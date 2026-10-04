@@ -960,8 +960,9 @@ mod gpu_kernels {
             let (t_f, bands_) = (t_frames as usize, bands as usize);
             let d = g0 % 256;
             let row = g0 / 256;
-            let b = row % bands_;
-            let t = row / bands_;
+            // Output is (band, t, 256) so row = b*T + t → b = row/T, t = row%T
+            let b = row / t_f;
+            let t = row % t_f;
             let src = (t * bands_ + b) * 256 + d;
             if let Some(o) = out.get_mut(idx) {
                 *o = x[src];
