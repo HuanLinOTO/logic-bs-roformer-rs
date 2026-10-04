@@ -27,6 +27,7 @@ struct Args {
     fft_test: bool,
     stft_test: bool,
     rmsnorm_test: bool,
+    bandsplit_test: bool,
     bench: bool,
     stems: Option<usize>,
 }
@@ -50,6 +51,7 @@ fn parse_args() -> Result<Args, String> {
             "--fft-test" => args.fft_test = true,
             "--stft-test" => args.stft_test = true,
             "--rmsnorm-test" => args.rmsnorm_test = true,
+            "--bandsplit-test" => args.bandsplit_test = true,
             "--bench" => args.bench = true,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -80,6 +82,11 @@ fn main() {
 
     if args.stft_test {
         stft_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        return;
+    }
+
+    if args.bandsplit_test {
+        bandsplit_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
         return;
     }
 
@@ -168,7 +175,7 @@ fn main() {
 
 use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
-use cuda_device::{DisjointSlice, cuda_module, kernel, thread, warp};
+use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread, warp};
 
 #[cuda_module]
 mod gpu_kernels {
@@ -261,6 +268,147 @@ mod gpu_kernels {
             // each warp owns a disjoint row, lanes write disjoint columns.
             unsafe {
                 *out_ptr.add(i) = vals[k] * scale * gamma[i % dim];
+            }
+        }
+    }
+
+    /// BandSplit: per-band RMSNorm + Linear(dim_in -> 256) fused.
+    /// One warp per (t, band) task. Per-warp slice of a static shared tile
+    /// carries the normalized h vector; each lane then runs 8 COMPLETE dot
+    /// products from shared memory (no cross-lane accumulation shuffles).
+    #[kernel]
+    pub fn bandsplit(
+        x: &[f32],
+        gamma: &[f32],
+        w: &[f32],
+        b: &[f32],
+        band_offs: &[u32],
+        band_dims: &[u32],
+        mut out: DisjointSlice<f32>,
+        rows: u32,
+        n_bands: u32,
+    ) {
+        static mut HB: SharedArray<f32, { 8 * 521 }> = SharedArray::UNINIT;
+        let gid = thread::index_1d();
+        let g0 = gid.get();
+        let lane = warp::lane_id() as usize;
+        let wid = (thread::threadIdx_x() as usize) / 32; // warp within block
+        let task = g0 / 32;
+        let rows = rows as usize;
+        let n_bands = n_bands as usize;
+        if task >= rows * n_bands {
+            return;
+        }
+        let t = task / n_bands;
+        let band = task % n_bands;
+        let dim_in = band_dims[band] as usize;
+        let g_off = band_offs[band] as usize;
+        let x_off = t * band_offs[n_bands] as usize + g_off;
+        let w_off = 256 * g_off;
+        let b_off = band * 256;
+        let dmax = dim_in - 1;
+        let sbase = wid * 521;
+
+        // 1) branch-free partial load + square sum
+        let mut s = 0.0f32;
+        for k in 0..17 {
+            let j = lane + k * 32;
+            let valid = if j < dim_in { 1.0f32 } else { 0.0f32 };
+            let v = x[x_off + j.min(dmax)];
+            s += v * v * valid;
+            unsafe {
+                HB[sbase + j.min(520)] = v * valid;
+            }
+        }
+        // 2) butterfly reduce the norm
+        s += warp::shuffle_xor_f32(s, 16);
+        s += warp::shuffle_xor_f32(s, 8);
+        s += warp::shuffle_xor_f32(s, 4);
+        s += warp::shuffle_xor_f32(s, 2);
+        s += warp::shuffle_xor_f32(s, 1);
+        let norm = s.sqrt();
+        let denom = if norm > 1e-12 { norm } else { 1e-12 };
+        let scale = (dim_in as f32).sqrt() / denom;
+        // 3) normalize + fold gamma in shared memory
+        for k in 0..17 {
+            let j = lane + k * 32;
+            let valid = if j < dim_in { 1.0f32 } else { 0.0f32 };
+            let jj = j.min(520);
+            unsafe {
+                HB[sbase + jj] *= scale * valid * gamma[g_off + j.min(dmax)];
+            }
+        }
+        thread::sync_threads();
+        // 4) each lane: 8 complete dots straight from shared memory
+        let out_ptr = out.as_mut_ptr();
+        let out_base = task * 256;
+        for ci in 0..8 {
+            let ch = lane * 8 + ci;
+            let wrow = w_off + ch * dim_in;
+            let mut a = 0.0f32;
+            for j in 0..dim_in {
+                a += unsafe { HB[sbase + j] } * w[wrow + j];
+            }
+            // SAFETY: task < rows*n_bands, ch < 256, out sized rows*n_bands*256.
+            unsafe {
+                *out_ptr.add(out_base + ch) = a + b[b_off + ch];
+            }
+        }
+    }
+
+    /// Debug variant: lane 0 recomputes the whole band serially from the
+    /// warp-reduced norm. Isolates lane-partitioning bugs.
+    #[kernel]
+    pub fn bandsplit_serial(
+        x: &[f32],
+        gamma: &[f32],
+        w: &[f32],
+        b: &[f32],
+        band_offs: &[u32],
+        band_dims: &[u32],
+        mut out: DisjointSlice<f32>,
+        rows: u32,
+        n_bands: u32,
+    ) {
+        let gid = thread::index_1d();
+        let g0 = gid.get();
+        let lane = warp::lane_id() as usize;
+        let task = g0 / 32;
+        let rows = rows as usize;
+        let n_bands = n_bands as usize;
+        if task >= rows * n_bands {
+            return;
+        }
+        let dim_in = band_dims[task % n_bands] as usize;
+        let band = task % n_bands;
+        let t = task / n_bands;
+        let g_off = band_offs[band] as usize;
+        let x_off = t * band_offs[n_bands] as usize + g_off;
+        // norm over the band via one lane, then broadcast through shuffle
+        let mut s = 0.0f32;
+        if lane == 0 {
+            for j in 0..dim_in {
+                s += x[x_off + j] * x[x_off + j];
+            }
+        }
+        s = warp::shuffle_f32(s, 0);
+        let norm = s.sqrt();
+        let denom = if norm > 1e-12 { norm } else { 1e-12 };
+        let scale = (dim_in as f32).sqrt() / denom;
+        if lane == 0 {
+            let w_off = 256 * g_off;
+            let b_off = band * 256;
+            let out_ptr = out.as_mut_ptr();
+            for ch in 0..256 {
+                let mut a = 0.0f32;
+                let wrow = w_off + ch * dim_in;
+                for j in 0..dim_in {
+                    a += x[x_off + j] * scale * gamma[g_off + j] * w[wrow + j];
+                }
+                // SAFETY: task < rows*n_bands, ch < 256.
+                unsafe {
+                    *out_ptr.add(task * 256 + ch) = a + b[b_off + ch];
+                }
             }
         }
     }
@@ -392,6 +540,74 @@ fn rmsnorm_parity_test(device: usize, model_dir: &std::path::Path) {
     }
     println!("rmsnorm parity: rows={rows} dim={dim} max_err={max_err:e} rel={:.3e}", max_err / denom);
     assert!(max_err < 1e-5 * denom, "rmsnorm parity failed");
+    println!("OK");
+}
+
+/// BandSplit parity vs per-band RMSNorm+Linear (parity/bandsplit.npz).
+fn bandsplit_parity_test(device: usize, model_dir: &std::path::Path) {
+    let npz_path = model_dir.parent().unwrap_or(model_dir).join("parity/bandsplit.npz");
+    let npz = npz::Npz::open(&npz_path).unwrap_or_else(|e| panic!("{e}"));
+    let x = npz.f32("x").expect("x");       // (t, 4100)
+    let gamma = npz.f32("gamma").expect("gamma");
+    let w = npz.f32("w").expect("w");
+    let b = npz.f32("b").expect("b");
+    let ref_out = npz.f32("out").expect("out"); // (t, 62, 256)
+    let rows = npz.shapes["x"][0];
+    let n_bands = 62usize;
+    let freqs: Vec<usize> = {
+        let mut v = vec![2usize; 24];
+        v.extend(vec![4; 12]);
+        v.extend(vec![12; 8]);
+        v.extend(vec![24; 8]);
+        v.extend(vec![48; 8]);
+        v.push(128);
+        v.push(129);
+        v
+    };
+    let dims: Vec<u32> = freqs.iter().map(|f| (2 * f * 2) as u32).collect();
+    let mut offs = vec![0u32; n_bands + 1];
+    for i in 0..n_bands {
+        offs[i + 1] = offs[i] + dims[i];
+    }
+    assert_eq!(offs[n_bands] as usize, npz.shapes["x"][1], "band offsets must cover x width");
+
+    let ctx = CudaContext::new(device).expect("ctx");
+    let stream = ctx.default_stream();
+    let x_dev = DeviceBuffer::from_host(&stream, x).unwrap();
+    let g_dev = DeviceBuffer::from_host(&stream, gamma).unwrap();
+    let w_dev = DeviceBuffer::from_host(&stream, w).unwrap();
+    let b_dev = DeviceBuffer::from_host(&stream, b).unwrap();
+    let offs_dev = DeviceBuffer::from_host(&stream, &offs).unwrap();
+    let dims_dev = DeviceBuffer::from_host(&stream, &dims).unwrap();
+    let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, rows * n_bands * 256).unwrap();
+    let km = gpu_kernels::load(&ctx).expect("kernel module");
+    // SAFETY: one warp per (row, band) task; threads = rows*62*32 exactly.
+    unsafe {
+        km.bandsplit(
+            &stream,
+            cuda_core::simt::LaunchConfig::for_num_elems((rows * n_bands * 32) as u32),
+            &x_dev,
+            &g_dev,
+            &w_dev,
+            &b_dev,
+            &offs_dev,
+            &dims_dev,
+            &mut out_dev,
+            rows as u32,
+            n_bands as u32,
+        )
+    }
+    .expect("bandsplit kernel");
+
+    let got = out_dev.to_host_vec(&stream).unwrap();
+    let mut max_err = 0.0f32;
+    let mut denom = 0.0f32;
+    for i in 0..got.len() {
+        max_err = max_err.max((got[i] - ref_out[i]).abs());
+        denom = denom.max(ref_out[i].abs());
+    }
+    println!("bandsplit parity: rows={rows} max_err={max_err:e} rel={:.3e}", max_err / denom);
+    assert!(max_err < 1e-4 * denom, "bandsplit parity failed");
     println!("OK");
 }
 
