@@ -18,5 +18,8 @@ cuda-host = { path = "vendor/cuda-rust/cuda-oxide/crates/cuda-host" }
 # Host-side CUDA runtime (context, streams, DeviceBuffer, launches)
 cuda-core = { path = "vendor/cuda-rust/cuda-core" }
 
+# dlopen helper for the cuFFT runtime bindings (already in the vendor graph)
+libloading = "0.8"
+
 [profile.release]
 debug = 1

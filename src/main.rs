@@ -7,6 +7,7 @@
 
 mod audio;
 mod config;
+mod cufft;
 mod weights;
 
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ struct Args {
     self_test: bool,
     print_config: bool,
     check_weights: bool,
+    fft_test: bool,
     bench: bool,
     stems: Option<usize>,
 }
@@ -40,6 +42,7 @@ fn parse_args() -> Result<Args, String> {
             "--self-test" => args.self_test = true,
             "--print-config" => args.print_config = true,
             "--check-weights" => args.check_weights = true,
+            "--fft-test" => args.fft_test = true,
             "--bench" => args.bench = true,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -60,6 +63,11 @@ fn main() {
 
     if args.self_test {
         self_test(args.device);
+        return;
+    }
+
+    if args.fft_test {
+        fft_roundtrip_test(args.device);
         return;
     }
 
@@ -158,6 +166,61 @@ mod kernels {
             *out = a[i] + b[i];
         }
     }
+}
+
+/// cufft R2C/C2R roundtrip parity: x -> R2C -> C2R*(1/n) == x, plus the
+/// DC/Nyquist bins of a known cosine.
+fn fft_roundtrip_test(device: usize) {
+    let ctx = CudaContext::new(device).expect("create CUDA context");
+    let stream = ctx.default_stream();
+    let fft = cufft::Cufft::load().expect("load libcufft");
+
+    const N: usize = 2048;
+    const BATCH: usize = 2302; // 2ch * 1151 frames — the real STFT shape
+
+    // deterministic pseudo-random signal + one known cosine frame
+    let mut x = vec![0.0f32; N * BATCH];
+    let mut seed = 0x12345678u32;
+    let mut next = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        (seed >> 8) as f32 / 16777216.0 - 0.5
+    };
+    for v in x.iter_mut() {
+        *v = next() * 0.1;
+    }
+    // frame 7: 64-point cosine -> energy at bin 64
+    for i in 0..N {
+        x[7 * N + i] = (std::f32::consts::TAU * 64.0 * i as f32 / N as f32).cos();
+    }
+
+    let x_dev = DeviceBuffer::from_host(&stream, &x).unwrap();
+    let mut spec = DeviceBuffer::<f32>::zeroed(&stream, (N / 2 + 1) * 2 * BATCH).unwrap();
+    let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, N * BATCH).unwrap();
+
+    let fwd = fft.plan(N, BATCH, true).expect("R2C plan");
+    let inv = fft.plan(N, BATCH, false).expect("C2R plan");
+    fwd.exec_r2c(x_dev.cu_deviceptr(), spec.cu_deviceptr()).expect("exec R2C");
+    inv.exec_c2r(spec.cu_deviceptr(), y_dev.cu_deviceptr()).expect("exec C2R");
+
+    let y = y_dev.to_host_vec(&stream).unwrap();
+    let spec = spec.to_host_vec(&stream).unwrap();
+    let mut max_err = 0.0f32;
+    for i in 0..x.len() {
+        let got = y[i] / N as f32;
+        max_err = max_err.max((got - x[i]).abs());
+    }
+    // DC of the cosine frame must be ~0 and bin 64 magnitude ~ N/2
+    let dc = spec[7 * (N / 2 + 1) * 2];
+    let b64_re = spec[7 * (N / 2 + 1) * 2 + 64 * 2];
+    let b64_im = spec[7 * (N / 2 + 1) * 2 + 64 * 2 + 1];
+    let b64_mag = (b64_re * b64_re + b64_im * b64_im).sqrt();
+    println!(
+        "fft roundtrip N={N} batch={BATCH}: max_err={max_err:e}, cos-frame DC={dc:.3e}, bin64 |X|={b64_mag:.1} (expect ~{})",
+        N / 2
+    );
+    assert!(max_err < 1e-4, "roundtrip error too large");
+    assert!(b64_mag > (N / 2) as f32 * 0.99 && b64_mag < (N / 2) as f32 * 1.01);
+    println!("OK");
 }
 
 fn self_test(device: usize) {
