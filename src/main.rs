@@ -504,6 +504,8 @@ mod gpu_kernels {
         sin: &[f32],
         mut out: DisjointSlice<f32>,
         seq: u32,
+        bands: u32,
+        axis: u32,
     ) {
         let idx = thread::index_1d();
         let g0 = idx.get();
@@ -516,7 +518,9 @@ mod gpu_kernels {
         let part = c2 / 256; // 0=q, 1=k, 2=v (in pair units: 256 pairs each)
         let head = (c2 % 256) / 32;
         let pair = c2 % 32;
-        let pos = m % seq as usize;
+        // token m is (t, band) folded: time axis pos = m / bands, freq axis
+        // pos = m % bands (x is (t, f) row-major).
+        let pos = if axis == 0 { m / bands as usize } else { m % bands as usize };
         let base = m * 1536 + part * 512 + head * 64 + pair * 2;
         let c = cos[pos * 32 + pair];
         let s = sin[pos * 32 + pair];
@@ -769,6 +773,73 @@ mod gpu_kernels {
         if i < x.len() {
             if let Some(o) = y.get_mut(idx) {
                 *o = x[i] + res[i];
+            }
+        }
+    }
+
+    /// Reorder folded QKV into attention-major layout:
+    /// in qkv[m=(t,f), part*512 + head*64 + d] -> out[(part*BH + seq_i*8 + head)*N + d]
+    /// where seq_i is the attention sequence index (time axis: t, BH=f*8,
+    /// N=T; freq axis: f, BH=t*8, N=62).
+    #[kernel]
+    pub fn qkv_to_attn(
+        qkv: &[f32],
+        mut out: DisjointSlice<f32>,
+        t_frames: u32,
+        bands: u32,
+        axis: u32,
+    ) {
+        let idx = thread::index_1d();
+        let g0 = idx.get();
+        // g0 = ((part*BH + seq_i*8 + head)*N + row)*64 + d — decompose once
+        let total = out.len();
+        if g0 < total {
+            let (t_f, bands_, axis_) = (t_frames as usize, bands as usize, axis as usize);
+            let d = g0 % 64;
+            let row_col = g0 / 64;
+            let n = row_col % (if axis_ == 0 { t_f } else { bands_ });
+            let rest = row_col / (if axis_ == 0 { t_f } else { bands_ });
+            let head = rest % 8;
+            let seq_i = rest / 8;
+            let part = seq_i / (if axis_ == 0 { bands_ } else { t_f });
+            let s = seq_i % (if axis_ == 0 { bands_ } else { t_f });
+            // source token m and channel
+            let (t, f) = if axis_ == 0 { (n, s) } else { (s, n) };
+            let m = t * bands_ + f;
+            let src = m * 1536 + part * 512 + head * 64 + d;
+            if let Some(o) = out.get_mut(idx) {
+                *o = qkv[src];
+            }
+        }
+    }
+
+    /// Inverse of qkv_to_attn for the V output only (attn out [BH, N, 64] ->
+    /// folded (t,f) rows: out_flat[m*512 + head*64 + d]).
+    #[kernel]
+    pub fn attn_v_to_flat(
+        attn: &[f32],
+        mut out: DisjointSlice<f32>,
+        t_frames: u32,
+        bands: u32,
+        axis: u32,
+    ) {
+        let idx = thread::index_1d();
+        let g0 = idx.get();
+        // g0 = m*512 + head*64 + d
+        if g0 < out.len() {
+            let (t_f, bands_, axis_) = (t_frames as usize, bands as usize, axis as usize);
+            let d = g0 % 64;
+            let ch = g0 / 64;
+            let head = ch % 8;
+            let m = ch / 8;
+            let f = m % bands_;
+            let t = m / bands_;
+            let (n, s) = if axis_ == 0 { (t, f) } else { (f, t) };
+            let bh = s * 8 + head;
+            let n_len = if axis_ == 0 { t_f } else { bands_ };
+            let src = (bh * n_len + n) * 64 + d;
+            if let Some(o) = out.get_mut(idx) {
+                *o = attn[src];
             }
         }
     }
@@ -1075,7 +1146,7 @@ fn qkvrope_parity_test(device: usize, model_dir: &std::path::Path) {
     let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, rows * nqkv).unwrap();
     // SAFETY: one thread per (row, pair).
     unsafe {
-        km.rope_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((rows * 768) as u32), &qkv_dev, &cos_dev, &sin_dev, &mut out_dev, seq as u32)
+        km.rope_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((rows * 768) as u32), &qkv_dev, &cos_dev, &sin_dev, &mut out_dev, seq as u32, 1, 0)
     }
     .expect("rope");
 
