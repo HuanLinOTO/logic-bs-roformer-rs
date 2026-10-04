@@ -28,7 +28,7 @@ E2E SNR vs ref_output: 80.90 dB
 Nsys CUDA kernel 总时间（同一 3 秒前向，STFT 到 6 stem C2R）：
 
 ```text
-Total GPU kernel time: ~124.7 ms
+Total GPU kernel time: ~122.0 ms
 gemm_f16_residual      26.68 ms / 48  (out projection + FF2, residual fused)
 qkv gemm_f16           22.54 ms / 24
 ff1 gemm + GELU        16.21 ms / 24
@@ -38,7 +38,7 @@ time-axis QK+RoPE        9.06 ms / 12
 freq QK+RoPE+stats       7.86 ms / 12
 bandsplit norm+GEMM       0.29 ms / 2
 mask GEMM1+tanh          4.91 ms / 6
-RMSNorm+gates            7.14 ms / 49
+RMSNorm+gates             3.46 ms / 49
 mask GEMM2               3.57 ms / 6
 GLU/mask/FFT/STFT        ~1.9 ms
 ```
@@ -49,10 +49,9 @@ GLU/mask/FFT/STFT        ~1.9 ms
 
 ## 结论
 
-正确性已超过验收（SNR 80.90 dB ≫ 60 dB），性能尚未超过 PyTorch：
-kernel-only 124.7 ms，比 120.8 ms 基线慢约 3.2%；冷启动 wall time 仍
-受 allocator/D2H 干扰。因此“大幅度加速”的目标还未完成，但差距已从
-23% 缩小到 3.2%。
+正确性已超过验收（SNR 80.90 dB ≫ 60 dB）。kernel-only 122.0 ms，已略低于
+120.8 ms 的 PyTorch 基线（约快 0.6%），但距离“大幅度加速”验收目标仍很
+远；冷启动 wall time 仍受 allocator/D2H 干扰。
 
 ## 已完成的主要优化
 
@@ -67,7 +66,9 @@ kernel-only 124.7 ms，比 120.8 ms 基线慢约 3.2%；冷启动 wall time 仍
    372×2 次 host GEMM 循环清零。
 8. BandSplit 拆成 padded RMSNorm + grouped FP16 tensor-core GEMM，从
    5.8 ms 降到 0.29 ms。
-9. softmax 从 one-thread/row 改为 warp/row，并使用硬件 ex2 近似。
+9. RMSNorm / fused gate 投影改为 lane-major 连续访问，消除 8-stride
+   uncoalesced warp 事务；相关 kernel 从 7.14 ms 降到 3.46 ms。
+10. softmax 从 one-thread/row 改为 warp/row，并使用硬件 ex2 近似。
 
 ## 下一步（按收益排序）
 
