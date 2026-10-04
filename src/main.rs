@@ -30,6 +30,7 @@ struct Args {
     bandsplit_test: bool,
     gemm_test: bool,
     qkvrope_test: bool,
+    attn_test: bool,
     bench: bool,
     stems: Option<usize>,
 }
@@ -56,6 +57,7 @@ fn parse_args() -> Result<Args, String> {
             "--bandsplit-test" => args.bandsplit_test = true,
             "--gemm-test" => args.gemm_test = true,
             "--qkvrope-test" => args.qkvrope_test = true,
+            "--attn-test" => args.attn_test = true,
             "--bench" => args.bench = true,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -86,6 +88,11 @@ fn main() {
 
     if args.stft_test {
         stft_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        return;
+    }
+
+    if args.attn_test {
+        attn_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
         return;
     }
 
@@ -521,6 +528,194 @@ mod gpu_kernels {
         }
     }
 
+    /// Short-sequence SDPA (freq axis, seq=62): one 128-thread block per
+    /// (batch*head). q/k/v are [bh, 62, 64] folded. Scores materialize in
+    /// shared memory; softmax rows are computed serially per thread (no
+    /// cross-lane reductions). scale = 64^-0.5 = 0.125 (already folded into
+    /// q by rope_scale upstream, so NOT applied here).
+    #[kernel]
+    pub fn attn_short(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        mut out: DisjointSlice<f32>,
+        seq: u32,
+    ) {
+        // 48KB budget: K+V tiles (31KB) + scores (15.9KB). Q reads straight
+        // from global (each row is re-read n times; L2 absorbs it).
+        static mut SK: SharedArray<f32, { 62 * 64 }> = SharedArray::UNINIT;
+        static mut SV: SharedArray<f32, { 62 * 64 }> = SharedArray::UNINIT;
+        static mut SC: SharedArray<f32, { 62 * 64 }> = SharedArray::UNINIT; // scores, rows padded to 64
+        let tid = thread::threadIdx_x() as usize;
+        let bh = thread::blockIdx_x() as usize;
+        let n = seq as usize;
+        let base = bh * n * 64;
+        // cooperative load: 62*64 = 3968 elements per matrix, 128 threads
+        let total = n * 64;
+        let mut i = tid;
+        while i < total {
+            unsafe {
+                SK[i] = k[base + i];
+                SV[i] = v[base + i];
+            }
+            i += 128;
+        }
+        thread::sync_threads();
+        // scores: row-major padded to 64 cols, scaled by 0.125 (applied to q
+        // upstream — but the reference applies it inside SDPA; our q input
+        // from rope_scale is pre-scaled, so scores here are unscaled dots).
+        let stride = 64; // padded row width
+        let mut idx = tid;
+        let n2 = n * n;
+        while idx < n2 {
+            let r = idx / n;
+            let c = idx % n;
+            let mut acc = 0.0f32;
+            let mut d = 0usize;
+            while d < 64 {
+                acc += q[base + r * 64 + d] * unsafe { SK[c * 64 + d] };
+                d += 1;
+            }
+            unsafe {
+                SC[r * stride + c] = acc;
+            }
+            idx += 128;
+        }
+        thread::sync_threads();
+        // softmax + weighted V: one thread per row (62 rows), 64 outputs each
+        if tid < n {
+            let r = tid;
+            let row_off = r * stride;
+            let mut m = f32::NEG_INFINITY;
+            let mut j = 0usize;
+            while j < n {
+                let s = unsafe { SC[row_off + j] };
+                if s > m {
+                    m = s;
+                }
+                j += 1;
+            }
+            let mut z = 0.0f32;
+            j = 0;
+            while j < n {
+                let e = (unsafe { SC[row_off + j] } - m).exp();
+                unsafe {
+                    SC[row_off + j] = e;
+                }
+                z += e;
+                j += 1;
+            }
+            let inv = 1.0 / z;
+            let out_ptr = out.as_mut_ptr();
+            let mut d = 0usize;
+            while d < 64 {
+                let mut acc = 0.0f32;
+                j = 0;
+                while j < n {
+                    acc += unsafe { SC[row_off + j] } * unsafe { SV[j * 64 + d] };
+                    j += 1;
+                }
+                // SAFETY: bh < grid, r < n, d < 64; out has bh*n*64 elements.
+                unsafe {
+                    *out_ptr.add(base + r * 64 + d) = acc * inv;
+                }
+                d += 1;
+            }
+        }
+    }
+
+    /// In-place row softmax over a [rows, cols] matrix (one thread/row).
+    #[kernel]
+    pub fn softmax_rows(mut p: DisjointSlice<f32>, rows: u32, cols: u32) {
+        let idx = thread::index_1d();
+        let r = idx.get();
+        let (rows, cols) = (rows as usize, cols as usize);
+        if r >= rows {
+            return;
+        }
+        let off = r * cols;
+        let ptr = p.as_mut_ptr();
+        let mut m = unsafe { *ptr.add(off) };
+        let mut j = 1usize;
+        while j < cols {
+            let s = unsafe { *ptr.add(off + j) };
+            if s > m {
+                m = s;
+            }
+            j += 1;
+        }
+        let mut z = 0.0f32;
+        j = 0;
+        while j < cols {
+            let e = (unsafe { *ptr.add(off + j) } - m).exp();
+            unsafe {
+                *ptr.add(off + j) = e;
+            }
+            z += e;
+            j += 1;
+        }
+        let inv = 1.0 / z;
+        j = 0;
+        while j < cols {
+            // SAFETY: off+j < rows*cols.
+            unsafe {
+                *ptr.add(off + j) *= inv;
+            }
+            j += 1;
+        }
+    }
+
+    /// GEMM with B in [K, N] row-major layout (torch x @ B semantics):
+    /// Y[M,N] = X[M,K] . B[K,N] + bias.
+    #[kernel]
+    pub fn gemm_bias_bn(
+        m: u32,
+        n: u32,
+        k: u32,
+        x: &[f32],
+        b_mat: &[f32],
+        bias: &[f32],
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut TA: SharedArray<f32, 256> = SharedArray::UNINIT;
+        static mut TB: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let tx = thread::threadIdx_x() as usize;
+        let ty = thread::threadIdx_y() as usize;
+        let row = thread::blockIdx_y() as usize * 16 + ty;
+        let col = thread::blockIdx_x() as usize * 16 + tx;
+        let (m_size, n_size, k_size) = (m as usize, n as usize, k as usize);
+        let num_tiles = k_size.div_ceil(16);
+        let mut sum = 0.0f32;
+        let smem_idx = ty * 16 + tx;
+        let mut tile = 0usize;
+        while tile < num_tiles {
+            let tile_start = tile * 16;
+            unsafe {
+                let a_col = tile_start + tx;
+                TA[smem_idx] = if row < m_size && a_col < k_size { x[row * k_size + a_col] } else { 0.0 };
+                let b_row = tile_start + ty;
+                TB[smem_idx] = if b_row < k_size && col < n_size { b_mat[b_row * n_size + col] } else { 0.0 };
+            }
+            thread::sync_threads();
+            unsafe {
+                let mut i = 0usize;
+                while i < 16 {
+                    sum += TA[ty * 16 + i] * TB[i * 16 + tx];
+                    i += 1;
+                }
+            }
+            thread::sync_threads();
+            tile += 1;
+        }
+        if row < m_size && col < n_size {
+            let out_ptr = y.as_mut_ptr();
+            // SAFETY: bounds checked above; y is m*n.
+            unsafe {
+                *out_ptr.add(row * n_size + col) = sum + bias[col];
+            }
+        }
+    }
+
     /// Minimal probe retained for toolchain smoke tests.
     #[kernel]
     pub fn probe_min(x: &[f32], mut out: DisjointSlice<f32>) {
@@ -840,6 +1035,168 @@ fn qkvrope_parity_test(device: usize, model_dir: &std::path::Path) {
     }
     println!("qkv+rope parity: rows={rows} max_err={max_err:e} rel={:.3e}", max_err / denom);
     assert!(max_err < 1e-4 * denom, "qkv+rope parity failed");
+    println!("OK");
+}
+
+/// Short-attention parity vs SDPA (parity/attn_short.npz). Note: the npz
+/// q/k/v are UNSCALED; our kernel expects q pre-scaled by 0.125 (rope_scale
+/// upstream does it), so the test scales q on the host before upload.
+fn attn_parity_test(device: usize, model_dir: &std::path::Path) {
+    let npz_path = model_dir.parent().unwrap_or(model_dir).join("parity/attn_short.npz");
+    let npz = npz::Npz::open(&npz_path).unwrap_or_else(|e| panic!("{e}"));
+    let q = npz.f32("q").expect("q");
+    let k = npz.f32("k").expect("k");
+    let v = npz.f32("v").expect("v");
+    let ref_out = npz.f32("out").expect("out");
+    let (bh, seq) = (16usize, 62usize);
+    let mut qs = vec![0.0f32; q.len()];
+    for i in 0..q.len() {
+        qs[i] = q[i] * 0.125;
+    }
+    let ctx = CudaContext::new(device).expect("ctx");
+    let stream = ctx.default_stream();
+    let q_dev = DeviceBuffer::from_host(&stream, &qs).unwrap();
+    let k_dev = DeviceBuffer::from_host(&stream, k).unwrap();
+    let v_dev = DeviceBuffer::from_host(&stream, v).unwrap();
+    let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, bh * seq * 64).unwrap();
+    let km = gpu_kernels::load(&ctx).expect("kernel module");
+    // SAFETY: grid = bh blocks of 128 threads; buffers sized bh*seq*64.
+    unsafe {
+        km.attn_short(
+            &stream,
+            cuda_core::simt::LaunchConfig {
+                grid_dim: (bh as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &q_dev,
+            &k_dev,
+            &v_dev,
+            &mut out_dev,
+            seq as u32,
+        )
+    }
+    .expect("attn kernel");
+    let got = out_dev.to_host_vec(&stream).unwrap();
+    let mut max_err = 0.0f32;
+    let mut denom = 0.0f32;
+    for i in 0..got.len() {
+        max_err = max_err.max((got[i] - ref_out[i]).abs());
+        denom = denom.max(ref_out[i].abs());
+    }
+    println!("attn_short parity: bh={bh} max_err={max_err:e} rel={:.3e}", max_err / denom);
+    assert!(max_err < 1e-4 * denom, "attn parity failed");
+    println!("OK");
+
+    // ---- long-sequence (time-axis) 2-pass attention ----
+    let npz2 = npz::Npz::open(&model_dir.parent().unwrap_or(model_dir).join("parity/attn_long.npz"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let ql = npz2.f32("q").expect("q"); // unscaled; scale on host below
+    let kl = npz2.f32("k").expect("k");
+    let vl = npz2.f32("v").expect("v");
+    let ref_l = npz2.f32("out").expect("out");
+    let (bh2, seq2) = (4usize, 256usize);
+    let mut qs2 = vec![0.0f32; ql.len()];
+    for i in 0..ql.len() {
+        qs2[i] = ql[i] * 0.125;
+    }
+    let q2 = DeviceBuffer::from_host(&stream, &qs2).unwrap();
+    let k2 = DeviceBuffer::from_host(&stream, kl).unwrap();
+    let v2 = DeviceBuffer::from_host(&stream, vl).unwrap();
+    // pass 1: scores = q @ k^T per (b,h) — W = k as [N=seq, K=64]
+    let mut p2 = DeviceBuffer::<f32>::zeroed(&stream, bh2 * seq2 * seq2).unwrap();
+    let zero_bias = DeviceBuffer::<f32>::zeroed(&stream, seq2).unwrap();
+    for g in 0..bh2 {
+        let off = g * seq2 * 64;
+        let qseg = q2.cu_deviceptr() + (off * 4) as u64;
+        let kseg = k2.cu_deviceptr() + (off * 4) as u64;
+        let pseg = p2.cu_deviceptr() + (g * seq2 * seq2 * 4) as u64;
+        // SAFETY: aliasing views over disjoint segments of sized buffers.
+        let q_view = unsafe { DeviceBuffer::<f32>::from_raw_parts(qseg, seq2 * 64, ctx.clone()) };
+        let k_view = unsafe { DeviceBuffer::<f32>::from_raw_parts(kseg, seq2 * 64, ctx.clone()) };
+        let mut p_view = unsafe { DeviceBuffer::<f32>::from_raw_parts(pseg, seq2 * seq2, ctx.clone()) };
+        unsafe {
+            km.gemm_bias(
+                &stream,
+                cuda_core::simt::LaunchConfig {
+                    grid_dim: ((seq2.div_ceil(16)) as u32, (seq2.div_ceil(16)) as u32, 1),
+                    block_dim: (16, 16, 1),
+                    shared_mem_bytes: 0,
+                },
+                seq2 as u32,
+                seq2 as u32,
+                64,
+                &q_view,
+                &k_view,
+                &zero_bias,
+                &mut p_view,
+            )
+        }
+        .expect("scores gemm");
+        std::mem::forget(q_view);
+        std::mem::forget(k_view);
+        std::mem::forget(p_view);
+    }
+    // pass 1.5: in-place row softmax
+    // SAFETY: one thread per row of bh2*seq2 rows.
+    unsafe {
+        km.softmax_rows(&stream, cuda_core::simt::LaunchConfig::for_num_elems((bh2 * seq2) as u32), &mut p2, (bh2 * seq2) as u32, seq2 as u32)
+    }
+    .expect("softmax");
+    // pass 2: out = P @ V with B=[K=seq, N=64] layout (v is [seq, 64] row-major)
+    let zero64 = DeviceBuffer::<f32>::zeroed(&stream, 64).unwrap();
+    let mut out2 = DeviceBuffer::<f32>::zeroed(&stream, bh2 * seq2 * 64).unwrap();
+    for g in 0..bh2 {
+        let pseg = p2.cu_deviceptr() + (g * seq2 * seq2 * 4) as u64;
+        let vseg = v2.cu_deviceptr() + (g * seq2 * 64 * 4) as u64;
+        let oseg = out2.cu_deviceptr() + (g * seq2 * 64 * 4) as u64;
+        // SAFETY: disjoint segment views.
+        let p_view = unsafe { DeviceBuffer::<f32>::from_raw_parts(pseg, seq2 * seq2, ctx.clone()) };
+        let v_view = unsafe { DeviceBuffer::<f32>::from_raw_parts(vseg, seq2 * 64, ctx.clone()) };
+        let mut o_view = unsafe { DeviceBuffer::<f32>::from_raw_parts(oseg, seq2 * 64, ctx.clone()) };
+        unsafe {
+            km.gemm_bias_bn(
+                &stream,
+                cuda_core::simt::LaunchConfig {
+                    grid_dim: ((64 / 16) as u32, (seq2.div_ceil(16)) as u32, 1),
+                    block_dim: (16, 16, 1),
+                    shared_mem_bytes: 0,
+                },
+                seq2 as u32,
+                64,
+                seq2 as u32,
+                &p_view,
+                &v_view,
+                &zero64,
+                &mut o_view,
+            )
+        }
+        .expect("pv gemm");
+        std::mem::forget(p_view);
+        std::mem::forget(v_view);
+        std::mem::forget(o_view);
+    }
+    let got2 = out2.to_host_vec(&stream).unwrap();
+    {
+        let p_back = p2.to_host_vec(&stream).unwrap();
+        let rs0: f32 = p_back[0..8].iter().sum();
+        println!("P row0[0..4]={:?} sum8={:.4}", &p_back[0..4], rs0);
+        let rs_last: f32 = p_back[(bh2 * seq2 - 1) * seq2..(bh2 * seq2 - 1) * seq2 + 8].iter().sum();
+        println!("P lastrow[0..4] sum8={:.4}", rs_last);
+        let r768: f32 = p_back[768 * seq2..768 * seq2 + 8].iter().sum();
+        let r1000: f32 = p_back[1000 * seq2..1000 * seq2 + 8].iter().sum();
+        println!("P bh3 row0 sum8={:.4} row1000 sum8={:.4}", r768, r1000);
+        println!("P raw scores g3 row0[0..3] pre-softmax unknown; P val={:?}", &p_back[768 * seq2..768 * seq2 + 3]);
+        println!("out2[0..4]={:?} ref={:?}", &got2[0..4], &ref_l[0..4]);
+    }
+    let mut me2 = 0.0f32;
+    let mut dn2 = 0.0f32;
+    for i in 0..got2.len() {
+        me2 = me2.max((got2[i] - ref_l[i]).abs());
+        dn2 = dn2.max(ref_l[i].abs());
+    }
+    println!("attn_long parity: bh={bh2} seq={seq2} max_err={me2:e} rel={:.3e}", me2 / dn2);
+    assert!(me2 < 1e-3 * dn2, "attn_long parity failed");
     println!("OK");
 }
 

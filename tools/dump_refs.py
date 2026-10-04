@@ -135,6 +135,32 @@ def gen_qkv_rope():
     print("qkvrope.npz: b=2 seq=64")
 
 
+def gen_attn_short():
+    """Short-seq SDPA parity: q,k,v (BH, 62, 64), scale=8^-0.5, fp32 math."""
+    rs = np.random.RandomState(19)
+    bh, seq, dh = 16, 62, 64   # small BH for the npz; math is per-(b,h)
+    q = (rs.randn(bh, seq, dh) * 0.3).astype(np.float32)
+    k = (rs.randn(bh, seq, dh) * 0.3).astype(np.float32)
+    v = (rs.randn(bh, seq, dh) * 0.3).astype(np.float32)
+    qt, kt, vt = map(torch.from_numpy, (q, k, v))
+    out = torch.nn.functional.scaled_dot_product_attention(qt, kt, vt)
+    np.savez(OUT / "attn_short.npz", q=q.reshape(-1), k=k.reshape(-1), v=v.reshape(-1), out=out.numpy().reshape(-1))
+    print("attn_short.npz: bh=16 seq=62")
+
+
+def gen_attn_long():
+    """Long-seq SDPA parity (time axis), 2-pass reference: scores->softmax->PV."""
+    rs = np.random.RandomState(23)
+    bh, seq, dh = 4, 256, 64
+    q = (rs.randn(bh, seq, dh) * 0.3).astype(np.float32)  # unscaled; SDPA applies 1/sqrt(64)
+    k = (rs.randn(bh, seq, dh) * 0.3).astype(np.float32)
+    v = (rs.randn(bh, seq, dh) * 0.3).astype(np.float32)
+    qt, kt, vt = map(torch.from_numpy, (q, k, v))
+    out = torch.nn.functional.scaled_dot_product_attention(qt, kt, vt)
+    np.savez(OUT / "attn_long.npz", q=q.reshape(-1), k=k.reshape(-1), v=v.reshape(-1), out=out.numpy().reshape(-1))
+    print("attn_long.npz: bh=4 seq=256")
+
+
 def main():
     OUT.mkdir(exist_ok=True)
     torch.manual_seed(0)
@@ -143,6 +169,8 @@ def main():
     gen_bandsplit()
     gen_gemm()
     gen_qkv_rope()
+    gen_attn_short()
+    gen_attn_long()
 
 
 if __name__ == "__main__":
