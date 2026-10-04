@@ -101,6 +101,40 @@ def gen_gemm():
     print("gemm.npz: 4 shapes M=2048")
 
 
+def gen_qkv_rope():
+    """QKV+RoPE+scale parity: time-axis layout (b*seq folding), small scale.
+    x (b,seq,256) -> RMSNorm -> Linear -> rotate q/k (interleaved pairs) -> q*scale,k*scale."""
+    rs = np.random.RandomState(17)
+    b, seq, dim, heads, dh = 2, 64, 256, 8, 64
+    x = (rs.randn(b, seq, dim) * 0.5).astype(np.float32)
+    gamma = (rs.randn(dim) * 0.1 + 1.0).astype(np.float32)
+    w = (rs.randn(3 * heads * dh, dim) * 0.05).astype(np.float32)
+    bias = (rs.randn(3 * heads * dh) * 0.05).astype(np.float32)
+    xt = torch.from_numpy(x)
+    h = torch.nn.functional.normalize(xt, dim=-1) * (dim ** 0.5) * torch.from_numpy(gamma)
+    qkv = torch.nn.functional.linear(h, torch.from_numpy(w), torch.from_numpy(bias))
+    q, k, v = qkv.view(b, seq, 3, heads, dh).unbind(2)
+    # rotary: freqs = 1/10000^(2i/dh), pos*freqs, cos/sin on repeat_interleave layout
+    freqs = 1.0 / (10000 ** (torch.arange(0, dh, 2).float() / dh))
+    ang = torch.arange(seq).float()[:, None] * freqs[None]           # (seq, 32)
+    ang = ang.repeat_interleave(2, -1)                                # (seq, 64)
+    ang_c = ang[..., ::2]  # (seq, 32) after taking even positions
+    cos = ang_c.cos()[None, :, None, :]
+    sin = ang_c.sin()[None, :, None, :]
+    def rot(t):
+        te, to = t[..., ::2], t[..., 1::2]
+        out = torch.empty_like(t)
+        torch.sub(te * cos, to * sin, out=out[..., ::2])
+        torch.add(to * cos, te * sin, out=out[..., 1::2])
+        return out
+    scale = dh ** -0.5
+    qr, kr = rot(q) * scale, rot(k) * scale
+    np.savez(OUT / "qkvrope.npz", x=x.reshape(-1), gamma=gamma, w=w.reshape(-1), bias=bias,
+             cos=cos.numpy().reshape(-1), sin=sin.numpy().reshape(-1),
+             q=qr.numpy().reshape(-1), k=kr.numpy().reshape(-1), v=v.numpy().reshape(-1))
+    print("qkvrope.npz: b=2 seq=64")
+
+
 def main():
     OUT.mkdir(exist_ok=True)
     torch.manual_seed(0)
@@ -108,6 +142,7 @@ def main():
     gen_rmsnorm()
     gen_bandsplit()
     gen_gemm()
+    gen_qkv_rope()
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ struct Args {
     rmsnorm_test: bool,
     bandsplit_test: bool,
     gemm_test: bool,
+    qkvrope_test: bool,
     bench: bool,
     stems: Option<usize>,
 }
@@ -54,6 +55,7 @@ fn parse_args() -> Result<Args, String> {
             "--rmsnorm-test" => args.rmsnorm_test = true,
             "--bandsplit-test" => args.bandsplit_test = true,
             "--gemm-test" => args.gemm_test = true,
+            "--qkvrope-test" => args.qkvrope_test = true,
             "--bench" => args.bench = true,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -84,6 +86,11 @@ fn main() {
 
     if args.stft_test {
         stft_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        return;
+    }
+
+    if args.qkvrope_test {
+        qkvrope_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
         return;
     }
 
@@ -472,6 +479,48 @@ mod gpu_kernels {
         }
     }
 
+    /// RoPE + scale on a folded QKV tensor: qkv[(b*seq+pos), 3*8*64].
+    /// Each thread rotates one (even, odd) pair of q or k and scales; v and
+    /// the partner element are written by the same thread. cos/sin tables
+    /// are [seq, 32] row-major.
+    #[kernel]
+    pub fn rope_scale(
+        qkv: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        mut out: DisjointSlice<f32>,
+        seq: u32,
+    ) {
+        let idx = thread::index_1d();
+        let g0 = idx.get();
+        // g0 = m * 768 + c2, where c2 in [0, 768) indexes (part, head, pair):
+        // part 0=q, 1=k; 768 = 2 parts * 8 heads * 32 pairs? Actually 3*8*64/2
+        // pairs total = 768; v occupies pairs 512..768 and passes through
+        // untouched (its two elements are copied as-is).
+        let c2 = g0 % 768;
+        let m = g0 / 768;
+        let part = c2 / 256; // 0=q, 1=k, 2=v (in pair units: 256 pairs each)
+        let head = (c2 % 256) / 32;
+        let pair = c2 % 32;
+        let pos = m % seq as usize;
+        let base = m * 1536 + part * 512 + head * 64 + pair * 2;
+        let c = cos[pos * 32 + pair];
+        let s = sin[pos * 32 + pair];
+        let (ve, vo) = (qkv[base], qkv[base + 1]);
+        let (re, ro) = if part < 2 {
+            (ve * c - vo * s, vo * c + ve * s)
+        } else {
+            (ve, vo)
+        };
+        let scale = if part < 2 { 0.125f32 } else { 1.0f32 };
+        let out_ptr = out.as_mut_ptr();
+        // SAFETY: base+1 < rows*1536 by construction (c2 < 768).
+        unsafe {
+            *out_ptr.add(base) = re * scale;
+            *out_ptr.add(base + 1) = ro * scale;
+        }
+    }
+
     /// Minimal probe retained for toolchain smoke tests.
     #[kernel]
     pub fn probe_min(x: &[f32], mut out: DisjointSlice<f32>) {
@@ -717,6 +766,80 @@ fn gemm_parity_test(device: usize, model_dir: &std::path::Path) {
         println!("gemm[{gi}] K={k} N={n}: max_err={max_err:e} rel={:.3e}", max_err / denom);
         assert!(max_err < 1e-4 * denom, "gemm[{gi}] parity failed");
     }
+    println!("OK");
+}
+
+/// QKV+RoPE+scale parity (parity/qkvrope.npz): rmsnorm -> gemm -> rope.
+fn qkvrope_parity_test(device: usize, model_dir: &std::path::Path) {
+    let npz_path = model_dir.parent().unwrap_or(model_dir).join("parity/qkvrope.npz");
+    let npz = npz::Npz::open(&npz_path).unwrap_or_else(|e| panic!("{e}"));
+    let x = npz.f32("x").expect("x");           // (b*seq*dim) folded rows
+    let gamma = npz.f32("gamma").expect("gamma");
+    let w = npz.f32("w").expect("w");
+    let bias = npz.f32("bias").expect("bias");
+    let cos = npz.f32("cos").expect("cos");     // (seq*32)
+    let sin = npz.f32("sin").expect("sin");
+    let ref_q = npz.f32("q").expect("q");
+    let ref_k = npz.f32("k").expect("k");
+    let ref_v = npz.f32("v").expect("v");
+    let (b, seq, dim, nqkv) = (2usize, 64usize, 256usize, 1536usize);
+    let rows = b * seq;
+
+    let ctx = CudaContext::new(device).expect("ctx");
+    let stream = ctx.default_stream();
+    let km = gpu_kernels::load(&ctx).expect("kernel module");
+    let x_dev = DeviceBuffer::from_host(&stream, x).unwrap();
+    let g_dev = DeviceBuffer::from_host(&stream, gamma).unwrap();
+    let mut h_dev = DeviceBuffer::<f32>::zeroed(&stream, rows * dim).unwrap();
+    // SAFETY: one warp per row.
+    unsafe {
+        km.rmsnorm(&stream, cuda_core::simt::LaunchConfig::for_num_elems((rows * 32) as u32), &x_dev, &g_dev, &mut h_dev, rows as u32, dim as u32)
+    }
+    .expect("rmsnorm");
+    let w_dev = DeviceBuffer::from_host(&stream, w).unwrap();
+    let b_dev = DeviceBuffer::from_host(&stream, bias).unwrap();
+    let mut qkv_dev = DeviceBuffer::<f32>::zeroed(&stream, rows * nqkv).unwrap();
+    // SAFETY: 2-D grid of 16x16 tiles covering rows x nqkv.
+    unsafe {
+        km.gemm_bias(
+            &stream,
+            cuda_core::simt::LaunchConfig {
+                grid_dim: ((nqkv.div_ceil(16)) as u32, (rows.div_ceil(16)) as u32, 1),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            },
+            rows as u32,
+            nqkv as u32,
+            dim as u32,
+            &h_dev,
+            &w_dev,
+            &b_dev,
+            &mut qkv_dev,
+        )
+    }
+    .expect("gemm qkv");
+    let cos_dev = DeviceBuffer::from_host(&stream, cos).unwrap();
+    let sin_dev = DeviceBuffer::from_host(&stream, sin).unwrap();
+    let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, rows * nqkv).unwrap();
+    // SAFETY: one thread per (row, pair).
+    unsafe {
+        km.rope_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((rows * 768) as u32), &qkv_dev, &cos_dev, &sin_dev, &mut out_dev, seq as u32)
+    }
+    .expect("rope");
+
+    let got = out_dev.to_host_vec(&stream).unwrap();
+    let mut max_err = 0.0f32;
+    let mut denom = 0.0f32;
+    for m in 0..rows {
+        for c in 0..nqkv {
+            let g = got[m * nqkv + c];
+            let r = if c < 512 { ref_q[m * 512 + c] } else if c < 1024 { ref_k[m * 512 + (c - 512)] } else { ref_v[m * 512 + (c - 1024)] };
+            max_err = max_err.max((g - r).abs());
+            denom = denom.max(r.abs());
+        }
+    }
+    println!("qkv+rope parity: rows={rows} max_err={max_err:e} rel={:.3e}", max_err / denom);
+    assert!(max_err < 1e-4 * denom, "qkv+rope parity failed");
     println!("OK");
 }
 
