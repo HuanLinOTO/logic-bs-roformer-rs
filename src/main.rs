@@ -2347,9 +2347,6 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     unsafe {
         km.transpose_band_major(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * 256) as u32), &x_final, &mut xb, t_frames as u32, bands as u32)
     }.expect("transpose");
-    let mut mask_dev = DeviceBuffer::<f32>::zeroed(&stream, 6 * bands * t_frames * 2 * 1025 * 2 / 1025 * 0 + 6 * t_frames * 4100).unwrap();
-    let mut hidden = DeviceBuffer::<f32>::zeroed(&stream, bands * t_frames * 1024).unwrap();
-    let mut hidden_t = DeviceBuffer::<f32>::zeroed(&stream, bands * t_frames * 1024).unwrap();
 
     // ---- MaskEstimator: second GEMM + GLU per (stem, band), band-major layout ----
     // glu_all: (s, band, t, dim_in) with per-band fixed stride max_dim (padded)
@@ -2357,23 +2354,43 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     let mut glu_all = DeviceBuffer::<f32>::zeroed(&stream, 6 * bands * t_frames * max_dim).unwrap();
     let mut pre2 = DeviceBuffer::<f32>::zeroed(&stream, t_frames * (2 * max_dim)).unwrap();
     let mut glu1 = DeviceBuffer::<f32>::zeroed(&stream, t_frames * max_dim).unwrap();
+    // GEMM1 + tanh per (stem, band), then GEMM2 + GLU per (stem, band)
+    let hidden_sz = 6 * bands * t_frames * 1024;
+    let mut hidden = DeviceBuffer::<f32>::zeroed(&stream, hidden_sz).unwrap();
+    let mut hidden_t = DeviceBuffer::<f32>::zeroed(&stream, hidden_sz).unwrap();
+    let max_dim = 2 * 129 * 2; // 516
+    let mut glu_all = DeviceBuffer::<f32>::zeroed(&stream, 6 * bands * t_frames * max_dim).unwrap();
+    let mut pre2 = DeviceBuffer::<f32>::zeroed(&stream, t_frames * (2 * max_dim)).unwrap();
+    let mut glu1 = DeviceBuffer::<f32>::zeroed(&stream, t_frames * max_dim).unwrap();
+    for s in 0..6 {
+        for b in 0..bands {
+            let xseg = slice_view(&stream, &xb, b * t_frames * 256, t_frames * 256).unwrap();
+            let w1seg = slice_view(&stream, &gw.mask_w1[s], b * 1024 * 256, 1024 * 256).unwrap();
+            let b1seg = slice_view(&stream, &gw.mask_b1[s], b * 1024, 1024).unwrap();
+            let h_off = (s * bands + b) * t_frames * 1024;
+            let mut hseg = mut_slice_view(&stream, &mut hidden, h_off, t_frames * 1024).unwrap();
+            // SAFETY: tile grid over t_frames x 1024.
+            unsafe { km.gemm_bias(&stream, tile_cfg(t_frames, 1024), t_frames as u32, 1024, 256, &*xseg, &*w1seg, &*b1seg, &mut *hseg) }.expect("mask gemm1");
+        }
+    }
+    // SAFETY: elementwise tanh over 6*bands*T*1024.
+    unsafe { km.tanh_e(&stream, cuda_core::simt::LaunchConfig::for_num_elems((6 * bands * t_frames * 1024) as u32), &hidden, &mut hidden_t) }.expect("tanh");
     for s in 0..6 {
         for b in 0..bands {
             let dim_in = 2 * freqs[b] * 2;
             let dim_out = dim_in * 2;
-            let w2_base = 2 * offs[b] as usize; // cumulative dim_out offset
+            let w2_base = 2 * offs[b] as usize;
             let w2seg = slice_view(&stream, &gw.mask_w2[s], w2_base * 1024, dim_out * 1024).unwrap();
             let b2seg = slice_view(&stream, &gw.mask_b2[s], w2_base, dim_out).unwrap();
-            let hseg = slice_view(&stream, &hidden_t, b * t_frames * 1024, t_frames * 1024).unwrap();
+            let h_off = (s * bands + b) * t_frames * 1024;
+            let hseg = slice_view(&stream, &hidden_t, h_off, t_frames * 1024).unwrap();
             let mut oseg = mut_slice_view(&stream, &mut pre2, 0, t_frames * dim_out).unwrap();
             // SAFETY: tile grid over t_frames x dim_out.
             unsafe { km.gemm_bias(&stream, tile_cfg(t_frames, dim_out), t_frames as u32, dim_out as u32, 1024, &*hseg, &*w2seg, &*b2seg, &mut *oseg) }.expect("mask gemm2");
-            // GLU halves into glu1 (t, dim_in)
             let pseg = slice_view(&stream, &pre2, 0, t_frames * dim_out).unwrap();
             let mut gseg = mut_slice_view(&stream, &mut glu1, 0, t_frames * dim_in).unwrap();
             // SAFETY: elementwise over t*dim_in.
             unsafe { km.glu_halve(&stream, cuda_core::simt::LaunchConfig::for_num_elems((t_frames * dim_in) as u32), &*pseg, &mut *gseg, dim_out as u32) }.expect("glu");
-            // copy glu1 into glu_all at (s, band) slot — elementwise with mapping
             let dst_base = ((s * bands + b) * t_frames) * max_dim;
             let src = slice_view(&stream, &glu1, 0, t_frames * dim_in).unwrap();
             let mut dst = mut_slice_view(&stream, &mut glu_all, dst_base, t_frames * max_dim).unwrap();
@@ -2381,11 +2398,37 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
             unsafe { km.copy_masked(&stream, cuda_core::simt::LaunchConfig::for_num_elems((t_frames * max_dim) as u32), &*src, &mut *dst, dim_in as u32, max_dim as u32) }.expect("copy");
         }
     }
-    drop(scr); // free trunk scratch before the big C2R plan
+    drop(scr);
     // mask apply -> C2R input frames
     let mut c2r_in = DeviceBuffer::<f32>::zeroed(&stream, 12 * t_frames * stft::FREQ_BINS * 2).unwrap();
     // SAFETY: elementwise over 12*T*1025*2.
     unsafe { km.mask_apply(&stream, cuda_core::simt::LaunchConfig::for_num_elems((12 * t_frames * 1025 * 2) as u32), &spec_dev, &glu_all, &f0_dev, &mut c2r_in, t_frames as u32, bands as u32) }.expect("mask apply");
+    {
+        let mref = npz::Npz::open(&root.join("parity/e2e_mask.npz")).expect("e2e_mask");
+        let mask_ref = mref.f32("mask").unwrap();
+        let ga = glu_all.to_host_vec(&stream).unwrap();
+        let f0v: Vec<usize> = f0.iter().map(|&x| x as usize).collect();
+        let mut me = 0.0f32;
+        let mut dn = 0.0f32;
+        for s in 0..6usize {
+            for fpos in 0..1025usize {
+                let band = f0v.iter().position(|&x| x > fpos).unwrap_or(62) - 1;
+                let fi = fpos - f0v[band];
+                for t in 0..t_frames {
+                    for ch in 0..2usize {
+                        for cc in 0..2usize {
+                            let ref_idx = ((s * 2050 + fpos * 2 + ch) * t_frames + t) * 2 + cc;
+                            let gcol = fi * 4 + ch * 2 + cc;
+                            let got = ga[((s * 62 + band) * t_frames + t) * 516 + gcol];
+                            me = me.max((got - mask_ref[ref_idx]).abs());
+                            dn = dn.max(mask_ref[ref_idx].abs());
+                        }
+                    }
+                }
+            }
+        }
+        println!("mask (glu_all) parity: rel={:.3e}", me / dn);
+    }
     for (n, b) in [(16usize, 2usize), (2048, 2), (2048, 32), (2048, 259)] {
         let p0 = fft.plan(n, b, false);
         eprintln!("probe c2r n={n} b={b}: {}", p0.is_ok())
@@ -2440,7 +2483,6 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     let snr = 10.0 * (sig / (noise + 1e-30)).log10();
     println!("E2E SNR vs ref_output: {snr:.2} dB");
 
-    let _ = &mask_dev;
 }
 
 fn self_test(device: usize) {
