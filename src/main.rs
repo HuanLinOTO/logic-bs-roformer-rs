@@ -997,7 +997,6 @@ mod gpu_kernels {
                 band += 1;
             }
             let fi = fpos - band_f0[band] as usize;
-            let _dim_in = (band_f0[band + 1] as usize - band_f0[band] as usize);
             let gcol = fi * 4 + ch * 2 + c;
             // glu rows are padded to max_dim = 516
             let g = glu[((stem * bands_ + band) * t_f + t) * 516 + gcol];
@@ -2387,6 +2386,10 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     let mut c2r_in = DeviceBuffer::<f32>::zeroed(&stream, 12 * t_frames * stft::FREQ_BINS * 2).unwrap();
     // SAFETY: elementwise over 12*T*1025*2.
     unsafe { km.mask_apply(&stream, cuda_core::simt::LaunchConfig::for_num_elems((12 * t_frames * 1025 * 2) as u32), &spec_dev, &glu_all, &f0_dev, &mut c2r_in, t_frames as u32, bands as u32) }.expect("mask apply");
+    for (n, b) in [(16usize, 2usize), (2048, 2), (2048, 32), (2048, 259)] {
+        let p0 = fft.plan(n, b, false);
+        eprintln!("probe c2r n={n} b={b}: {}", p0.is_ok())
+    }
     // C2R: plan batch = 12*T frames of n=2048
     let mut pcm = DeviceBuffer::<f32>::zeroed(&stream, 12 * t_frames * 2048).unwrap();
     for g in 0..12usize {
@@ -2410,7 +2413,8 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
                 for sc in 0..12usize {
                     let s = sc / 2;
                     let ch = sc % 2;
-                    result[(s * 2 + ch) * padded + pos] += frames_out[(sc * t_frames + t) * 2048 + n] * win[n];
+                    // cuFFT C2R is unnormalized: apply 1/N here.
+                    result[(s * 2 + ch) * padded + pos] += frames_out[(sc * t_frames + t) * 2048 + n] * win[n] * (1.0 / 2048.0);
                 }
             }
         }
