@@ -8,6 +8,9 @@
 mod audio;
 mod config;
 mod cufft;
+mod kernels;
+mod npz;
+mod stft;
 mod weights;
 
 use std::path::PathBuf;
@@ -22,6 +25,7 @@ struct Args {
     print_config: bool,
     check_weights: bool,
     fft_test: bool,
+    stft_test: bool,
     bench: bool,
     stems: Option<usize>,
 }
@@ -43,6 +47,7 @@ fn parse_args() -> Result<Args, String> {
             "--print-config" => args.print_config = true,
             "--check-weights" => args.check_weights = true,
             "--fft-test" => args.fft_test = true,
+            "--stft-test" => args.stft_test = true,
             "--bench" => args.bench = true,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -68,6 +73,11 @@ fn main() {
 
     if args.fft_test {
         fft_roundtrip_test(args.device);
+        return;
+    }
+
+    if args.stft_test {
+        stft_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
         return;
     }
 
@@ -154,19 +164,142 @@ use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 
 #[cuda_module]
-mod kernels {
+mod gpu_kernels {
     use super::*;
 
-    /// c[i] = a[i] + b[i] — toolchain smoke test.
+    /// STFT front-end: one windowed frame element per thread. See the
+    /// kernels/frame.rs doc for the reflect-gather semantics.
     #[kernel]
-    pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
+    pub fn frame_hann_reflect(
+        x: &[f32],
+        window: &[f32],
+        mut out: DisjointSlice<f32>,
+        n_fft: u32,
+        hop: u32,
+        len: u32,
+        frames: u32,
+    ) {
         let idx = thread::index_1d();
-        let i = idx.get();
-        if let Some(out) = c.get_mut(idx) {
-            *out = a[i] + b[i];
+        let g0 = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            let n_fft = n_fft as usize;
+            let hop = hop as usize;
+            let len = len as usize;
+            let frames = frames as usize;
+            let t2 = g0 / n_fft;
+            let j = g0 % n_fft;
+            let ch = t2 / frames;
+            let t = t2 % frames;
+            let pad = n_fft / 2;
+            let g = t * hop + j;
+            // numpy/torch 'reflect' mirrors WITHOUT repeating the border:
+            // left x_pad[k] = x[p-k]; right x_pad[p+len+k] = x[len-2-k].
+            let src = if g < pad {
+                pad - g
+            } else if g >= len + pad {
+                2 * len + pad - 2 - g
+            } else {
+                g - pad
+            };
+            *o = x[src * 2 + ch] * window[j];
+        }
+    }
+
+    /// ISTFT back-end: scale cuFFT's unnormalized C2R output by 1/n_fft.
+    #[kernel]
+    pub fn scale_1_over_n(mut x: DisjointSlice<f32>, n: f32) {
+        let idx = thread::index_1d();
+        if let Some(v) = x.get_mut(idx) {
+            *v /= n;
+        }
+    }
+
+    /// Minimal probe retained for toolchain smoke tests.
+    #[kernel]
+    pub fn probe_min(x: &[f32], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let g0 = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            *o = x[g0];
         }
     }
 }
+
+/// STFT parity vs torch.stft (parity/stft.npz from tools/dump_refs.py).
+/// Gate: max abs err < 1e-5 (STFT is a deterministic dot product; measured 3e-6).
+fn stft_parity_test(device: usize, model_dir: &std::path::Path) {
+    let npz_path = model_dir.parent().unwrap_or(model_dir).join("parity/stft.npz");
+    let npz = npz::Npz::open(&npz_path).unwrap_or_else(|e| panic!("{e}"));
+    let x = npz.f32("x").expect("x");               // (2, CHUNK) planar stereo
+    let window = npz.f32("window").expect("window"); // (2048,)
+    let ref_spec = npz.f32("spec").expect("spec");   // (2, 1025, T, 2)
+    let len = npz.shapes["x"][1];
+    let frames = stft::num_frames(len);
+    let ctx = CudaContext::new(device).expect("ctx");
+    let stream = ctx.default_stream();
+
+    // planar (2, L) -> interleaved (L, 2)
+    let mut xi = vec![0.0f32; len * 2];
+    for i in 0..len {
+        xi[i * 2] = x[i];
+        xi[i * 2 + 1] = x[len + i];
+    }
+    let our_win = stft::hann_window(stft::N_FFT);
+    let win_err = our_win.iter().zip(window).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    // torch's hann_window differs from a pure-f64 recompute by ~2e-7 (its
+    // internal form is float32). Far below the parity gate.
+    assert!(win_err < 1e-6, "hann window mismatch {win_err:e}");
+
+    let x_dev = DeviceBuffer::from_host(&stream, &xi).unwrap();
+    let win_dev = DeviceBuffer::from_host(&stream, &our_win).unwrap();
+    let mut frames_dev = DeviceBuffer::<f32>::zeroed(&stream, 2 * frames * stft::N_FFT).unwrap();
+    let km = gpu_kernels::load(&ctx).expect("kernel module");
+    // SAFETY: 1-D launch, one thread per output element; buffers sized for
+    // 2*frames*n_fft outputs, window of n_fft, input of len*2.
+    unsafe {
+        km.frame_hann_reflect(
+            &stream,
+            cuda_core::simt::LaunchConfig::for_num_elems((2 * frames * stft::N_FFT) as u32),
+            &x_dev,
+            &win_dev,
+            &mut frames_dev,
+            stft::N_FFT as u32,
+            stft::HOP as u32,
+            len as u32,
+            frames as u32,
+        )
+    }
+    .expect("frame kernel");
+
+    let fft = std::sync::Arc::new(cufft::Cufft::load().expect("cufft"));
+    let stft_plan = stft::Stft::new(fft, frames).expect("stft plan");
+    let mut spec_dev = DeviceBuffer::<f32>::zeroed(&stream, 2 * frames * stft::FREQ_BINS * 2).unwrap();
+    stft_plan.exec_fwd(&frames_dev, &mut spec_dev).expect("r2c");
+
+    let got = spec_dev.to_host_vec(&stream).unwrap();
+    // got layout: (t2 = ch*frames + t)(f)(c); ref layout: (ch)(f)(t)(c)
+    let t = frames;
+    let f = stft::FREQ_BINS;
+    let mut max_err = 0.0f32;
+    let mut denom_max = 0.0f32;
+    for ch in 0..2usize {
+        for ti in 0..t {
+            for fi in 0..f {
+                for c in 0..2usize {
+                    let g = got[((ch * t + ti) * f + fi) * 2 + c];
+                    let r = ref_spec[((ch * f + fi) * t + ti) * 2 + c];
+                    max_err = max_err.max((g - r).abs());
+                    denom_max = denom_max.max(r.abs());
+                }
+            }
+        }
+    }
+    let rel = max_err / denom_max;
+    println!("stft parity: frames={t} max_err={max_err:e} rel={rel:e}");
+    assert!(max_err < 1e-5 * denom_max + 1e-6, "stft parity failed");
+    println!("OK");
+}
+
 
 /// cufft R2C/C2R roundtrip parity: x -> R2C -> C2R*(1/n) == x, plus the
 /// DC/Nyquist bins of a known cosine.
@@ -229,30 +362,25 @@ fn self_test(device: usize) {
 
     const N: usize = 1 << 20;
     let a: Vec<f32> = (0..N).map(|i| i as f32 * 0.5).collect();
-    let b: Vec<f32> = (0..N).map(|i| (i as f32).sin()).collect();
 
     let a_dev = DeviceBuffer::from_host(&stream, &a).unwrap();
-    let b_dev = DeviceBuffer::from_host(&stream, &b).unwrap();
     let mut c_dev = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
 
-    let module = kernels::load(&ctx).expect("load embedded module");
+    let module = gpu_kernels::load(&ctx).expect("load embedded module");
     // SAFETY: 1-D launch, one thread per output element, buffers all length N.
     unsafe {
-        module.vecadd(
+        module.probe_min(
             &stream,
             LaunchConfig::for_num_elems(N as u32),
             &a_dev,
-            &b_dev,
             &mut c_dev,
         )
     }
-    .expect("launch vecadd");
+    .expect("launch probe_min");
 
     let c = c_dev.to_host_vec(&stream).unwrap();
-    let max_err = (0..N)
-        .map(|i| (c[i] - (a[i] + b[i])).abs())
-        .fold(0.0f32, f32::max);
-    println!("lbrr self-test: vecadd N={N} max_err={max_err:e}");
-    assert!(max_err < 1e-6, "vecadd mismatch");
+    let max_err = (0..N).map(|i| (c[i] - a[i]).abs()).fold(0.0f32, f32::max);
+    println!("lbrr self-test: probe_min N={N} max_err={max_err:e}");
+    assert!(max_err < 1e-6, "probe mismatch");
     println!("OK");
 }

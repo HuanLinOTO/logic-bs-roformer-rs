@@ -94,11 +94,16 @@ impl Cufft {
     }
 
     /// Batched 1-D real FFT plan. `n` points per transform, `batch`
-    /// transforms, contiguous: input stride 1 / dist n, output dist n/2+1.
+    /// transforms, contiguous layouts: R2C input dist n / output dist n/2+1,
+    /// C2R input dist n/2+1 / output dist n.
     pub fn plan(&self, n: usize, batch: usize, forward: bool) -> Result<CufftPlan, String> {
         let mut handle: c_int = 0;
         let dims = [n as c_int];
-        let dist = if forward { n as c_int } else { (n / 2 + 1) as c_int };
+        let (idist, odist) = if forward {
+            (n as c_int, (n / 2 + 1) as c_int)
+        } else {
+            ((n / 2 + 1) as c_int, n as c_int)
+        };
         let rc = unsafe {
             (self.plan_many)(
                 &mut handle,
@@ -106,10 +111,10 @@ impl Cufft {
                 dims.as_ptr(),
                 ptr::null(),
                 1,
-                dist,
+                idist,
                 ptr::null(),
                 1,
-                dist,
+                odist,
                 if forward { CUFFT_R2C } else { CUFFT_C2R },
                 batch as c_int,
             )
