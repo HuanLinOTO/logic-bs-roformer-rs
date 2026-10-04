@@ -1031,6 +1031,12 @@ mod gpu_kernels {
         }
     }
 
+
+    /// High-performance GEMM: 64x64 tile, 4x4 register blocking per thread.
+    /// Y[M,N] = X[M,K] · W[N,K]^T + bias. 256 threads per block, each
+    /// computing a 4x4 block of the 64x64 output tile.
+    
+
     /// Minimal probe retained for toolchain smoke tests.
     #[kernel]
     pub fn probe_min(x: &[f32], mut out: DisjointSlice<f32>) {
@@ -1945,6 +1951,7 @@ fn tile_cfg(m: usize, n: usize) -> cuda_core::simt::LaunchConfig {
         shared_mem_bytes: 0,
     }
 }
+
 
 /// A borrowed interior segment of a DeviceBuffer. Dropping the wrapper
 /// never frees the underlying memory (the parent buffer stays the sole
