@@ -128,7 +128,7 @@ def gen_qkv_rope():
         torch.add(to * cos, te * sin, out=out[..., 1::2])
         return out
     scale = dh ** -0.5
-    qr, kr = rot(q) * scale, rot(k) * scale
+    qr, kr = rot(q) * scale, rot(k)
     np.savez(OUT / "qkvrope.npz", x=x.reshape(-1), gamma=gamma, w=w.reshape(-1), bias=bias,
              cos=cos.numpy().reshape(-1), sin=sin.numpy().reshape(-1),
              q=qr.numpy().reshape(-1), k=kr.numpy().reshape(-1), v=v.numpy().reshape(-1))

@@ -547,7 +547,8 @@ mod gpu_kernels {
         } else {
             (ve, vo)
         };
-        let scale = if part < 2 { 0.125f32 } else { 1.0f32 };
+        // Only q (part 0) gets the SDPA scale; k must stay unscaled.
+        let scale = if part == 0 { 0.125f32 } else { 1.0f32 };
         let out_ptr = out.as_mut_ptr();
         // SAFETY: base+1 < rows*1536 by construction (c2 < 768).
         unsafe {
@@ -964,6 +965,61 @@ mod gpu_kernels {
             let src = (t * bands_ + b) * 256 + d;
             if let Some(o) = out.get_mut(idx) {
                 *o = x[src];
+            }
+        }
+    }
+
+    /// Apply the GLU'd per-band masks to the STFT spectrum, writing the
+    /// C2R batch layout directly: frame (stem*2 + ch)*T + t, freq bins, c.
+    /// glu layout is (stem, band, t, fi*4 + ch*2 + c) row-major.
+    #[kernel]
+    pub fn mask_apply(
+        spec: &[f32],
+        glu: &[f32],
+        band_f0: &[u32],
+        mut out: DisjointSlice<f32>,
+        t_frames: u32,
+        bands: u32,
+    ) {
+        let idx = thread::index_1d();
+        let g0 = idx.get();
+        if g0 < out.len() {
+            let (t_f, bands_) = (t_frames as usize, bands as usize);
+            let c = g0 % 2;
+            let fpos = (g0 / 2) % 1025;
+            let frame = g0 / 2 / 1025;
+            let ch = (frame / t_f) % 2;
+            let t = frame % t_f;
+            let stem = frame / (2 * t_f);
+            // locate band for this freq bin
+            let mut band = 0usize;
+            while band + 1 < band_f0.len() && (band_f0[band + 1] as usize) <= fpos {
+                band += 1;
+            }
+            let fi = fpos - band_f0[band] as usize;
+            let _dim_in = (band_f0[band + 1] as usize - band_f0[band] as usize);
+            let gcol = fi * 4 + ch * 2 + c;
+            // glu rows are padded to max_dim = 516
+            let g = glu[((stem * bands_ + band) * t_f + t) * 516 + gcol];
+            let s = spec[((ch * t_f + t) * 1025 + fpos) * 2 + c];
+            if let Some(o) = out.get_mut(idx) {
+                *o = s * g;
+            }
+        }
+    }
+
+    /// Copy compact rows (src_dim) into padded rows (dst_dim), zero-fill tail.
+    #[kernel]
+    pub fn copy_masked(src: &[f32], mut dst: DisjointSlice<f32>, src_dim: u32, dst_dim: u32) {
+        let idx = thread::index_1d();
+        let g0 = idx.get();
+        if g0 < dst.len() {
+            let (sd, dd) = (src_dim as usize, dst_dim as usize);
+            let row = g0 / dd;
+            let col = g0 % dd;
+            let v = if col < sd { src[row * sd + col] } else { 0.0 };
+            if let Some(o) = dst.get_mut(idx) {
+                *o = v;
             }
         }
     }
@@ -2295,35 +2351,91 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     let mut mask_dev = DeviceBuffer::<f32>::zeroed(&stream, 6 * bands * t_frames * 2 * 1025 * 2 / 1025 * 0 + 6 * t_frames * 4100).unwrap();
     let mut hidden = DeviceBuffer::<f32>::zeroed(&stream, bands * t_frames * 1024).unwrap();
     let mut hidden_t = DeviceBuffer::<f32>::zeroed(&stream, bands * t_frames * 1024).unwrap();
+
+    // ---- MaskEstimator: second GEMM + GLU per (stem, band), band-major layout ----
+    // glu_all: (s, band, t, dim_in) with per-band fixed stride max_dim (padded)
+    let max_dim = 2 * 129 * 2; // 516
+    let mut glu_all = DeviceBuffer::<f32>::zeroed(&stream, 6 * bands * t_frames * max_dim).unwrap();
+    let mut pre2 = DeviceBuffer::<f32>::zeroed(&stream, t_frames * (2 * max_dim)).unwrap();
+    let mut glu1 = DeviceBuffer::<f32>::zeroed(&stream, t_frames * max_dim).unwrap();
     for s in 0..6 {
         for b in 0..bands {
-            let dim_in = (2 * freqs[b] * 2) as usize;
-            // hidden = tanh(xb_b @ W1^T + b1)
-            let xseg = slice_view(&stream, &xb, b * t_frames * 256, t_frames * 256).unwrap();
-            let w1seg = slice_view(&stream, &gw.mask_w1[s], b * 1024 * 256, 1024 * 256).unwrap();
-            let b1seg = slice_view(&stream, &gw.mask_b1[s], b * 1024, 1024).unwrap();
-            let mut hseg = mut_slice_view(&stream, &mut hidden, b * t_frames * 1024, t_frames * 1024).unwrap();
-            // SAFETY: tile grid over t_frames x 1024.
-            unsafe {
-                km.gemm_bias(&stream, tile_cfg(t_frames, 1024), t_frames as u32, 1024, 256, &*xseg, &*w1seg, &*b1seg, &mut *hseg)
-            }.expect("mask gemm1");
-        }
-    }
-    // SAFETY: elementwise tanh.
-    unsafe { km.tanh_e(&stream, cuda_core::simt::LaunchConfig::for_num_elems((bands * t_frames * 1024) as u32), &hidden, &mut hidden_t) }.expect("tanh");
-    for s in 0..6 {
-        for b in 0..bands {
-            let dim_out = 2 * (2 * freqs[b] * 2); // dim_in*2
-            let w2seg = slice_view(&stream, &gw.mask_w2[s], b * dim_out * 1024, dim_out * 1024).unwrap();
-            let b2seg = slice_view(&stream, &gw.mask_b2[s], b * dim_out, dim_out).unwrap();
+            let dim_in = 2 * freqs[b] * 2;
+            let dim_out = dim_in * 2;
+            let w2_base = 2 * offs[b] as usize; // cumulative dim_out offset
+            let w2seg = slice_view(&stream, &gw.mask_w2[s], w2_base * 1024, dim_out * 1024).unwrap();
+            let b2seg = slice_view(&stream, &gw.mask_b2[s], w2_base, dim_out).unwrap();
             let hseg = slice_view(&stream, &hidden_t, b * t_frames * 1024, t_frames * 1024).unwrap();
-            let mut oseg = mut_slice_view(&stream, &mut mask_dev, s * t_frames * 4100 + offs[b] as usize * t_frames, 0).unwrap();
-            // write into a band-major tmp instead; see below
-            drop(oseg);
-            let _ = dim_out;
+            let mut oseg = mut_slice_view(&stream, &mut pre2, 0, t_frames * dim_out).unwrap();
+            // SAFETY: tile grid over t_frames x dim_out.
+            unsafe { km.gemm_bias(&stream, tile_cfg(t_frames, dim_out), t_frames as u32, dim_out as u32, 1024, &*hseg, &*w2seg, &*b2seg, &mut *oseg) }.expect("mask gemm2");
+            // GLU halves into glu1 (t, dim_in)
+            let pseg = slice_view(&stream, &pre2, 0, t_frames * dim_out).unwrap();
+            let mut gseg = mut_slice_view(&stream, &mut glu1, 0, t_frames * dim_in).unwrap();
+            // SAFETY: elementwise over t*dim_in.
+            unsafe { km.glu_halve(&stream, cuda_core::simt::LaunchConfig::for_num_elems((t_frames * dim_in) as u32), &*pseg, &mut *gseg, dim_out as u32) }.expect("glu");
+            // copy glu1 into glu_all at (s, band) slot — elementwise with mapping
+            let dst_base = ((s * bands + b) * t_frames) * max_dim;
+            let src = slice_view(&stream, &glu1, 0, t_frames * dim_in).unwrap();
+            let mut dst = mut_slice_view(&stream, &mut glu_all, dst_base, t_frames * max_dim).unwrap();
+            // SAFETY: elementwise copy over t*max_dim with masking.
+            unsafe { km.copy_masked(&stream, cuda_core::simt::LaunchConfig::for_num_elems((t_frames * max_dim) as u32), &*src, &mut *dst, dim_in as u32, max_dim as u32) }.expect("copy");
         }
     }
-    println!("(mask tail + istft to be wired next round)");
+    drop(scr); // free trunk scratch before the big C2R plan
+    // mask apply -> C2R input frames
+    let mut c2r_in = DeviceBuffer::<f32>::zeroed(&stream, 12 * t_frames * stft::FREQ_BINS * 2).unwrap();
+    // SAFETY: elementwise over 12*T*1025*2.
+    unsafe { km.mask_apply(&stream, cuda_core::simt::LaunchConfig::for_num_elems((12 * t_frames * 1025 * 2) as u32), &spec_dev, &glu_all, &f0_dev, &mut c2r_in, t_frames as u32, bands as u32) }.expect("mask apply");
+    // C2R: plan batch = 12*T frames of n=2048
+    let mut pcm = DeviceBuffer::<f32>::zeroed(&stream, 12 * t_frames * 2048).unwrap();
+    for g in 0..12usize {
+        let inv = fft.plan(2048, t_frames, false).expect("c2r plan");
+        let iseg = slice_view(&stream, &c2r_in, g * t_frames * 1025 * 2, t_frames * 1025 * 2).unwrap();
+        let mut oseg = mut_slice_view(&stream, &mut pcm, g * t_frames * 2048, t_frames * 2048).unwrap();
+        inv.exec_c2r((*iseg).cu_deviceptr(), (*oseg).cu_deviceptr()).expect("exec c2r");
+    }
+    let frames_out = pcm.to_host_vec(&stream).unwrap();
+    // host OLA: frame (s*2+ch)*T + t covers padded[n] = sum over frames w[n - t*hop] * f[..], then divide by win^2 sum, trim center pad
+    let win = sp.window();
+    let hop = stft::HOP;
+    let padded = len + 2 * 1024;
+    let mut result = vec![0.0f32; 6 * 2 * padded];
+    let mut counter = vec![0.0f32; padded];
+    for t in 0..t_frames {
+        for n in 0..2048usize {
+            let pos = t * hop + n;
+            if pos < padded {
+                counter[pos] += win[n] * win[n];
+                for sc in 0..12usize {
+                    let s = sc / 2;
+                    let ch = sc % 2;
+                    result[(s * 2 + ch) * padded + pos] += frames_out[(sc * t_frames + t) * 2048 + n] * win[n];
+                }
+            }
+        }
+    }
+    let mut final_out = vec![0.0f32; 6 * 2 * len];
+    for s in 0..6usize {
+        for ch in 0..2usize {
+            for i in 0..len {
+                let c = counter[1024 + i];
+                let v = if c > 1e-8 { result[(s * 2 + ch) * padded + 1024 + i] / c } else { 0.0 };
+                final_out[(s * 2 + ch) * len + i] = v;
+            }
+        }
+    }
+    // SNR vs ref
+    let mut sig = 0.0f64;
+    let mut noise = 0.0f64;
+    for i in 0..final_out.len() {
+        sig += (ref_out[i] as f64) * (ref_out[i] as f64);
+        let d = (final_out[i] - ref_out[i]) as f64;
+        noise += d * d;
+    }
+    let snr = 10.0 * (sig / (noise + 1e-30)).log10();
+    println!("E2E SNR vs ref_output: {snr:.2} dB");
+
     let _ = &mask_dev;
 }
 
