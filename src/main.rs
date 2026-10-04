@@ -2373,8 +2373,18 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
             unsafe { km.gemm_bias(&stream, tile_cfg(t_frames, 1024), t_frames as u32, 1024, 256, &*xseg, &*w1seg, &*b1seg, &mut *hseg) }.expect("mask gemm1");
         }
     }
+    {
+        let hv = hidden.to_host_vec(&stream).unwrap();
+        let h_off = (0 * bands + 0) * t_frames * 1024; // s=0, b=0
+        println!("GPU hidden[s0,b0,t0,0:4] = {:?}", &hv[h_off..h_off+4]);
+    }
     // SAFETY: elementwise tanh over 6*bands*T*1024.
     unsafe { km.tanh_e(&stream, cuda_core::simt::LaunchConfig::for_num_elems((6 * bands * t_frames * 1024) as u32), &hidden, &mut hidden_t) }.expect("tanh");
+    {
+        let ht = hidden_t.to_host_vec(&stream).unwrap();
+        let h_off = (0 * bands + 0) * t_frames * 1024;
+        println!("GPU hidden_t[s0,b0,t0,0:4] = {:?}", &ht[h_off..h_off+4]);
+    }
     for s in 0..6 {
         for b in 0..bands {
             let dim_in = 2 * freqs[b] * 2;
@@ -2396,6 +2406,13 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
             let mut dst = mut_slice_view(&stream, &mut glu_all, dst_base, t_frames * max_dim).unwrap();
             // SAFETY: elementwise copy over t*max_dim with masking.
             unsafe { km.copy_masked(&stream, cuda_core::simt::LaunchConfig::for_num_elems((t_frames * max_dim) as u32), &*src, &mut *dst, dim_in as u32, max_dim as u32) }.expect("copy");
+            if s == 0 && b == 0 {
+                let g1 = glu1.to_host_vec(&stream).unwrap();
+                println!("GPU glu1[s0,b0,t0,0:4] = {:?}", &g1[0..4]);
+                let ga = glu_all.to_host_vec(&stream).unwrap();
+                let ga_off = (0 * bands + 0) * t_frames * max_dim;
+                println!("GPU glu_all[s0,b0,t0,0:4] = {:?}", &ga[ga_off..ga_off+4]);
+            }
         }
     }
     drop(scr);
@@ -2428,6 +2445,33 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
             }
         }
         println!("mask (glu_all) parity: rel={:.3e}", me / dn);
+        // spot: stem 0 band 0 t 0 first 8 values
+        // also spot band 24 (freqs=12, dim_in=48) stem 0 t 0
+        {
+            let b24 = 24usize;
+            let f0_24 = f0[b24] as usize; // freq start for band 24
+            let dim_in_24 = (offs[b24 + 1] - offs[b24]) as usize;
+            for gc in 0..8usize {
+                let fi = gc / 4;
+                let ch = (gc % 4) / 2;
+                let cc = gc % 2;
+                let got_v = ga[((0 * 62 + b24) * t_frames + 0) * 516 + gc];
+                let ref_idx = ((0 * 2050 + (f0_24 + fi) * 2 + ch) * t_frames + 0) * 2 + cc;
+                let ref_v = mask_ref[ref_idx];
+                println!("  b24 glu[{}] = {got_v:.6} ref={ref_v:.6}", gc);
+            }
+        }
+        for gc in 0..8usize {
+            let band0 = 0usize;
+            let t0 = 0usize;
+            let s0 = 0usize;
+            let got_v = ga[((s0 * 62 + band0) * t_frames + t0) * 516 + gc];
+            let fpos = 0usize;
+            let ch = gc / 4;
+            let cc = gc % 2;
+            let ref_v = mask_ref[((s0 * 2050 + fpos * 2 + ch) * t_frames + t0) * 2 + cc];
+            println!("  glu_all[0,0,0,{}] = {got_v:.6} ref={ref_v:.6}", gc);
+        }
     }
     for (n, b) in [(16usize, 2usize), (2048, 2), (2048, 32), (2048, 259)] {
         let p0 = fft.plan(n, b, false);
