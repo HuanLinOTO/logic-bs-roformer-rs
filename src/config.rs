@@ -221,6 +221,12 @@ fn parse_block(lines: &[Line], pos: &mut usize, indent: usize) -> Result<Value, 
         if l.indent > indent {
             return Err(format!("line {}: unexpected indent", l.num));
         }
+        if l.text.starts_with("- ") || l.text == "-" {
+            // a sequence at the same indent belongs to the previous key (YAML
+            // allows list items aligned with their key) — stop and let the
+            // caller's sequence loop consume it.
+            break;
+        }
         let (key, rest) = l
             .text
             .split_once(':')
@@ -228,9 +234,17 @@ fn parse_block(lines: &[Line], pos: &mut usize, indent: usize) -> Result<Value, 
         let key = key.trim().to_string();
         let rest = rest.trim();
         *pos += 1;
-        if rest.is_empty() {
-            // nested block (or null)
-            if *pos < lines.len() && lines[*pos].indent > indent {
+        let rest_trim = rest.trim();
+        let tag_only = rest_trim.starts_with("!!") && !rest_trim.contains(' ') && !rest_trim.contains('\t');
+        if rest_trim.is_empty() || tag_only {
+            // nested block (or null); a bare tag like `!!python/tuple` also
+            // introduces the block sequence that follows it. Items may be
+            // indented deeper OR aligned with this key.
+            if *pos < lines.len()
+                && (lines[*pos].indent > indent
+                    || (lines[*pos].indent == indent
+                        && (lines[*pos].text.starts_with("- ") || lines[*pos].text == "-")))
+            {
                 let child_indent = lines[*pos].indent;
                 map.insert(key, parse_block(lines, pos, child_indent)?);
             } else {

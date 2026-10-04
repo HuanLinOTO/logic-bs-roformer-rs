@@ -7,6 +7,7 @@
 
 mod audio;
 mod config;
+mod weights;
 
 use std::path::PathBuf;
 
@@ -18,6 +19,7 @@ struct Args {
     device: usize,
     self_test: bool,
     print_config: bool,
+    check_weights: bool,
     bench: bool,
     stems: Option<usize>,
 }
@@ -37,6 +39,7 @@ fn parse_args() -> Result<Args, String> {
             "--stems" => args.stems = Some(need("--stems")?.parse().map_err(|_| "bad --stems")?),
             "--self-test" => args.self_test = true,
             "--print-config" => args.print_config = true,
+            "--check-weights" => args.check_weights = true,
             "--bench" => args.bench = true,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -79,6 +82,36 @@ fn main() {
 
     if args.print_config {
         println!("{cfg:#?}");
+        return;
+    }
+
+    if args.check_weights {
+        let st_path = model_dir.join("model.safetensors");
+        let t0 = std::time::Instant::now();
+        let st = match weights::SafeTensors::open(&st_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("lbrr: {}: {e}", st_path.display());
+                std::process::exit(1);
+            }
+        };
+        println!("safetensors: {} tensors parsed in {:?}", st.metas.len(), t0.elapsed());
+        match weights::ModelWeights::load(&st, &cfg) {
+            Ok(w) => {
+                println!(
+                    "weights OK: {} layers, {} bands, {} stems; shared qkv bias len {}",
+                    w.layers.len(),
+                    w.band_w.len(),
+                    w.mask_w1.len(),
+                    w.shared_qkv_bias.len()
+                );
+                println!("all checkpoint keys consumed exactly once");
+            }
+            Err(e) => {
+                eprintln!("lbrr: weight load failed: {e}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
 
