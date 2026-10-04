@@ -75,7 +75,32 @@ kernel-only 124.7 ms，比 120.8 ms 基线慢约 3.2%；冷启动 wall time 仍
    warp tile / ldmatrix 组合、权重常驻 FP16。
 2. 时间轴 score softmax 仍有 10.6 ms；探索更便宜的 partial reduction 或
    tensor-core flash attention，避免 materialized score 的完整读。
-3. 预分配/复用全部 mask scratch，消除冷启动 wall time 中约 60–120 ms 的
+3. 预分配/复用全部 scratch，建立 warm benchmark loop，隔离冷启动
    allocator/D2H 开销。
-4. 预分配/复用全部 mask scratch，消除冷启动 wall time 中约 60–120 ms 的
-   allocator/D2H 开销。
+## Nsight Compute 定位与已否决方案
+
+对稳定版 QKV `gemm_f16_128x64`（grid 24×126、block 256）采集 hardware counter：
+
+```text
+L1/shared throughput              76.3%
+shared load bank conflicts     54,365,655
+DRAM throughput                  14.8%
+SM throughput                    36.4%
+active warps                     49.1%
+kernel duration                 1.10 ms
+```
+
+瓶颈明确是 shared-memory fragment load 的 bank conflict，而非 DRAM 或 tensor core 峰值。以下方案均已实现并验证正确性，但在 RTX 3080 上比当前 128×64 布局慢，已回退：
+
+| 方案 | QKV 24-launch 总时间 | 结论 |
+|---|---:|---|
+| 稳定版 128×64 / 8 warps | 22.51 ms | 当前最优 |
+| 128×128 / 16 warps / block512 | 32.06 ms | 更大 tile 增加同步与占用压力 |
+| 128×128 / 8 warps / 16 accumulators | 125.29 ms | 寄存器/串行 MMA 严重限制 |
+| FP16 packed A + W | 25.91 ms | 减半流量但地址/转换开销更大 |
+| 33-word padded shared rows | 80.50 ms | 生成地址计算代价高 |
+| corrected row-tag XOR swizzle | 26.69 ms | bank conflict 降低但总时间变慢 |
+| ldmatrix.x4 + ldmatrix.x2 | 28.38 ms | fragment load 指令减少仍不敌开销 |
+
+另外尝试了 time-axis softmax 融合：QK epilogue 用 atomic max 聚合行最大值，PV 在加载 score 时同步累计 `exp(score-max)` 行和。Layer 0 正确且无 NaN，但后续层出现 NaN；将频率轴拆回独立 proven kernel 后仍复现，判断与当前 atomic/key 状态交互不稳定，已完整回退。cuBLASLt heuristic 可找到 TF32 算法，但实际调用会使 cuda-oxide stream 出现 unspecified launch failure，继续不可用。
+
