@@ -161,6 +161,36 @@ def gen_attn_long():
     print("attn_long.npz: bh=4 seq=256")
 
 
+def gen_gateout_ff():
+    """gate_out (gates sigmoid*attn -> out proj -> +residual) and FF (GELU erf)."""
+    rs = np.random.RandomState(29)
+    M, dim, heads, dh, ff = 512, 256, 8, 64, 1024
+    h = (rs.randn(M, dim) * 0.5).astype(np.float32)          # post-norm activations
+    x_res = (rs.randn(M, dim) * 0.5).astype(np.float32)      # attention input (residual)
+    attn_raw = (rs.randn(M, heads * dh) * 0.3).astype(np.float32)
+    wg = (rs.randn(heads, dim) * 0.1).astype(np.float32)
+    bg = (rs.randn(heads) * 0.1).astype(np.float32)
+    wo = (rs.randn(dim, heads * dh) * 0.05).astype(np.float32)
+    bo = (rs.randn(dim) * 0.05).astype(np.float32)
+    gates = torch.sigmoid(torch.nn.functional.linear(torch.from_numpy(h), torch.from_numpy(wg), torch.from_numpy(bg)))
+    scaled = torch.from_numpy(attn_raw).view(M, heads, dh) * gates.unsqueeze(-1)
+    attn_out = torch.nn.functional.linear(scaled.reshape(M, heads * dh), torch.from_numpy(wo), torch.from_numpy(bo)) + torch.from_numpy(x_res)
+    # FF
+    hff = attn_out
+    w1 = (rs.randn(ff, dim) * 0.05).astype(np.float32)
+    b1 = (rs.randn(ff) * 0.05).astype(np.float32)
+    w2 = (rs.randn(dim, ff) * 0.05).astype(np.float32)
+    b2 = (rs.randn(dim) * 0.05).astype(np.float32)
+    ff1 = torch.nn.functional.gelu(torch.nn.functional.linear(hff, torch.from_numpy(w1), torch.from_numpy(b1)))
+    ff_out = torch.nn.functional.linear(ff1, torch.from_numpy(w2), torch.from_numpy(b2)) + hff
+    np.savez(OUT / "gateff.npz",
+             h=h.reshape(-1), x_res=x_res.reshape(-1), attn_raw=attn_raw.reshape(-1),
+             wg=wg.reshape(-1), bg=bg, wo=wo.reshape(-1), bo=bo,
+             w1=w1.reshape(-1), b1=b1, w2=w2.reshape(-1), b2=b2,
+             attn_out=attn_out.numpy().reshape(-1), ff1=ff1.numpy().reshape(-1), ff_out=ff_out.numpy().reshape(-1))
+    print("gateff.npz: M=512")
+
+
 def main():
     OUT.mkdir(exist_ok=True)
     torch.manual_seed(0)
@@ -171,6 +201,7 @@ def main():
     gen_qkv_rope()
     gen_attn_short()
     gen_attn_long()
+    gen_gateout_ff()
 
 
 if __name__ == "__main__":

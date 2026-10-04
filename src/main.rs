@@ -31,6 +31,7 @@ struct Args {
     gemm_test: bool,
     qkvrope_test: bool,
     attn_test: bool,
+    gateff_test: bool,
     bench: bool,
     stems: Option<usize>,
 }
@@ -58,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
             "--gemm-test" => args.gemm_test = true,
             "--qkvrope-test" => args.qkvrope_test = true,
             "--attn-test" => args.attn_test = true,
+            "--gateff-test" => args.gateff_test = true,
             "--bench" => args.bench = true,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -88,6 +90,11 @@ fn main() {
 
     if args.stft_test {
         stft_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        return;
+    }
+
+    if args.gateff_test {
+        gateff_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
         return;
     }
 
@@ -716,6 +723,56 @@ mod gpu_kernels {
         }
     }
 
+    /// GELU (erf form) via the Abramowitz-Stegun 7.1.26 approximation
+    /// (|eps| <= 1.5e-7, ~1000x tighter than the tanh approximation).
+    #[kernel]
+    pub fn gelu_erf(x: &[f32], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            let v = x[i];
+            let sign = if v < 0.0 { -1.0f32 } else { 1.0 };
+            // GELU uses erf(x/sqrt(2))
+            let a = v.abs() * 0.70710678;
+            let t = 1.0 / (1.0 + 0.3275911 * a);
+            let poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+            let erfa = sign * (1.0 - poly * (-a * a).exp());
+            *o = 0.5 * v * (1.0 + erfa);
+        }
+    }
+
+    /// Head-gate scaling BEFORE the out projection:
+    /// scaled[m, c] = attn_raw[m, c] * sigmoid(gates[m, c/64]), c in [0,512).
+    #[kernel]
+    pub fn gate_scale(
+        attn_raw: &[f32],
+        gates: &[f32],
+        mut out: DisjointSlice<f32>,
+    ) {
+        let idx = thread::index_1d();
+        let g0 = idx.get();
+        if g0 < attn_raw.len() {
+            let head = (g0 % 512) / 64;
+            let m = g0 / 512;
+            let sig = 1.0 / (1.0 + (-gates[m * 8 + head]).exp());
+            if let Some(o) = out.get_mut(idx) {
+                *o = attn_raw[g0] * sig;
+            }
+        }
+    }
+
+    /// Elementwise y[i] = x[i] + res[i].
+    #[kernel]
+    pub fn add_resid(x: &[f32], res: &[f32], mut y: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i < x.len() {
+            if let Some(o) = y.get_mut(idx) {
+                *o = x[i] + res[i];
+            }
+        }
+    }
+
     /// Minimal probe retained for toolchain smoke tests.
     #[kernel]
     pub fn probe_min(x: &[f32], mut out: DisjointSlice<f32>) {
@@ -1197,6 +1254,134 @@ fn attn_parity_test(device: usize, model_dir: &std::path::Path) {
     }
     println!("attn_long parity: bh={bh2} seq={seq2} max_err={me2:e} rel={:.3e}", me2 / dn2);
     assert!(me2 < 1e-3 * dn2, "attn_long parity failed");
+    println!("OK");
+}
+
+/// Gate/out-proj/FF chain parity (parity/gateff.npz).
+fn gateff_parity_test(device: usize, model_dir: &std::path::Path) {
+    let npz_path = model_dir.parent().unwrap_or(model_dir).join("parity/gateff.npz");
+    let npz = npz::Npz::open(&npz_path).unwrap_or_else(|e| panic!("{e}"));
+    let m = 512usize;
+    let (dim, heads_dim, ff) = (256usize, 512usize, 1024usize);
+    let ctx = CudaContext::new(device).expect("ctx");
+    let stream = ctx.default_stream();
+    let km = gpu_kernels::load(&ctx).expect("kernel module");
+    let gemm2 = |mm: usize, nn: usize, kk: usize, x: &DeviceBuffer<f32>, w: &DeviceBuffer<f32>, bias: &DeviceBuffer<f32>, y: &mut DeviceBuffer<f32>| {
+        // SAFETY: 2-D grid of 16x16 tiles covering mm x nn.
+        unsafe {
+            km.gemm_bias(
+                &stream,
+                cuda_core::simt::LaunchConfig {
+                    grid_dim: ((nn.div_ceil(16)) as u32, (mm.div_ceil(16)) as u32, 1),
+                    block_dim: (16, 16, 1),
+                    shared_mem_bytes: 0,
+                },
+                mm as u32,
+                nn as u32,
+                kk as u32,
+                x,
+                w,
+                bias,
+                y,
+            )
+        }
+        .expect("gemm");
+    };
+
+    // gates GEMM (M, 256 -> 8)
+    let h = npz.f32("h").unwrap();
+    let wg = npz.f32("wg").unwrap();
+    let bg = npz.f32("bg").unwrap();
+    let h_dev = DeviceBuffer::from_host(&stream, h).unwrap();
+    let wg_dev = DeviceBuffer::from_host(&stream, wg).unwrap();
+    let bg_dev = DeviceBuffer::from_host(&stream, bg).unwrap();
+    let mut gates_dev = DeviceBuffer::<f32>::zeroed(&stream, m * 8).unwrap();
+    gemm2(m, 8, dim, &h_dev, &wg_dev, &bg_dev, &mut gates_dev);
+
+    // gate scale on attn_raw
+    let attn_raw = npz.f32("attn_raw").unwrap();
+    let attn_dev = DeviceBuffer::from_host(&stream, attn_raw).unwrap();
+    let mut scaled_dev = DeviceBuffer::<f32>::zeroed(&stream, m * heads_dim).unwrap();
+    // SAFETY: elementwise over m*512.
+    unsafe {
+        km.gate_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * heads_dim) as u32), &attn_dev, &gates_dev, &mut scaled_dev)
+    }
+    .expect("gate scale");
+
+    // out proj GEMM (M, 512 -> 256) + residual
+    let wo = npz.f32("wo").unwrap();
+    let bo = npz.f32("bo").unwrap();
+    let x_res = npz.f32("x_res").unwrap();
+    let wo_dev = DeviceBuffer::from_host(&stream, wo).unwrap();
+    let bo_dev = DeviceBuffer::from_host(&stream, bo).unwrap();
+    let mut oproj_dev = DeviceBuffer::<f32>::zeroed(&stream, m * dim).unwrap();
+    gemm2(m, dim, heads_dim, &scaled_dev, &wo_dev, &bo_dev, &mut oproj_dev);
+    let res_dev = DeviceBuffer::from_host(&stream, x_res).unwrap();
+    let mut attn_out_dev = DeviceBuffer::<f32>::zeroed(&stream, m * dim).unwrap();
+    // SAFETY: elementwise over m*256.
+    unsafe {
+        km.add_resid(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * dim) as u32), &oproj_dev, &res_dev, &mut attn_out_dev)
+    }
+    .expect("add resid");
+
+    let attn_out = attn_out_dev.to_host_vec(&stream).unwrap();
+    let ref_attn = npz.f32("attn_out").unwrap();
+    let mut e1 = 0.0f32;
+    let mut d1 = 0.0f32;
+    for i in 0..attn_out.len() {
+        e1 = e1.max((attn_out[i] - ref_attn[i]).abs());
+        d1 = d1.max(ref_attn[i].abs());
+    }
+    println!("gate+outproj parity: rel={:.3e}", e1 / d1);
+    assert!(e1 < 1e-4 * d1, "gate/outproj parity failed");
+
+    // FF1: GEMM (M,256->1024) + GELU
+    let w1 = npz.f32("w1").unwrap();
+    let b1 = npz.f32("b1").unwrap();
+    let w1_dev = DeviceBuffer::from_host(&stream, w1).unwrap();
+    let b1_dev = DeviceBuffer::from_host(&stream, b1).unwrap();
+    let mut pre_dev = DeviceBuffer::<f32>::zeroed(&stream, m * ff).unwrap();
+    gemm2(m, ff, dim, &attn_out_dev, &w1_dev, &b1_dev, &mut pre_dev);
+    let mut ff1_dev = DeviceBuffer::<f32>::zeroed(&stream, m * ff).unwrap();
+    // SAFETY: elementwise over m*ff.
+    unsafe {
+        km.gelu_erf(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * ff) as u32), &pre_dev, &mut ff1_dev)
+    }
+    .expect("gelu");
+    let ff1 = ff1_dev.to_host_vec(&stream).unwrap();
+    let ref_ff1 = npz.f32("ff1").unwrap();
+    let mut e2 = 0.0f32;
+    let mut d2 = 0.0f32;
+    for i in 0..ff1.len() {
+        e2 = e2.max((ff1[i] - ref_ff1[i]).abs());
+        d2 = d2.max(ref_ff1[i].abs());
+    }
+    println!("ff1+gelu parity: rel={:.3e}", e2 / d2);
+    assert!(e2 < 5e-4 * d2, "ff1 parity failed");
+
+    // FF2: GEMM (M,1024->256) + residual
+    let w2 = npz.f32("w2").unwrap();
+    let b2 = npz.f32("b2").unwrap();
+    let w2_dev = DeviceBuffer::from_host(&stream, w2).unwrap();
+    let b2_dev = DeviceBuffer::from_host(&stream, b2).unwrap();
+    let mut ffo_dev = DeviceBuffer::<f32>::zeroed(&stream, m * dim).unwrap();
+    gemm2(m, dim, ff, &ff1_dev, &w2_dev, &b2_dev, &mut ffo_dev);
+    let mut ff_out_dev = DeviceBuffer::<f32>::zeroed(&stream, m * dim).unwrap();
+    // SAFETY: elementwise over m*256.
+    unsafe {
+        km.add_resid(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * dim) as u32), &ffo_dev, &attn_out_dev, &mut ff_out_dev)
+    }
+    .expect("add resid 2");
+    let ff_out = ff_out_dev.to_host_vec(&stream).unwrap();
+    let ref_ff = npz.f32("ff_out").unwrap();
+    let mut e3 = 0.0f32;
+    let mut d3 = 0.0f32;
+    for i in 0..ff_out.len() {
+        e3 = e3.max((ff_out[i] - ref_ff[i]).abs());
+        d3 = d3.max(ref_ff[i].abs());
+    }
+    println!("ff2+resid parity: rel={:.3e}", e3 / d3);
+    assert!(e3 < 1e-4 * d3, "ff2 parity failed");
     println!("OK");
 }
 
