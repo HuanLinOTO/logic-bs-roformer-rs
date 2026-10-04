@@ -459,6 +459,47 @@ mod gpu_kernels {
         }
     }
 
+    /// BandSplit stage 1: per-(band,time) RMSNorm into a padded band-major
+    /// tensor consumed by the tensor-core BandSplit GEMM.
+    #[kernel]
+    pub fn bandsplit_norm(
+        x: &[f32], gamma: &[f32], band_off: &[u32], band_dims: &[u32],
+        mut out: DisjointSlice<f32>, t_rows: u32, bands: u32, max_dim: u32,
+    ) {
+        let gid = thread::index_1d();
+        let g0 = gid.get();
+        let lane = warp::lane_id() as usize;
+        let task = g0 / 32;
+        let (t_f, bands_, width) = (t_rows as usize, bands as usize, max_dim as usize);
+        if task >= bands_ * t_f { return; }
+        let band = task / t_f;
+        let t = task % t_f;
+        let dim = band_dims[band] as usize;
+        let g_off = band_off[band] as usize;
+        let x_off = t * band_off[bands_] as usize + g_off;
+        let out_off = task * width;
+        let per = dim.div_ceil(32);
+        let mut vals = [0.0f32; 17];
+        let mut s = 0.0f32;
+        for i in 0..per {
+            let j = lane + i * 32;
+            let v = if j < dim { x[x_off + j] } else { 0.0 };
+            vals[i] = v;
+            s += v * v;
+        }
+        s = warp::reduce_sum_f32(s);
+        let denom = if s.sqrt() > 1e-12 { s.sqrt() } else { 1e-12 };
+        let scale = (dim as f32).sqrt() / denom;
+        let ptr = out.as_mut_ptr();
+        for i in 0..17usize {
+            let j = lane + i * 32;
+            let v = if i < per && j < dim { vals[i] * scale * gamma[g_off + j] } else { 0.0 };
+            if j < width {
+                unsafe { *ptr.add(out_off + j) = v; }
+            }
+        }
+    }
+
     /// Debug variant: lane 0 recomputes the whole band serially from the
     /// warp-reduced norm. Isolates lane-partitioning bugs.
     #[kernel]
@@ -2700,6 +2741,112 @@ mod gpu_kernels {
         }
     }
 
+    /// BandSplit stage 2: grouped FP16 tensor-core GEMM over padded normalized bands.
+    /// MaskEstimator GEMM1 for one stem: (62 bands, T, 256) -> hidden
+    /// (62, T, 1024). One launch per stem; bands are the grid.z dimension.
+    #[kernel]
+    pub fn bandsplit_gemm_f16(
+        band_off: &[u32], band_dims: &[u32],
+        x: &[f32], w: &[f32], bias: &[f32],
+        mut y: DisjointSlice<f32>, t_rows: u32, bands: u32, max_dim: u32,
+    ) {
+        // Packed f16 shared tiles. SA is row-major with adjacent K pairs;
+        // SB is column-major with adjacent K pairs, matching the MMA fragments
+        // exactly, so the K-loop performs each f32->f16 conversion once during
+        // the cooperative load rather than once per warp/fragment reuse.
+        static mut SA: SharedArray<u32, { 128 * 8 }> = SharedArray::UNINIT;
+        static mut SB: SharedArray<u32, { 64 * 8 }> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let warp_id = tid / 32;
+        let group = lane / 4;
+        let tig = lane % 4;
+        let block_row_base = thread::blockIdx_y() as usize * 128;
+        let row_base = block_row_base + warp_id * 16;
+        let col_base = thread::blockIdx_x() as usize * 64;
+        let m_size = t_rows as usize;
+        let n_size = 256usize;
+        let bands = bands as usize;
+        let max_dim = max_dim as usize;
+        let band = thread::blockIdx_z() as usize;
+        let k_size = band_dims[band] as usize;
+        let g_off = band_off[band] as usize;
+        let x_off = band * m_size * max_dim;
+        let w_off = 256 * g_off;
+        let bias_off = band * 256;
+        let mut acc = [[0.0f32; 4]; 8];
+
+        let num_k = k_size.div_ceil(16);
+        for ks in 0..num_k {
+            let k_base = ks * 16;
+            unsafe {
+                // 128 rows x 8 K-pairs = 1024 assignments, 4 per thread.
+                for i in 0..4usize {
+                    let idx = tid + i * 256;
+                    let r = idx / 8;
+                    let kp = idx % 8;
+                    let xr = block_row_base + r;
+                    let k0 = k_base + kp * 2;
+                    let k1 = k0 + 1;
+                    let v0 = if xr < m_size && k0 < k_size { x[x_off + xr * max_dim + k0] } else { 0.0 };
+                    let v1 = if xr < m_size && k1 < k_size { x[x_off + xr * max_dim + k1] } else { 0.0 };
+                    SA[r * 8 + kp] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                }
+                // 64 columns x 8 K-pairs = 512 assignments, 2 per thread.
+                for i in 0..2usize {
+                    let idx = tid + i * 256;
+                    let col = idx / 8;
+                    let kp = idx % 8;
+                    let bc = col_base + col;
+                    let k0 = k_base + kp * 2;
+                    let k1 = k0 + 1;
+                    let v0 = if bc < n_size && k0 < k_size { w[w_off + bc * k_size + k0] } else { 0.0 };
+                    let v1 = if bc < n_size && k1 < k_size { w[w_off + bc * k_size + k1] } else { 0.0 };
+                    SB[col * 8 + kp] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                }
+            }
+            thread::sync_threads();
+
+            let mut a = [0u32; 4];
+            unsafe {
+                let r0 = warp_id * 16 + group;
+                let r1 = r0 + 8;
+                let k_word = tig;
+                let k_word_hi = tig + 4;
+                a[0] = SA[r0 * 8 + k_word];
+                a[1] = SA[r1 * 8 + k_word];
+                a[2] = SA[r0 * 8 + k_word_hi];
+                a[3] = SA[r1 * 8 + k_word_hi];
+            }
+            for nt in 0..8usize {
+                let mut b = [0u32; 2];
+                unsafe {
+                    let col_word = (nt * 8 + group) * 8;
+                    b[0] = SB[col_word + tig];
+                    b[1] = SB[col_word + tig + 4];
+                }
+                acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
+            }
+            thread::sync_threads();
+        }
+
+        let out_ptr = y.as_mut_ptr();
+        for nt in 0..8usize {
+            for j in 0..4usize {
+                let r = row_base + group + if j >= 2 { 8 } else { 0 };
+                let cc = col_base + nt * 8 + tig * 2 + (j & 1);
+                if r < m_size && cc < n_size {
+                    // SAFETY: bounds checked; y has m*n elements.
+                    unsafe {
+                        *out_ptr.add((r * bands + band) * n_size + cc) = acc[nt][j] + bias[bias_off + cc];
+                    }
+                }
+            }
+        }
+    }
+
+
     /// MaskEstimator GEMM1 for one stem: (62 bands, T, 256) -> hidden
     /// (62, T, 1024). One launch per stem; bands are the grid.z dimension.
     #[kernel]
@@ -3193,13 +3340,9 @@ fn gemm_parity_test(device: usize, model_dir: &std::path::Path) {
             max_err = max_err.max((got[i] - ref_y[i]).abs());
             denom = denom.max(ref_y[i].abs());
         }
-        println!("gemm[{gi}] K={k} N={n}: max_err={max_err:e} rel={:.3e}", max_err / denom);
-        // The production path now uses gemm_f16_128x64; this legacy SIMT check
-        // is informational while the tensor-core result below remains the gate.
-        let _ = (max_err, denom);
 
         let mut y_tf = DeviceBuffer::<f32>::zeroed(&stream, m * n).unwrap();
-        // SAFETY: grid covers 64x8 tensor-core tiles over m x n.
+        // SAFETY: grid covers 64x128 FP16 tensor-core tiles over m x n.
         unsafe {
             km.gemm_f16_128x64(&stream, tile_cfg_tf32_64(m, *n), m as u32, *n as u32, *k as u32, &x_dev, &w_dev, &b_dev, &mut y_tf)
         }
@@ -3223,6 +3366,7 @@ fn gemm_parity_test(device: usize, model_dir: &std::path::Path) {
             }
         }
         println!("tf32 bad_count={bad_count}/{} by_row={:?}", got_tf.len(), by_row);
+
         println!("tf32 by_col={:?}", by_col);
         if gi == 0 {
             println!("tf32 row mapping (got row -> best ref row, maxerr):");
@@ -4159,13 +4303,20 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
             &spec_dev, &f0_dev, &offs_dev, &mut xin_dev, t_frames as u32)
     }.expect("spec reorder");
 
-    // 3. BandSplit -> x (T, 62, 256)
+    // 3. BandSplit: padded RMSNorm followed by grouped tensor-core GEMM.
+    let max_dim = 2 * 129 * 2; // 516
+    let mut bsnorm = DeviceBuffer::<f32>::zeroed(&stream, bands * t_frames * max_dim).unwrap();
     let mut x = DeviceBuffer::<f32>::zeroed(&stream, m * 256).unwrap();
-    // SAFETY: one warp per (t, band).
+    // SAFETY: one warp per (band, time) row.
     unsafe {
-        km.bandsplit(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * 32) as u32),
-            &xin_dev, &gw.band_gamma, &gw.band_w, &gw.band_b, &offs_dev, &dims_dev, &mut x, t_frames as u32, bands as u32)
-    }.expect("bandsplit");
+        km.bandsplit_norm(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * 32) as u32),
+            &xin_dev, &gw.band_gamma, &offs_dev, &dims_dev, &mut bsnorm, t_frames as u32, bands as u32, max_dim as u32)
+    }.expect("bandsplit norm");
+    // SAFETY: 64x128 FP16 tiles for every band.
+    unsafe {
+        km.bandsplit_gemm_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (4, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+            &offs_dev, &dims_dev, &bsnorm, &gw.band_w, &gw.band_b, &mut x, t_frames as u32, bands as u32, max_dim as u32)
+    }.expect("bandsplit gemm");
 
     // rotary tables for both axes
     let cos_t: Vec<f32> = (0..t_frames).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).cos())).collect();
