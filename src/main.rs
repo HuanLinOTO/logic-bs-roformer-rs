@@ -26,6 +26,7 @@ struct Args {
     check_weights: bool,
     fft_test: bool,
     stft_test: bool,
+    rmsnorm_test: bool,
     bench: bool,
     stems: Option<usize>,
 }
@@ -48,6 +49,7 @@ fn parse_args() -> Result<Args, String> {
             "--check-weights" => args.check_weights = true,
             "--fft-test" => args.fft_test = true,
             "--stft-test" => args.stft_test = true,
+            "--rmsnorm-test" => args.rmsnorm_test = true,
             "--bench" => args.bench = true,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -78,6 +80,11 @@ fn main() {
 
     if args.stft_test {
         stft_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        return;
+    }
+
+    if args.rmsnorm_test {
+        rmsnorm_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
         return;
     }
 
@@ -161,7 +168,7 @@ fn main() {
 
 use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
-use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
+use cuda_device::{DisjointSlice, cuda_module, kernel, thread, warp};
 
 #[cuda_module]
 mod gpu_kernels {
@@ -211,6 +218,50 @@ mod gpu_kernels {
         let idx = thread::index_1d();
         if let Some(v) = x.get_mut(idx) {
             *v /= n;
+        }
+    }
+
+    /// RMSNorm: out[r] = normalize(x[r]) * sqrt(dim) * gamma, one warp per
+    /// row, butterfly reduction for the squared sum. dim must be a multiple
+    /// of 32 (256 = 8 elements per lane).
+    #[kernel]
+    pub fn rmsnorm(x: &[f32], gamma: &[f32], mut out: DisjointSlice<f32>, rows: u32, dim: u32) {
+        let gid = thread::index_1d();
+        let g0 = gid.get();
+        let lane = warp::lane_id() as usize;
+        let warp_id = g0 / 32;
+        let rows = rows as usize;
+        let dim = dim as usize;
+        let per_lane = dim / 32;
+        if warp_id >= rows {
+            return;
+        }
+        let base = warp_id * dim + lane * per_lane;
+        // partial squared sum over this lane's elements
+        let mut vals = [0.0f32; 8];
+        let mut s = 0.0f32;
+        for k in 0..per_lane {
+            let v = x[base + k];
+            vals[k] = v;
+            s += v * v;
+        }
+        // butterfly warp reduce
+        s += warp::shuffle_xor_f32(s, 16);
+        s += warp::shuffle_xor_f32(s, 8);
+        s += warp::shuffle_xor_f32(s, 4);
+        s += warp::shuffle_xor_f32(s, 2);
+        s += warp::shuffle_xor_f32(s, 1);
+        let norm = s.sqrt();
+        let denom = if norm > 1e-12 { norm } else { 1e-12 };
+        let scale = (dim as f32).sqrt() / denom;
+        let out_ptr = out.as_mut_ptr();
+        for k in 0..per_lane {
+            let i = base + k;
+            // SAFETY: rows*dim total elements, i < rows*dim by construction;
+            // each warp owns a disjoint row, lanes write disjoint columns.
+            unsafe {
+                *out_ptr.add(i) = vals[k] * scale * gamma[i % dim];
+            }
         }
     }
 
@@ -300,6 +351,49 @@ fn stft_parity_test(device: usize, model_dir: &std::path::Path) {
     println!("OK");
 }
 
+
+/// RMSNorm parity vs F.normalize(x)*sqrt(dim)*gamma (parity/rmsnorm.npz).
+/// Gate: max rel-err < 1e-6 (pure elementwise after the reduction).
+fn rmsnorm_parity_test(device: usize, model_dir: &std::path::Path) {
+    let npz_path = model_dir.parent().unwrap_or(model_dir).join("parity/rmsnorm.npz");
+    let npz = npz::Npz::open(&npz_path).unwrap_or_else(|e| panic!("{e}"));
+    let x = npz.f32("x").expect("x");
+    let gamma = npz.f32("gamma").expect("gamma");
+    let ref_out = npz.f32("out").expect("out");
+    let rows = npz.shapes["x"][0];
+    let dim = npz.shapes["x"][1];
+
+    let ctx = CudaContext::new(device).expect("ctx");
+    let stream = ctx.default_stream();
+    let x_dev = DeviceBuffer::from_host(&stream, x).unwrap();
+    let g_dev = DeviceBuffer::from_host(&stream, gamma).unwrap();
+    let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, rows * dim).unwrap();
+    let km = gpu_kernels::load(&ctx).expect("kernel module");
+    // SAFETY: one warp per row; threads = rows*32 covers exactly rows warps.
+    unsafe {
+        km.rmsnorm(
+            &stream,
+            cuda_core::simt::LaunchConfig::for_num_elems((rows * 32) as u32),
+            &x_dev,
+            &g_dev,
+            &mut out_dev,
+            rows as u32,
+            dim as u32,
+        )
+    }
+    .expect("rmsnorm kernel");
+
+    let got = out_dev.to_host_vec(&stream).unwrap();
+    let mut max_err = 0.0f32;
+    let mut denom = 0.0f32;
+    for i in 0..got.len() {
+        max_err = max_err.max((got[i] - ref_out[i]).abs());
+        denom = denom.max(ref_out[i].abs());
+    }
+    println!("rmsnorm parity: rows={rows} dim={dim} max_err={max_err:e} rel={:.3e}", max_err / denom);
+    assert!(max_err < 1e-5 * denom, "rmsnorm parity failed");
+    println!("OK");
+}
 
 /// cufft R2C/C2R roundtrip parity: x -> R2C -> C2R*(1/n) == x, plus the
 /// DC/Nyquist bins of a known cosine.

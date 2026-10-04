@@ -40,10 +40,24 @@ def gen_stft():
     print("stft.npz:", spec.shape)
 
 
+def gen_rmsnorm():
+    """RMSNorm parity: F.normalize(x) * sqrt(dim) * gamma, dim=256."""
+    rs = np.random.RandomState(7)
+    rows, dim = 4096, 256
+    x = rs.randn(rows, dim).astype(np.float32)
+    gamma = (rs.randn(dim) * 0.1 + 1.0).astype(np.float32)
+    xt = torch.from_numpy(x)
+    normed = torch.nn.functional.normalize(xt, dim=-1) * (dim ** 0.5)
+    out = (normed * torch.from_numpy(gamma)).numpy()
+    np.savez(OUT / "rmsnorm.npz", x=x, gamma=gamma, out=out)
+    print("rmsnorm.npz:", out.shape)
+
+
 def main():
     OUT.mkdir(exist_ok=True)
     torch.manual_seed(0)
     gen_stft()
+    gen_rmsnorm()
 
 
 if __name__ == "__main__":
