@@ -191,6 +191,36 @@ def gen_gateout_ff():
     print("gateff.npz: M=512")
 
 
+def gen_e2e_mid(model_dir):
+    """Capture the post-12-layer final_norm activation on the golden 3s input."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from pymss_core.modules.bs_roformer.bs_roformer import BSRoformer
+    import yaml
+    cfg = yaml.unsafe_load(open(model_dir / "logic_bs_roformer.yaml"))
+    mcfg = dict(cfg["model"])
+    for k in ["multi_stft_resolution_loss_weight", "multi_stft_resolutions_window_sizes",
+              "multi_stft_hop_size", "multi_stft_normalized", "linear_transformer_depth",
+              "use_torch_checkpoint", "dim_freqs_in"]:
+        mcfg.pop(k, None)
+    model = BSRoformer(**mcfg)
+    from safetensors.torch import load_file
+    sd = load_file(str(model_dir / "model.safetensors"))
+    model.load_state_dict(sd, strict=False)
+    model.eval().cuda()
+    ref = np.load(model_dir / "ref_output.npz")
+    x = torch.from_numpy(ref["inp"])[None].cuda()
+    cap = {}
+    def hook(mod, inp, out):
+        cap["x"] = out.detach()
+    model.final_norm.register_forward_hook(hook)
+    with torch.inference_mode():
+        y = model(x)
+    np.savez(OUT / "e2e_mid.npz", x_final=cap["x"].cpu().numpy().reshape(-1))
+    print("e2e_mid.npz:", cap["x"].shape, "out:", tuple(y.shape))
+
+
 def main():
     OUT.mkdir(exist_ok=True)
     torch.manual_seed(0)
@@ -202,6 +232,7 @@ def main():
     gen_attn_short()
     gen_attn_long()
     gen_gateout_ff()
+    gen_e2e_mid(Path(__file__).resolve().parent.parent / "assets")
 
 
 if __name__ == "__main__":
