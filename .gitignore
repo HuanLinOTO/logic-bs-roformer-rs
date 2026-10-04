@@ -1,0 +1,18 @@
+# Build artifacts
+/target/
+**/*.bc
+**/*.cubin
+**/*.ptx
+**/*.nvvm
+
+# Model weights & parity data (large binaries, not for git)
+/assets/
+*.ckpt
+*.safetensors
+*.npz
+
+# Local experiment outputs
+/out/
+*.wav
+
+.DS_Store
