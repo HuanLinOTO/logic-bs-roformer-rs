@@ -36,6 +36,7 @@ struct Args {
     attn_test: bool,
     gateff_test: bool,
     e2e_test: bool,
+    reorder_test: bool,
     bench: bool,
     stems: Option<usize>,
 }
@@ -65,6 +66,7 @@ fn parse_args() -> Result<Args, String> {
             "--attn-test" => args.attn_test = true,
             "--gateff-test" => args.gateff_test = true,
             "--e2e-test" => args.e2e_test = true,
+            "--reorder-test" => args.reorder_test = true,
             "--bench" => args.bench = true,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -95,6 +97,11 @@ fn main() {
 
     if args.stft_test {
         stft_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        return;
+    }
+
+    if args.reorder_test {
+        reorder_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
         return;
     }
 
@@ -847,6 +854,7 @@ mod gpu_kernels {
             let (n, s) = if axis_ == 0 { (t, f) } else { (f, t) };
             let bh = s * 8 + head;
             let n_len = if axis_ == 0 { t_f } else { bands_ };
+            // attn_out_long is [BH, N, 64] — no part offset here.
             let src = (bh * n_len + n) * 64 + d;
             if let Some(o) = out.get_mut(idx) {
                 *o = attn[src];
@@ -875,13 +883,13 @@ mod gpu_kernels {
             let rest = g0 / 4;
             let t = rest / 1025;
             let fc = rest % 1025; // flattened (band, fi)
-            // locate band via linear scan over band_off (62 entries)
+            // fc is in 1025-space; locate the band via the f0 table
             let mut band = 0usize;
-            while band + 1 < band_off.len() && (band_off[band + 1] as usize) <= fc {
+            while band + 1 < band_f0.len() && (band_f0[band + 1] as usize) <= fc {
                 band += 1;
             }
-            let fi = fc - band_off[band] as usize;
-            let src = ((ch * t_f + t) * 1025 + (band_f0[band] as usize + fi)) * 2 + c;
+            let src = ((ch * t_f + t) * 1025 + fc) * 2 + c;
+            let _ = band;
             if let Some(o) = out.get_mut(idx) {
                 *o = spec[src];
             }
@@ -1785,10 +1793,15 @@ unsafe fn transformer_step(
     // 5. attention: short (freq) uses attn_short per (b,h) block; long (time)
     // uses 2-pass materialized with the batched kernels below.
     if axis == 1 {
+        // attn_short writes attention-layout output; un-reorder into v_flat.
         // SAFETY: grid bh blocks of 128 threads over [bh, 62, 64] segments.
         unsafe {
             km.attn_short(stream, cuda_core::simt::LaunchConfig { grid_dim: (bh as u32, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 },
-                &slice_view(stream, &scratch.qkv_attn, 0, 62 * 64)?, &slice_view(stream, &scratch.qkv_attn, 1, 62 * 64)?, &slice_view(stream, &scratch.qkv_attn, 2, 62 * 64)?, &mut scratch.v_flat, 62)
+                &*slice_view(stream, &scratch.qkv_attn, 0, bh * 62 * 64)?, &*slice_view(stream, &scratch.qkv_attn, bh * 62 * 64, bh * 62 * 64)?, &*slice_view(stream, &scratch.qkv_attn, 2 * bh * 62 * 64, bh * 62 * 64)?, &mut scratch.attn_out_long, 62)
+        }.map_err(|e| e.to_string())?;
+        // SAFETY: elementwise un-reorder (freq axis).
+        unsafe {
+            km.attn_v_to_flat(stream, launch1((m * 512) as u32), &scratch.attn_out_long, &mut scratch.v_flat, t_frames as u32, bands as u32, 1)
         }.map_err(|e| e.to_string())?;
     } else {
         // scores per (b,h): loop with segment GEMMs (496 launches — Phase 4
@@ -1799,7 +1812,7 @@ unsafe fn transformer_step(
             let mut pseg = mut_slice_view(stream, &mut scratch.p_big, g * n_len * n_len, n_len * n_len)?;
             // SAFETY: 2-D tile grid over n_len x n_len.
             unsafe {
-                km.gemm_bias(stream, tile_cfg(n_len, n_len), n_len as u32, n_len as u32, 64, &qseg, &kseg, &scratch.zero_bias_t, &mut pseg)
+                km.gemm_bias(stream, tile_cfg(n_len, n_len), n_len as u32, n_len as u32, 64, &*qseg, &*kseg, &scratch.zero_bias_t, &mut *pseg)
             }.map_err(|e| e.to_string())?;
         }
         // SAFETY: one thread per row.
@@ -1812,7 +1825,7 @@ unsafe fn transformer_step(
             let mut oseg = mut_slice_view(stream, &mut scratch.attn_out_long, g * n_len * 64, n_len * 64)?;
             // SAFETY: 2-D tile grid over n_len x 64.
             unsafe {
-                km.gemm_bias_bn(stream, tile_cfg(n_len, 64), n_len as u32, 64, n_len as u32, &pseg, &vseg, &scratch.zero_bias_64, &mut oseg)
+                km.gemm_bias_bn(stream, tile_cfg(n_len, 64), n_len as u32, 64, n_len as u32, &*pseg, &*vseg, &scratch.zero_bias_64, &mut *oseg)
             }.map_err(|e| e.to_string())?;
         }
         // SAFETY: elementwise un-reorder.
@@ -1870,30 +1883,106 @@ fn tile_cfg(m: usize, n: usize) -> cuda_core::simt::LaunchConfig {
     }
 }
 
-/// Borrow a read-only segment of a device buffer without transferring ownership.
-fn slice_view(stream: &Arc<CudaStream>, b: &DeviceBuffer<f32>, off: usize, len: usize) -> Result<DeviceBuffer<f32>, String> {
+/// A borrowed interior segment of a DeviceBuffer. Dropping the wrapper
+/// never frees the underlying memory (the parent buffer stays the sole
+/// owner), so segments can be passed to kernels as &DeviceBuffer freely.
+pub struct Seg {
+    inner: Option<DeviceBuffer<f32>>,
+}
+impl std::ops::Deref for Seg {
+    type Target = DeviceBuffer<f32>;
+    fn deref(&self) -> &DeviceBuffer<f32> {
+        self.inner.as_ref().unwrap()
+    }
+}
+impl std::ops::DerefMut for Seg {
+    fn deref_mut(&mut self) -> &mut DeviceBuffer<f32> {
+        self.inner.as_mut().unwrap()
+    }
+}
+impl Drop for Seg {
+    fn drop(&mut self) {
+        if let Some(b) = self.inner.take() {
+            std::mem::forget(b); // never free an interior pointer
+        }
+    }
+}
+
+fn slice_view(stream: &Arc<CudaStream>, b: &DeviceBuffer<f32>, off: usize, len: usize) -> Result<Seg, String> {
     if off + len > b.len() {
         return Err(format!("slice_view oob {off}+{len}>{}", b.len()));
     }
     let ptr = b.cu_deviceptr() + (off * 4) as u64;
-    // SAFETY: ptr is a cuMemAlloc'd segment of the same context-owned buffer;
-    // the view is leaked (never dropped) so the parent stays the sole owner.
-    Ok(unsafe { DeviceBuffer::from_raw_parts(ptr, len, b.context().clone()) })
+    let _ = stream;
+    // SAFETY: interior segment of a live parent allocation in the same ctx.
+    Ok(Seg { inner: Some(unsafe { DeviceBuffer::from_raw_parts(ptr, len, b.context().clone()) }) })
 }
 
-fn mut_slice_view(stream: &Arc<CudaStream>, b: &mut DeviceBuffer<f32>, off: usize, len: usize) -> Result<DeviceBuffer<f32>, String> {
+fn mut_slice_view(stream: &Arc<CudaStream>, b: &mut DeviceBuffer<f32>, off: usize, len: usize) -> Result<Seg, String> {
     if off + len > b.len() {
         return Err(format!("mut_slice_view oob {off}+{len}>{}", b.len()));
     }
     let ptr = b.cu_deviceptr() + (off * 4) as u64;
     let _ = stream;
     // SAFETY: same as slice_view; the caller's use is exclusive in stream order.
-    Ok(unsafe { DeviceBuffer::from_raw_parts(ptr, len, b.context().clone()) })
+    Ok(Seg { inner: Some(unsafe { DeviceBuffer::from_raw_parts(ptr, len, b.context().clone()) }) })
 }
 
 
 /// Full end-to-end parity on the golden 3s input (parity/e2e_mid.npz for the
 /// transformer trunk + assets/ref_output.npz for the final stems).
+
+/// qkv_to_attn / attn_v_to_flat unit test vs python reference (T=37).
+fn reorder_test(device: usize, model_dir: &std::path::Path) {
+    let root = model_dir.parent().unwrap_or(model_dir);
+    let npz = npz::Npz::open(&root.join("parity/reorder.npz")).unwrap_or_else(|e| panic!("{e}"));
+    let qkv = npz.f32("qkv").expect("qkv");
+    let ref_q = npz.f32("q").expect("q");
+    let t_frames = 37usize;
+    let bands = 62usize;
+    let m = t_frames * bands;
+    let bh = bands * 8;
+    let ctx = CudaContext::new(device).expect("ctx");
+    let stream = ctx.default_stream();
+    let km = gpu_kernels::load(&ctx).expect("kernels");
+    let in_dev = DeviceBuffer::from_host(&stream, qkv).unwrap();
+    let mut att = DeviceBuffer::<f32>::zeroed(&stream, 3 * bh * t_frames * 64).unwrap();
+    // SAFETY: elementwise reorder over 3*BH*T*64.
+    unsafe {
+        km.qkv_to_attn(&stream, cuda_core::simt::LaunchConfig::for_num_elems((3 * bh * t_frames * 64) as u32), &in_dev, &mut att, t_frames as u32, bands as u32, 0)
+    }.expect("reorder");
+    let got = att.to_host_vec(&stream).unwrap();
+    // q segment = first bh*T*64
+    let mut me = 0.0f32;
+    let mut dn = 0.0f32;
+    for i in 0..ref_q.len() {
+        me = me.max((got[i] - ref_q[i]).abs());
+        dn = dn.max(ref_q[i].abs());
+    }
+    println!("reorder q segment: rel={:.3e}", me / dn);
+    for (i, label) in [(0usize, "att[0]"), (64, "att[64]"), (37 * 64, "att[t1d0]"), (62 * 8 * 37 * 64 / 2, "mid")] {
+        println!("spot {label}: got={:.5} ref={:.5}", got[i], ref_q[i]);
+    }
+    // v roundtrip: attn_v_to_flat on the v segment
+    let mut vflat = DeviceBuffer::<f32>::zeroed(&stream, m * 512).unwrap();
+    let vseg = slice_view(&stream, &att, 2 * bh * t_frames * 64, bh * t_frames * 64).unwrap();
+    // SAFETY: elementwise over m*512.
+    unsafe {
+        km.attn_v_to_flat(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * 512) as u32), &*vseg, &mut vflat, t_frames as u32, bands as u32, 0)
+    }.expect("unreorder");
+    let vf = vflat.to_host_vec(&stream).unwrap();
+    // v_flat reference: identity (v part of qkv)
+    let mut me2 = 0.0f32;
+    for i in 0..vf.len() {
+        let row = i / 512;
+        me2 = me2.max((vf[i] - qkv[row * 1536 + 1024 + i % 512]).abs());
+    }
+    println!("v roundtrip: max_err={me2:e}");
+    assert!(me < 1e-5 * dn, "reorder q mismatch");
+    assert!(me2 < 1e-6, "v roundtrip mismatch");
+    println!("OK");
+}
+
 fn e2e_test(device: usize, model_dir: &std::path::Path) {
     let root = model_dir.parent().unwrap_or(model_dir);
     let mid = npz::Npz::open(&root.join("parity/e2e_mid.npz")).unwrap_or_else(|e| panic!("{e}"));
@@ -1992,10 +2081,191 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
         zero_bias_64: z(64),
     };
 
-    // 4. 12 layers x 2 axes
+    // staged references for bisection
+    let stages = npz::Npz::open(&root.join("parity/e2e_stages.npz")).ok();
+    let stage_check = |name: &str, got: &[f32], ref_arr: &[f32], perm_ft: bool| {
+        let mut me = 0.0f32;
+        let mut dn = 0.0f32;
+        let dim = ref_arr.len() / (t_frames * bands);
+        for t in 0..t_frames {
+            for f in 0..bands {
+                for d in 0..dim {
+                    let (g, r) = if perm_ft {
+                        (got[(t * bands + f) * dim + d], ref_arr[(f * t_frames + t) * dim + d])
+                    } else {
+                        (got[(t * bands + f) * dim + d], ref_arr[(t * bands + f) * dim + d])
+                    };
+                    me = me.max((g - r).abs());
+                    dn = dn.max(r.abs());
+                }
+            }
+        }
+        println!("stage {name}: rel={:.3e}", me / dn);
+    };
+    {
+        let bsnpz = npz::Npz::open(&root.join("parity/e2e_bs.npz")).expect("e2e_bs");
+        let bsin_ref = bsnpz.f32("bs_input").unwrap();
+        let xin = xin_dev.to_host_vec(&stream).unwrap();
+        {
+            let mut me = 0.0f32;
+            let mut dn = 0.0f32;
+            for i in 0..xin.len() {
+                me = me.max((xin[i] - bsin_ref[i]).abs());
+                dn = dn.max(bsin_ref[i].abs());
+            }
+            println!("stage bs_input(reorder): rel={:.3e}", me / dn);
+        }
+        let bs_ref = bsnpz.f32("bandsplit").unwrap();
+        let xv = x.to_host_vec(&stream).unwrap();
+        stage_check("bandsplit", &xv, bs_ref, false);
+    }
+
+    // manual first-half of layer 0 axis 0 with staged checks
+    {
+        let sub = npz::Npz::open(&root.join("parity/e2e_sub.npz")).expect("e2e_sub");
+        let m_ = m;
+        let launch1 = |n: usize| cuda_core::simt::LaunchConfig::for_num_elems(n as u32);
+        // rmsnorm
+        // SAFETY: one warp per row.
+        unsafe { km.rmsnorm(&stream, launch1(m_ * 32), &x, &gw.norm_gamma[0], &mut scr.h, m_ as u32, 256) }.unwrap();
+        {
+            let hv = scr.h.to_host_vec(&stream).unwrap();
+            let r = sub.f32("h_norm").unwrap();
+            stage_check("L0.h_norm", &hv, r, true);
+        }
+        // qkv gemm
+        // SAFETY: tile grid over m x 1536.
+        unsafe { km.gemm_bias(&stream, tile_cfg(m_, 1536), m_ as u32, 1536, 256, &scr.h, &gw.qkv_w[0], &gw.shared_qkv_bias, &mut scr.qkv) }.unwrap();
+        // rope (time axis)
+        // SAFETY: one thread per (row, pair).
+        unsafe { km.rope_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 768) as u32), &scr.qkv, &scr.cos[0], &scr.sin[0], &mut scr.qkv_rope, t_frames as u32, bands as u32, 0) }.unwrap();
+        // gates (uses h)
+        // SAFETY: tile grid over m x 8.
+        unsafe { km.gemm_bias(&stream, tile_cfg(m_, 8), m_ as u32, 8, 256, &scr.h, &gw.gates_w[0], &gw.gates_b[0], &mut scr.gates) }.unwrap();
+        // SAFETY: elementwise reorder.
+        unsafe { km.qkv_to_attn(&stream, cuda_core::simt::LaunchConfig::for_num_elems((3 * 62 * 8 * t_frames * 64) as u32), &scr.qkv_rope, &mut scr.qkv_attn, t_frames as u32, bands as u32, 0) }.unwrap();
+        {
+            let (bh, n_len) = (62usize * 8, t_frames);
+            for g in 0..bh {
+                let qseg = slice_view(&stream, &scr.qkv_attn, g * n_len * 64, n_len * 64).unwrap();
+                let kseg = slice_view(&stream, &scr.qkv_attn, bh * n_len * 64 + g * n_len * 64, n_len * 64).unwrap();
+                let mut pseg = mut_slice_view(&stream, &mut scr.p_big, g * n_len * n_len, n_len * n_len).unwrap();
+                // SAFETY: tile grid over n_len x n_len.
+                unsafe { km.gemm_bias(&stream, tile_cfg(n_len, n_len), n_len as u32, n_len as u32, 64, &*qseg, &*kseg, &scr.zero_bias_t, &mut *pseg) }.unwrap();
+            }
+            // SAFETY: one thread per row.
+            unsafe { km.softmax_rows(&stream, cuda_core::simt::LaunchConfig::for_num_elems((bh * n_len) as u32), &mut scr.p_big, (bh * n_len) as u32, n_len as u32) }.unwrap();
+            {
+                let ps = npz::Npz::open(&root.join("parity/e2e_pspot.npz")).expect("pspot");
+                let p0 = ps.f32("p0").unwrap();
+                let q00 = ps.f32("q00").unwrap();
+                let pb = scr.p_big.to_host_vec(&stream).unwrap();
+                let qa = scr.qkv_attn.to_host_vec(&stream).unwrap();
+                println!("P[0,0,:16] = {:?}", &pb[0..16]);
+                println!("ref P0[:16]  = {:?}", &p0[0..16]);
+                // also the peak position
+                let mut pk = 0usize; let mut pv = f32::NEG_INFINITY;
+                for j in 0..259 { if pb[j] > pv { pv = pb[j]; pk = j; } }
+                println!("P0 peak at {pk} = {pv:.5}");
+                println!("q[bh0,t0,:4] = {:?} ref {:?}", &qa[0..4], &q00[0..4]);
+            }
+            for g in 0..bh {
+                let pseg = slice_view(&stream, &scr.p_big, g * n_len * n_len, n_len * n_len).unwrap();
+                let vseg = slice_view(&stream, &scr.qkv_attn, 2 * bh * n_len * 64 + g * n_len * 64, n_len * 64).unwrap();
+                let mut oseg = mut_slice_view(&stream, &mut scr.attn_out_long, g * n_len * 64, n_len * 64).unwrap();
+                // SAFETY: tile grid over n_len x 64.
+                unsafe { km.gemm_bias_bn(&stream, tile_cfg(n_len, 64), n_len as u32, 64, n_len as u32, &*pseg, &*vseg, &scr.zero_bias_64, &mut *oseg) }.unwrap();
+            }
+            {
+                let ol = scr.attn_out_long.to_host_vec(&stream).unwrap();
+                let vfnpz = npz::Npz::open(&root.join("parity/e2e_vflat.npz")).expect("e2e_vflat");
+                let r = vfnpz.f32("v_flat").unwrap();
+                println!("ol[bh0,t0,:4] = {:?} ref_vflat[0..4] = {:?}", &ol[0..4], &r[0..4]);
+                println!("ol[bh1,t0,:4] = {:?} ref vflat(t0,f1,h0)= {:?}", &ol[259 * 64..259 * 64 + 4], &r[512..516]);
+                // host check: dot(P row0, V col0) should equal ol[0]
+                let pb2 = scr.p_big.to_host_vec(&stream).unwrap();
+                let qa2 = scr.qkv_attn.to_host_vec(&stream).unwrap();
+                let vbase = 2 * 496usize * 259 * 64;
+                let mut dot = 0.0f32;
+                for j in 0..259usize {
+                    dot += pb2[j] * qa2[vbase + j * 64];
+                }
+                println!("host dot(P0, V0col0) = {dot:.6} vs ol[0] = {:.6}", ol[0]);
+                let roped = scr.qkv_rope.to_host_vec(&stream).unwrap();
+                let raw_v0: Vec<f32> = scr.qkv.to_host_vec(&stream).unwrap()[1024..1028].to_vec();
+                println!("attV[0..4]={:?} ropeV={:?} rawqkv={:?}", &qa2[vbase..vbase + 4], &roped[1024..1028], &raw_v0);
+                {
+                    let qa_ref = npz::Npz::open(&root.join("parity/e2e_qkv_attn.npz")).expect("qkv_attn ref");
+                    let (rq, rk, rv) = (qa_ref.f32("qr").unwrap(), qa_ref.f32("kr").unwrap(), qa_ref.f32("v").unwrap());
+                    println!("attQ[0..4]={:?} refQ={:?}", &qa2[0..4], &rq[0..4]);
+                    println!("attK[0..4]={:?} refK={:?}", &qa2[496 * 259 * 64..496 * 259 * 64 + 4], &rk[0..4]);
+                    println!("attV0[0..4]={:?} refV={:?}", &qa2[vbase..vbase + 4], &rv[0..4]);
+                }
+                // v provenance: qkv_attn part2 first 4, and the raw qkv v segment for m=0
+            }
+            // SAFETY: elementwise un-reorder (time axis).
+            unsafe { km.attn_v_to_flat(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 512) as u32), &scr.attn_out_long, &mut scr.v_flat, t_frames as u32, bands as u32, 0) }.unwrap();
+        }
+        {
+            let vfnpz = npz::Npz::open(&root.join("parity/e2e_vflat.npz")).expect("e2e_vflat");
+            let r = vfnpz.f32("v_flat").unwrap();
+            let vv = scr.v_flat.to_host_vec(&stream).unwrap();
+            let mut me = 0.0f32;
+            let mut dn = 0.0f32;
+            for i in 0..vv.len() {
+                me = me.max((vv[i] - r[i]).abs());
+                dn = dn.max(r[i].abs());
+            }
+            println!("stage L0.v_flat: rel={:.3e}", me / dn);
+        }
+        // SAFETY: elementwise over m*512.
+        unsafe { km.gate_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 512) as u32), &scr.v_flat, &scr.gates, &mut scr.scaled) }.unwrap();
+        {
+            let sc = npz::Npz::open(&root.join("parity/e2e_scaled.npz")).expect("e2e_scaled");
+            {
+                let gv = scr.gates.to_host_vec(&stream).unwrap();
+                let r = sc.f32("gates").unwrap();
+                stage_check("L0.gates", &gv, r, true);
+            }
+            {
+                let sv = scr.scaled.to_host_vec(&stream).unwrap();
+                let r = sc.f32("to_out_in").unwrap();
+                stage_check("L0.scaled", &sv, r, true);
+                println!("scaled[(t0,f0)0..4] = {:?}", &sv[0..4]);
+                println!("ref[(f0,t0)0..4]    = {:?}", &r[0..4]);
+                println!("ours m=62(f0,t1)?  = {:?}", &sv[62 * 512..62 * 512 + 4]);
+                println!("ref (f0,t1)        = {:?}", &r[512..516]);
+            }
+        }
+        // SAFETY: tile grid over m x 256.
+        unsafe { km.gemm_bias(&stream, tile_cfg(m_, 256), m_ as u32, 256, 512, &scr.scaled, &gw.out_w[0], &gw.shared_out_bias, &mut scr.oproj) }.unwrap();
+        // SAFETY: elementwise over m*256.
+        unsafe { km.add_resid(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 256) as u32), &scr.oproj, &x, &mut scr.attn_out) }.unwrap();
+        {
+            let av = scr.attn_out.to_host_vec(&stream).unwrap();
+            let r = sub.f32("attn_out").unwrap();
+            stage_check("L0.attn_out", &av, r, true);
+        }
+        let _ = &sub;
+    }
+    // 4. 12 layers x 2 axes (layer 0 axis 0 redone fully inside)
     for layer in 0..12 {
         for axis in 0..2 {
             unsafe { transformer_step(&km, &ctx, &stream, &gw, layer, axis, &mut x, t_frames, bands, &mut scr).unwrap(); }
+            if layer == 0 && axis == 0 {
+                if let Some(st) = &stages {
+                    let r = st.f32("L0_time").unwrap();
+                    let xv = x.to_host_vec(&stream).unwrap();
+                    stage_check("L0_time", &xv, r, true);
+                }
+            }
+            if layer == 0 && axis == 1 {
+                if let Some(st) = &stages {
+                    let r = st.f32("L0_freq").unwrap();
+                    let xv = x.to_host_vec(&stream).unwrap();
+                    stage_check("L0_freq", &xv, r, false);
+                }
+            }
         }
     }
     // final norm
@@ -2035,7 +2305,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
             let mut hseg = mut_slice_view(&stream, &mut hidden, b * t_frames * 1024, t_frames * 1024).unwrap();
             // SAFETY: tile grid over t_frames x 1024.
             unsafe {
-                km.gemm_bias(&stream, tile_cfg(t_frames, 1024), t_frames as u32, 1024, 256, &xseg, &w1seg, &b1seg, &mut hseg)
+                km.gemm_bias(&stream, tile_cfg(t_frames, 1024), t_frames as u32, 1024, 256, &*xseg, &*w1seg, &*b1seg, &mut *hseg)
             }.expect("mask gemm1");
         }
     }
