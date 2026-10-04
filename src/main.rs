@@ -222,6 +222,7 @@ fn main() {
 use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread, warp};
+use cuda_device::wmma;
 
 #[cuda_module]
 mod gpu_kernels {
@@ -1118,6 +1119,100 @@ mod gpu_kernels {
                     unsafe {
                         *out_ptr.add(r * n_size + cc) = acc[i][j] + bias[cc];
                     }
+                }
+            }
+        }
+    }
+
+
+    /// TF32 tensor-core GEMM: Y[M,N] = X[M,K] · W[N,K]^T + bias.
+    /// Uses mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32.
+    /// Each block: 128 threads (4 warps), computes 64×8 output tile.
+    /// TF32 conversion: truncate lower 13 mantissa bits (f32→TF32).
+    #[kernel]
+    pub fn gemm_tf32(
+        m: u32, n: u32, k: u32,
+        x: &[f32], w: &[f32], bias: &[f32],
+        mut y: DisjointSlice<f32>,
+    ) {
+        // Shared: A tile (64 rows × 8 K) and B tile (8 K × 8 cols)
+        static mut SA: SharedArray<f32, { 64 * 8 }> = SharedArray::UNINIT;
+        static mut SB: SharedArray<f32, { 8 * 8 }> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let warp_id = tid / 32;
+        let group = lane / 4;
+        let tig = lane % 4;
+
+        let row_base = thread::blockIdx_y() as usize * 64 + warp_id * 16;
+        let col_base = thread::blockIdx_x() as usize * 8;
+        let (m_size, n_size, k_size) = (m as usize, n as usize, k as usize);
+
+        // Accumulator: 4 f32 per lane (16×8 tile distributed across warp)
+        let mut acc = [0.0f32; 4];
+
+        let num_k = k_size.div_ceil(8);
+        for ks in 0..num_k {
+            let k_base = ks * 8;
+
+            // Cooperatively load A tile (64×8): 512 elements, 128 threads → 4 each
+            for i in 0..4usize {
+                let idx = tid + i * 128;
+                let r = idx / 8;
+                let cc = idx % 8;
+                let xr = row_base - warp_id * 16 + r; // global row (block-level)
+                let xc = k_base + cc;
+                SA[r * 8 + cc] = if xr < m_size && xc < k_size { x[xr * k_size + xc] } else { 0.0 };
+            }
+
+            // Load B tile (8×8): 64 elements, first 64 threads
+            if tid < 64 {
+                let r = tid / 8;
+                let cc = tid % 8;
+                let br = k_base + r;
+                let bc = col_base + cc;
+                // B[k][n] = W[n][k] (W is [N,K] row-major)
+                SB[r * 8 + cc] = if br < k_size && bc < n_size { w[bc * k_size + br] } else { 0.0 };
+            }
+
+            thread::sync_threads();
+
+            // Load A fragment: warp handles rows [warp_id*16, warp_id*16+16)
+            // a[j] → row = warp_id*16 + group + (if j∈{1,3} then 8 else 0)
+            //         col = tig + (if j≥2 then 4 else 0)
+            let mut a = [0u32; 4];
+            for j in 0..4 {
+                let r = warp_id * 16 + group + if j == 1 || j == 3 { 8 } else { 0 };
+                let cc = tig + if j >= 2 { 4 } else { 0 };
+                // f32 → TF32: truncate lower 13 mantissa bits
+                a[j] = SA[r * 8 + cc].to_bits() & 0xFFFF_E000;
+            }
+
+            // Load B fragment: b[j] → row = tig + (if j==1 then 4 else 0), col = group
+            let mut b = [0u32; 2];
+            for j in 0..2 {
+                let r = tig + if j == 1 { 4 } else { 0 };
+                let cc = group;
+                b[j] = SB[r * 8 + cc].to_bits() & 0xFFFF_E000;
+            }
+
+            // Tensor core MMA
+            acc = unsafe { wmma::mma_m16n8k8_f32_tf32(acc, a, b) };
+
+            thread::sync_threads();
+        }
+
+        // Write output: c[j] → row = warp_id*16 + group + (if j≥2 then 8 else 0)
+        //                    col = col_base + tig*2 + (j&1)
+        let out_ptr = y.as_mut_ptr();
+        for j in 0..4 {
+            let r = row_base + group + if j >= 2 { 8 } else { 0 };
+            let cc = col_base + tig * 2 + (j & 1);
+            if r < m_size && cc < n_size {
+                // SAFETY: bounds checked; y is m*n.
+                unsafe {
+                    *out_ptr.add(r * n_size + cc) = acc[j] + bias[cc];
                 }
             }
         }
