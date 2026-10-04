@@ -1074,11 +1074,8 @@ fn stft_parity_test(device: usize, model_dir: &std::path::Path) {
     let len = npz.shapes["x"][1];
     let frames = stft::num_frames(len);
     let ctx = CudaContext::new(device).expect("ctx");
-    let cublas_opt = cublas::Cublas::load().ok();
-    if let Some(cb) = &cublas_opt { cb.set_stream_raw(stream.cu_stream() as *mut std::ffi::c_void).expect("cublas stream"); }
-    println!("cuBLAS: {}", if cublas_opt.is_some() { "loaded" } else { "unavailable" });
-    cublas.set_stream_raw(stream.cu_stream() as *mut std::ffi::c_void).expect("cublas stream");
     let stream = ctx.default_stream();
+
 
     // planar (2, L) -> interleaved (L, 2)
     let mut xi = vec![0.0f32; len * 2];
@@ -2404,12 +2401,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
             let h_off = (s * bands + b) * t_frames * 1024;
             let mut hseg = mut_slice_view(&stream, &mut hidden, h_off, t_frames * 1024).unwrap();
             // SAFETY: tile grid over t_frames x 1024.
-            if let Some(cb) = &cublas_opt {
-            cb.sgemm_nt(t_frames, 1024, 256, (*xseg).cu_deviceptr(), (*w1seg).cu_deviceptr(), (*hseg).cu_deviceptr(), 1.0, 0.0).expect("cublas gemm1");
-            unsafe { km.bias_add(&stream, cuda_core::simt::LaunchConfig::for_num_elems((t_frames * 1024) as u32), &mut *hseg, &*b1seg, 1024) }.expect("bias1");
-        } else {
             unsafe { km.gemm_bias(&stream, tile_cfg(t_frames, 1024), t_frames as u32, 1024, 256, &*xseg, &*w1seg, &*b1seg, &mut *hseg) }.expect("mask gemm1");
-        }
         }
     }
     {

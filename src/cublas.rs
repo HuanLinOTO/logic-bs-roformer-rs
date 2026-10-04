@@ -10,7 +10,7 @@ use cuda_core::sys::CUdeviceptr;
 pub struct Cublas {
     _lib: Library,
     handle: *mut c_void,
-    sgemm: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, c_int,
+    sgemm: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int,
         *const f32, *const f32, c_int, *const f32, c_int,
         *const f32, *mut f32, c_int) -> c_int,
     set_stream: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int,
