@@ -85,12 +85,29 @@ def gen_bandsplit():
     print("bandsplit.npz:", y.shape)
 
 
+def gen_gemm():
+    """GEMM parity: Y = X @ W.T + bias for the 4 model shapes, M=2048."""
+    rs = np.random.RandomState(13)
+    shapes = [(256, 1536), (512, 256), (256, 1024), (1024, 256)]  # (K, N)
+    M = 2048
+    data = {}
+    for gi, (K, N) in enumerate(shapes):
+        x = (rs.randn(M, K) * 0.3).astype(np.float32)
+        w = (rs.randn(N, K) * 0.05).astype(np.float32)
+        bias = (rs.randn(N) * 0.05).astype(np.float32)
+        y = torch.nn.functional.linear(torch.from_numpy(x), torch.from_numpy(w), torch.from_numpy(bias)).numpy()
+        data[f"x{gi}"], data[f"w{gi}"], data[f"b{gi}"], data[f"y{gi}"] = x.reshape(-1), w.reshape(-1), bias, y.reshape(-1)
+    np.savez(OUT / "gemm.npz", **data)
+    print("gemm.npz: 4 shapes M=2048")
+
+
 def main():
     OUT.mkdir(exist_ok=True)
     torch.manual_seed(0)
     gen_stft()
     gen_rmsnorm()
     gen_bandsplit()
+    gen_gemm()
 
 
 if __name__ == "__main__":

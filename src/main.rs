@@ -28,6 +28,7 @@ struct Args {
     stft_test: bool,
     rmsnorm_test: bool,
     bandsplit_test: bool,
+    gemm_test: bool,
     bench: bool,
     stems: Option<usize>,
 }
@@ -52,6 +53,7 @@ fn parse_args() -> Result<Args, String> {
             "--stft-test" => args.stft_test = true,
             "--rmsnorm-test" => args.rmsnorm_test = true,
             "--bandsplit-test" => args.bandsplit_test = true,
+            "--gemm-test" => args.gemm_test = true,
             "--bench" => args.bench = true,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -82,6 +84,11 @@ fn main() {
 
     if args.stft_test {
         stft_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        return;
+    }
+
+    if args.gemm_test {
+        gemm_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
         return;
     }
 
@@ -413,6 +420,58 @@ mod gpu_kernels {
         }
     }
 
+    /// GEMM: Y[M,N] = X[M,K] . W[N,K]^T + bias. 16x16 tiles, one C
+    /// element per thread (Phase A baseline). W stays in torch [N,K] order.
+    #[kernel]
+    pub fn gemm_bias(
+        m: u32,
+        n: u32,
+        k: u32,
+        x: &[f32],
+        w: &[f32],
+        bias: &[f32],
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut TA: SharedArray<f32, 256> = SharedArray::UNINIT;
+        static mut TB: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let tx = thread::threadIdx_x() as usize;
+        let ty = thread::threadIdx_y() as usize;
+        let row = thread::blockIdx_y() as usize * 16 + ty;
+        let col = thread::blockIdx_x() as usize * 16 + tx;
+        let (m_size, n_size, k_size) = (m as usize, n as usize, k as usize);
+        let num_tiles = k_size.div_ceil(16);
+        let mut sum = 0.0f32;
+        let smem_idx = ty * 16 + tx;
+        let mut tile = 0usize;
+        while tile < num_tiles {
+            let tile_start = tile * 16;
+            unsafe {
+                let a_col = tile_start + tx;
+                TA[smem_idx] = if row < m_size && a_col < k_size { x[row * k_size + a_col] } else { 0.0 };
+                // W is [N, K] row-major: element (k_idx, col) == w[col*k + k_idx]
+                let b_row = tile_start + ty;
+                TB[smem_idx] = if b_row < k_size && col < n_size { w[col * k_size + b_row] } else { 0.0 };
+            }
+            thread::sync_threads();
+            unsafe {
+                let mut i = 0usize;
+                while i < 16 {
+                    sum += TA[ty * 16 + i] * TB[i * 16 + tx];
+                    i += 1;
+                }
+            }
+            thread::sync_threads();
+            tile += 1;
+        }
+        if row < m_size && col < n_size {
+            let out_ptr = y.as_mut_ptr();
+            // SAFETY: row/n bound checked; y is m*n elements.
+            unsafe {
+                *out_ptr.add(row * n_size + col) = sum + bias[col];
+            }
+        }
+    }
+
     /// Minimal probe retained for toolchain smoke tests.
     #[kernel]
     pub fn probe_min(x: &[f32], mut out: DisjointSlice<f32>) {
@@ -608,6 +667,56 @@ fn bandsplit_parity_test(device: usize, model_dir: &std::path::Path) {
     }
     println!("bandsplit parity: rows={rows} max_err={max_err:e} rel={:.3e}", max_err / denom);
     assert!(max_err < 1e-4 * denom, "bandsplit parity failed");
+    println!("OK");
+}
+
+/// GEMM parity across the four model shapes (parity/gemm.npz, M=2048).
+fn gemm_parity_test(device: usize, model_dir: &std::path::Path) {
+    let npz_path = model_dir.parent().unwrap_or(model_dir).join("parity/gemm.npz");
+    let npz = npz::Npz::open(&npz_path).unwrap_or_else(|e| panic!("{e}"));
+    let shapes = [(256usize, 1536usize), (512, 256), (256, 1024), (1024, 256)];
+    let m = 2048usize;
+    let ctx = CudaContext::new(device).expect("ctx");
+    let stream = ctx.default_stream();
+    let km = gpu_kernels::load(&ctx).expect("kernel module");
+    for (gi, (k, n)) in shapes.iter().enumerate() {
+        let x = npz.f32(&format!("x{gi}")).unwrap();
+        let w = npz.f32(&format!("w{gi}")).unwrap();
+        let bias = npz.f32(&format!("b{gi}")).unwrap();
+        let ref_y = npz.f32(&format!("y{gi}")).unwrap();
+        let x_dev = DeviceBuffer::from_host(&stream, x).unwrap();
+        let w_dev = DeviceBuffer::from_host(&stream, w).unwrap();
+        let b_dev = DeviceBuffer::from_host(&stream, bias).unwrap();
+        let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, m * n).unwrap();
+        // SAFETY: 2-D grid covers ceil(n/16) x ceil(m/16) tiles of 16x16 threads.
+        unsafe {
+            km.gemm_bias(
+                &stream,
+                cuda_core::simt::LaunchConfig {
+                    grid_dim: ((n.div_ceil(16)) as u32, (m.div_ceil(16)) as u32, 1),
+                    block_dim: (16, 16, 1),
+                    shared_mem_bytes: 0,
+                },
+                m as u32,
+                *n as u32,
+                *k as u32,
+                &x_dev,
+                &w_dev,
+                &b_dev,
+                &mut y_dev,
+            )
+        }
+        .expect("gemm kernel");
+        let got = y_dev.to_host_vec(&stream).unwrap();
+        let mut max_err = 0.0f32;
+        let mut denom = 0.0f32;
+        for i in 0..got.len() {
+            max_err = max_err.max((got[i] - ref_y[i]).abs());
+            denom = denom.max(ref_y[i].abs());
+        }
+        println!("gemm[{gi}] K={k} N={n}: max_err={max_err:e} rel={:.3e}", max_err / denom);
+        assert!(max_err < 1e-4 * denom, "gemm[{gi}] parity failed");
+    }
     println!("OK");
 }
 
