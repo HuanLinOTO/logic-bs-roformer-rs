@@ -290,12 +290,13 @@ mod gpu_kernels {
         if warp_id >= rows {
             return;
         }
-        let base = warp_id * dim + lane * per_lane;
-        // partial squared sum over this lane's elements
+        let base = warp_id * dim;
+        // partial squared sum; lane-major indexing makes each load coalesced
         let mut vals = [0.0f32; 8];
         let mut s = 0.0f32;
         for k in 0..per_lane {
-            let v = x[base + k];
+            let i = base + k * 32 + lane;
+            let v = x[i];
             vals[k] = v;
             s += v * v;
         }
@@ -310,7 +311,7 @@ mod gpu_kernels {
         let scale = (dim as f32).sqrt() / denom;
         let out_ptr = out.as_mut_ptr();
         for k in 0..per_lane {
-            let i = base + k;
+            let i = base + k * 32 + lane;
             // SAFETY: rows*dim total elements, i < rows*dim by construction;
             // each warp owns a disjoint row, lanes write disjoint columns.
             unsafe {
@@ -335,11 +336,12 @@ mod gpu_kernels {
         let dim = dim as usize;
         let per_lane = dim / 32;
         if warp_id >= rows { return; }
-        let base = warp_id * dim + lane * per_lane;
+        let base = warp_id * dim;
         let mut vals = [0.0f32; 8];
         let mut s = 0.0f32;
         for k in 0..per_lane {
-            let v = x[base + k];
+            let i = base + k * 32 + lane;
+            let v = x[i];
             vals[k] = v;
             s += v * v;
         }
@@ -353,7 +355,7 @@ mod gpu_kernels {
         let scale = (dim as f32).sqrt() / denom;
         let out_ptr = out.as_mut_ptr();
         for k in 0..per_lane {
-            let i = base + k;
+            let i = base + k * 32 + lane;
             vals[k] *= scale * gamma[i % dim];
             unsafe {
                 *out_ptr.add(i) = vals[k];
@@ -361,10 +363,10 @@ mod gpu_kernels {
         }
         let gates_ptr = gates.as_mut_ptr();
         for g in 0..8usize {
-            let wbase = g * dim + lane * per_lane;
+            let wbase = g * dim;
             let mut dot = 0.0f32;
             for k in 0..per_lane {
-                dot += vals[k] * gate_w[wbase + k];
+                dot += vals[k] * gate_w[wbase + k * 32 + lane];
             }
             dot = warp::reduce_sum_f32(dot);
             if lane == g {
