@@ -22,50 +22,57 @@ golden check: rel err 4.395e-07
 最终正确性：
 
 ```text
-E2E SNR vs ref_output: 80.90 dB
+E2E SNR vs ref_output: 80.98 dB
 ```
 
 Nsys CUDA kernel 总时间（同一 3 秒前向，STFT 到 6 stem C2R）：
 
 ```text
-Total GPU kernel time: ~148.6 ms
-gemm_f16_128x64        63.45 ms / 96 launches
-softmax_stats          16.50 ms / 24
-attn_pv_f16_bn         12.86 ms / 24
-attn_qk_f16             9.70 ms / 24
-rope_qkv_to_attn        8.25 ms / 24
-rmsnorm                 6.18 ms / 49
-bandsplit               5.23 ms / 1
-mask GEMM1+GEMM2        8.89 ms / 12
-other elementwise/FFT  ~17.5 ms
+Total GPU kernel time: ~130.8 ms
+gemm_f16_residual      26.68 ms / 48  (out projection + FF2, residual fused)
+qkv gemm_f16           22.54 ms / 24
+ff1 gemm + GELU        16.21 ms / 24
+attn PV (raw QKV)      15.01 ms / 24
+time-axis softmax       10.56 ms / 12
+time-axis QK+RoPE        9.06 ms / 12
+freq QK+RoPE+stats       7.86 ms / 12
+bandsplit                5.77 ms / 1
+mask GEMM1+tanh          5.40 ms / 6
+RMSNorm+gates            7.14 ms / 49
+mask GEMM2               3.57 ms / 6
+GLU/mask/FFT/STFT        ~1.9 ms
 ```
 
-单次冷启动前向 wall time 在 235–313 ms 间波动；主要额外开销来自首次
-大 scratch 分配/释放与输出 D2H。权重加载+上传约 0.7–1.15 s，基准中已
+单次冷启动前向 wall time 在 218–276 ms 间波动；主要额外开销来自首次
+大 scratch 分配/释放与输出 D2H。权重加载+上传约 0.65–1.10 s，基准中已
 排除。
 
 ## 结论
 
-正确性已超过验收（SNR 80.90 dB ≫ 60 dB），性能尚未超过 PyTorch：
-kernel-only 仍比 120.8 ms 基线慢约 23%，冷启动 wall time 慢约 2x。
-因此“大幅度加速”的目标还未完成。
+正确性已超过验收（SNR 80.98 dB ≫ 60 dB），性能尚未超过 PyTorch：
+kernel-only 130.8 ms，比 120.8 ms 基线慢约 8.3%；冷启动 wall time 仍
+受 allocator/D2H 干扰。因此“大幅度加速”的目标还未完成，但差距已从
+23% 缩小到 8.3%。
 
 ## 已完成的主要优化
 
 1. 24 层 transformer GEMM 改为 FP16 tensor-core（f32 累加），K tile 64。
-2. 双轴 attention 改为 batched FP16 QK + warp softmax stats + FP16 PV，
-   消除 1,488 次 host 循环/launch。
-3. RoPE 与 QKV attention-major reorder 融合，减少一次完整 QKV 读写。
-4. MaskEstimator 改为每个 stem 2 个 grouped GEMM launch + 全局 GLU scatter，
+2. 双轴 attention 改为 batched FP16 QK/PV，消除 1,488 次 host 循环/launch。
+3. QK/PV 直接读取 folded raw QKV：RoPE、q 缩放、V 展开、head gate 和
+   folded 写回全部融合，删除独立 RoPE/reorder/un-reorder/gate kernel。
+4. 频率轴 QK epilogue 直接输出 softmax max/scale，删除 12 次 stats launch。
+5. out-proj/FF2 residual、FF1 GELU、mask GEMM1 tanh 融合进 GEMM epilogue。
+6. RMSNorm 与 8 个 head gate 投影融合。
+7. MaskEstimator 改为每个 stem 2 个 grouped GEMM launch + 全局 GLU scatter，
    372×2 次 host GEMM 循环清零。
-5. softmax 从 one-thread/row 改为 warp/row。
+8. softmax 从 one-thread/row 改为 warp/row，并使用硬件 ex2 近似。
 
 ## 下一步（按收益排序）
 
-1. 继续压缩 `gemm_f16_128x64`（63 ms）：权重常驻 FP16/BF16、ldmatrix、
-   double-buffer shared memory。
-2. attention 三个 kernel 合计 39 ms：探索 tensor-core flash attention或
-   更深 K tile；避免 materialized score 的三遍访存。
-3. 预分配/复用全部 mask scratch，消除冷启动 wall time 中约 80–170 ms 的
+1. 继续压缩 65 ms transformer GEMM：cp.async double buffering、更优
+   warp tile / ldmatrix 组合、权重常驻 FP16。
+2. 时间轴 score softmax 仍有 10.6 ms；探索更便宜的 partial reduction 或
+   tensor-core flash attention，避免 materialized score 的完整读。
+3. BandSplit（5.8 ms）改 grouped tensor-core GEMM。
+4. 预分配/复用全部 mask scratch，消除冷启动 wall time 中约 60–120 ms 的
    allocator/D2H 开销。
-4. BandSplit（5.2 ms）与 RMSNorm/elementwise 融合。
