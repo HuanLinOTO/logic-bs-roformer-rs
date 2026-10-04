@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "BS-RoFormer six-stem music separation — pure Rust + cuda-oxide GPU inference"
 
-# Standalone crate (not part of the vendored cuda-rust workspace).
+# Standalone crate. `vendor/` holds an embedded cuda-rust checkout whose
+# crates belong to their own nested workspaces — exclude it so cargo does not
+# try to bind their `*.workspace = true` inheritance to this manifest.
 [workspace]
+exclude = ["vendor"]
 
 [dependencies]
 # Device-side intrinsics (thread indexing, barriers, shared memory, ...)

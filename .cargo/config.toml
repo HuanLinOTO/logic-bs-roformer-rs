@@ -1,0 +1,4 @@
+# 项目内 cargo 别名：通过 vendor 源码驱动 cargo-oxide，
+# 与 cuda-oxide 仓库内的官方 alias 等价，独立项目无需全局安装。
+[alias]
+oxide = "run --package cargo-oxide --manifest-path vendor/cuda-rust/cuda-oxide/Cargo.toml --"
