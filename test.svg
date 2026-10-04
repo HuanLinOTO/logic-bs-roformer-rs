@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="500" viewBox="0 0 800 500">
+  <rect width="800" height="500" fill="#eaf7ff"/>
+  <path d="M0 390 Q180 350 360 385 T800 375 V500 H0Z" fill="#b9e3a2"/>
+  <g stroke="#243746" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="270" cy="375" r="70" fill="#ffffff"/>
+    <circle cx="570" cy="375" r="70" fill="#ffffff"/>
+    <path d="M270 375 L400 275 L570 375 L270 375 M400 275 L450 375 M400 275 L365 375" fill="none"/>
+    <path d="M450 375 L535 285" fill="none"/>
+    <path d="M520 282 L570 282" fill="none"/>
+    <circle cx="400" cy="275" r="12" fill="#f4a261"/>
+    <circle cx="450" cy="375" r="12" fill="#f4a261"/>
+  </g>
+  <g stroke="#243746" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M370 255 Q350 190 385 125 Q420 70 478 102 Q515 122 505 175 Q498 215 460 250 Z" fill="#f2f5f7"/>
+    <path d="M388 140 Q350 95 300 110 Q265 122 288 145 Q330 180 390 175" fill="#f6b94c"/>
+    <path d="M455 113 Q490 65 530 88 Q550 100 531 123 L492 150" fill="#dce5ea"/>
+    <circle cx="471" cy="119" r="7" fill="#243746" stroke="none"/>
+    <path d="M385 178 Q430 220 470 182" fill="none"/>
+    <path d="M405 245 L390 300 L450 375" fill="none"/>
+    <path d="M430 252 L470 305 L520 282" fill="none"/>
+    <path d="M390 300 L360 330" fill="none"/>
+    <path d="M470 305 L500 330" fill="none"/>
+  </g>
+  <g fill="none" stroke="#f4a261" stroke-width="7" stroke-linecap="round">
+    <path d="M170 250 q-30 -25 -55 0"/>
+    <path d="M640 220 q30 -25 55 0"/>
+    <path d="M185 285 q-25 -18 -45 0"/>
+  </g>
+  <text x="400" y="465" text-anchor="middle" font-family="sans-serif" font-size="24" fill="#243746">Pelican on a bicycle</text>
+</svg>

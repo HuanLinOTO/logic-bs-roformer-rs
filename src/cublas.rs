@@ -20,6 +20,10 @@ pub struct Cublas {
 const OP_N: c_int = 0;
 const OP_T: c_int = 1;
 
+// SAFETY: cuBLAS handle is thread-safe (cuBLAS docs) and we're single-threaded.
+unsafe impl Send for Cublas {}
+unsafe impl Sync for Cublas {}
+
 impl Cublas {
     pub fn load() -> Result<Cublas, String> {
         let mut candidates: Vec<String> = Vec::new();
