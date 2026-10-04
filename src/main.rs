@@ -1039,6 +1039,90 @@ mod gpu_kernels {
     
 
 
+
+    /// High-performance GEMM: 64x64 tile, 4x4 register blocking, 256 threads.
+    /// Uses linear shared-memory loading (each thread loads 16 elements via
+    /// tid + i*256 covering all 4096 positions).
+    #[kernel]
+    pub fn gemm_bias_64(
+        m: u32,
+        n: u32,
+        k: u32,
+        x: &[f32],
+        w: &[f32],
+        bias: &[f32],
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut TA: SharedArray<f32, { 64 * 64 }> = SharedArray::UNINIT;
+        static mut TB: SharedArray<f32, { 64 * 64 }> = SharedArray::UNINIT;
+        let tx = thread::threadIdx_x() as usize; // 0..15
+        let ty = thread::threadIdx_y() as usize; // 0..15
+        let tid = ty * 16 + tx; // 0..255
+        let row_base = thread::blockIdx_y() as usize * 64;
+        let col_base = thread::blockIdx_x() as usize * 64;
+        let (m_size, n_size, k_size) = (m as usize, n as usize, k as usize);
+        let num_tiles = k_size.div_ceil(64);
+        // 4x4 register accumulators for this thread's output block
+        // Thread (ty, tx) computes rows [ty*4..ty*4+4) and cols [tx*4..tx*4+4)
+        let mut acc = [[0.0f32; 4]; 4];
+        let mut tile = 0usize;
+        while tile < num_tiles {
+            let ts = tile * 64;
+            // Linear loading: each of 256 threads loads 16 elements
+            unsafe {
+                for i in 0..16usize {
+                    let linear = tid + i * 256;
+                    let r = linear / 64;  // 0..63
+                    let cc = linear % 64; // 0..63
+                    // A tile: x[row_base+r][ts+cc]
+                    let ar = row_base + r;
+                    let ac = ts + cc;
+                    TA[r * 64 + cc] = if ar < m_size && ac < k_size { x[ar * k_size + ac] } else { 0.0 };
+                    // B tile: w[col_base+cc][ts+r] (W is [N,K], we need B[r][cc] = W[cc][r])
+                    let bc = col_base + cc;
+                    let br = ts + r;
+                    TB[r * 64 + cc] = if br < k_size && bc < n_size { w[bc * k_size + br] } else { 0.0 };
+                }
+            }
+            thread::sync_threads();
+            // Compute 4x4 outputs
+            unsafe {
+                let mut kk = 0usize;
+                while kk < 64 {
+                    let a0 = TA[ty * 4 * 64 + kk];
+                    let a1 = TA[(ty * 4 + 1) * 64 + kk];
+                    let a2 = TA[(ty * 4 + 2) * 64 + kk];
+                    let a3 = TA[(ty * 4 + 3) * 64 + kk];
+                    let b0 = TB[kk * 64 + tx * 4];
+                    let b1 = TB[kk * 64 + tx * 4 + 1];
+                    let b2 = TB[kk * 64 + tx * 4 + 2];
+                    let b3 = TB[kk * 64 + tx * 4 + 3];
+                    acc[0][0] += a0 * b0; acc[0][1] += a0 * b1; acc[0][2] += a0 * b2; acc[0][3] += a0 * b3;
+                    acc[1][0] += a1 * b0; acc[1][1] += a1 * b1; acc[1][2] += a1 * b2; acc[1][3] += a1 * b3;
+                    acc[2][0] += a2 * b0; acc[2][1] += a2 * b1; acc[2][2] += a2 * b2; acc[2][3] += a2 * b3;
+                    acc[3][0] += a3 * b0; acc[3][1] += a3 * b1; acc[3][2] += a3 * b2; acc[3][3] += a3 * b3;
+                    kk += 1;
+                }
+            }
+            thread::sync_threads();
+            tile += 1;
+        }
+        // Write 4x4 outputs with bounds check
+        let out_ptr = y.as_mut_ptr();
+        for i in 0..4usize {
+            for j in 0..4usize {
+                let r = row_base + ty * 4 + i;
+                let cc = col_base + tx * 4 + j;
+                if r < m_size && cc < n_size {
+                    // SAFETY: bounds checked above; y is m*n elements.
+                    unsafe {
+                        *out_ptr.add(r * n_size + cc) = acc[i][j] + bias[cc];
+                    }
+                }
+            }
+        }
+    }
+
     /// Element-wise: y[i] += bias[i % n]. Used after cuBLAS GEMM (no bias).
     #[kernel]
     pub fn bias_add(mut y: DisjointSlice<f32>, bias: &[f32], n: u32) {
@@ -1271,7 +1355,7 @@ fn gemm_parity_test(device: usize, model_dir: &std::path::Path) {
         let mut y_dev = DeviceBuffer::<f32>::zeroed(&stream, m * n).unwrap();
         // SAFETY: 2-D grid covers ceil(n/16) x ceil(m/16) tiles of 16x16 threads.
         unsafe {
-            km.gemm_bias(
+            km.gemm_bias_64(
                 &stream,
                 cuda_core::simt::LaunchConfig {
                     grid_dim: ((n.div_ceil(16)) as u32, (m.div_ceil(16)) as u32, 1),
@@ -1333,7 +1417,7 @@ fn qkvrope_parity_test(device: usize, model_dir: &std::path::Path) {
     let mut qkv_dev = DeviceBuffer::<f32>::zeroed(&stream, rows * nqkv).unwrap();
     // SAFETY: 2-D grid of 16x16 tiles covering rows x nqkv.
     unsafe {
-        km.gemm_bias(
+        km.gemm_bias_64(
             &stream,
             cuda_core::simt::LaunchConfig {
                 grid_dim: ((nqkv.div_ceil(16)) as u32, (rows.div_ceil(16)) as u32, 1),
@@ -1453,7 +1537,7 @@ fn attn_parity_test(device: usize, model_dir: &std::path::Path) {
         let k_view = unsafe { DeviceBuffer::<f32>::from_raw_parts(kseg, seq2 * 64, ctx.clone()) };
         let mut p_view = unsafe { DeviceBuffer::<f32>::from_raw_parts(pseg, seq2 * seq2, ctx.clone()) };
         unsafe {
-            km.gemm_bias(
+            km.gemm_bias_64(
                 &stream,
                 cuda_core::simt::LaunchConfig {
                     grid_dim: ((seq2.div_ceil(16)) as u32, (seq2.div_ceil(16)) as u32, 1),
@@ -1549,7 +1633,7 @@ fn gateff_parity_test(device: usize, model_dir: &std::path::Path) {
     let gemm2 = |mm: usize, nn: usize, kk: usize, x: &DeviceBuffer<f32>, w: &DeviceBuffer<f32>, bias: &DeviceBuffer<f32>, y: &mut DeviceBuffer<f32>| {
         // SAFETY: 2-D grid of 16x16 tiles covering mm x nn.
         unsafe {
-            km.gemm_bias(
+            km.gemm_bias_64(
                 &stream,
                 cuda_core::simt::LaunchConfig {
                     grid_dim: ((nn.div_ceil(16)) as u32, (mm.div_ceil(16)) as u32, 1),
@@ -1859,7 +1943,7 @@ unsafe fn transformer_step(
     // 2. QKV GEMM (M,256 -> 1536) with shared bias
     // SAFETY: 2-D tile grid over m x 1536.
     unsafe {
-        km.gemm_bias(stream, tile_cfg(m, 1536), m as u32, 1536, 256, &scratch.h, &gw.qkv_w[idx], &gw.shared_qkv_bias, &mut scratch.qkv)
+        km.gemm_bias_64(stream, tile_cfg_64(m, 1536), m as u32, 1536, 256, &scratch.h, &gw.qkv_w[idx], &gw.shared_qkv_bias, &mut scratch.qkv)
     }.map_err(|e| e.to_string())?;
     eprintln!("step {layer_idx}.{axis}: qkv gemm ok");
     // 3. RoPE + scale (axis-dependent positions)
@@ -1897,7 +1981,7 @@ unsafe fn transformer_step(
             let mut pseg = mut_slice_view(stream, &mut scratch.p_big, g * n_len * n_len, n_len * n_len)?;
             // SAFETY: 2-D tile grid over n_len x n_len.
             unsafe {
-                km.gemm_bias(stream, tile_cfg(n_len, n_len), n_len as u32, n_len as u32, 64, &*qseg, &*kseg, &scratch.zero_bias_t, &mut *pseg)
+                km.gemm_bias_64(stream, tile_cfg_64(n_len, n_len), n_len as u32, n_len as u32, 64, &*qseg, &*kseg, &scratch.zero_bias_t, &mut *pseg)
             }.map_err(|e| e.to_string())?;
         }
         // SAFETY: one thread per row.
@@ -1921,7 +2005,7 @@ unsafe fn transformer_step(
     // 6. gates GEMM (uses post-norm h)
     // SAFETY: 2-D tile grid over m x 8.
     unsafe {
-        km.gemm_bias(stream, tile_cfg(m, 8), m as u32, 8, 256, &scratch.h, &gw.gates_w[idx], &gw.gates_b[idx], &mut scratch.gates)
+        km.gemm_bias_64(stream, tile_cfg_64(m, 8), m as u32, 8, 256, &scratch.h, &gw.gates_w[idx], &gw.gates_b[idx], &mut scratch.gates)
     }.map_err(|e| e.to_string())?;
     // 7. gate scale + out proj + residual
     // SAFETY: elementwise over m*512.
@@ -1930,7 +2014,7 @@ unsafe fn transformer_step(
     }.map_err(|e| e.to_string())?;
     // SAFETY: 2-D tile grid over m x 256.
     unsafe {
-        km.gemm_bias(stream, tile_cfg(m, 256), m as u32, 256, 512, &scratch.scaled, &gw.out_w[idx], &gw.shared_out_bias, &mut scratch.oproj)
+        km.gemm_bias_64(stream, tile_cfg_64(m, 256), m as u32, 256, 512, &scratch.scaled, &gw.out_w[idx], &gw.shared_out_bias, &mut scratch.oproj)
     }.map_err(|e| e.to_string())?;
     // SAFETY: elementwise over m*256.
     unsafe {
@@ -1943,7 +2027,7 @@ unsafe fn transformer_step(
     }.map_err(|e| e.to_string())?;
     // SAFETY: 2-D tile grid over m x 1024.
     unsafe {
-        km.gemm_bias(stream, tile_cfg(m, 1024), m as u32, 1024, 256, &scratch.h, &gw.ff_w1[idx], &gw.ff_b1[idx], &mut scratch.ffpre)
+        km.gemm_bias_64(stream, tile_cfg_64(m, 1024), m as u32, 1024, 256, &scratch.h, &gw.ff_w1[idx], &gw.ff_b1[idx], &mut scratch.ffpre)
     }.map_err(|e| e.to_string())?;
     // SAFETY: elementwise over m*1024.
     unsafe {
@@ -1951,13 +2035,21 @@ unsafe fn transformer_step(
     }.map_err(|e| e.to_string())?;
     // SAFETY: 2-D tile grid over m x 256.
     unsafe {
-        km.gemm_bias(stream, tile_cfg(m, 256), m as u32, 256, 1024, &scratch.ff1, &gw.ff_w2[idx], &gw.ff_b2[idx], &mut scratch.ff2)
+        km.gemm_bias_64(stream, tile_cfg_64(m, 256), m as u32, 256, 1024, &scratch.ff1, &gw.ff_w2[idx], &gw.ff_b2[idx], &mut scratch.ff2)
     }.map_err(|e| e.to_string())?;
     // SAFETY: elementwise over m*256.
     unsafe {
         km.add_resid(stream, launch1((m * 256) as u32), &scratch.ff2, &scratch.attn_out, x)
     }.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn tile_cfg_64(m: usize, n: usize) -> cuda_core::simt::LaunchConfig {
+    cuda_core::simt::LaunchConfig {
+        grid_dim: ((n.div_ceil(64)) as u32, (m.div_ceil(64)) as u32, 1),
+        block_dim: (16, 16, 1),
+        shared_mem_bytes: 0,
+    }
 }
 
 fn tile_cfg(m: usize, n: usize) -> cuda_core::simt::LaunchConfig {
@@ -2221,13 +2313,13 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
         }
         // qkv gemm
         // SAFETY: tile grid over m x 1536.
-        unsafe { km.gemm_bias(&stream, tile_cfg(m_, 1536), m_ as u32, 1536, 256, &scr.h, &gw.qkv_w[0], &gw.shared_qkv_bias, &mut scr.qkv) }.unwrap();
+        unsafe { km.gemm_bias_64(&stream, tile_cfg_64(m_, 1536), m_ as u32, 1536, 256, &scr.h, &gw.qkv_w[0], &gw.shared_qkv_bias, &mut scr.qkv) }.unwrap();
         // rope (time axis)
         // SAFETY: one thread per (row, pair).
         unsafe { km.rope_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 768) as u32), &scr.qkv, &scr.cos[0], &scr.sin[0], &mut scr.qkv_rope, t_frames as u32, bands as u32, 0) }.unwrap();
         // gates (uses h)
         // SAFETY: tile grid over m x 8.
-        unsafe { km.gemm_bias(&stream, tile_cfg(m_, 8), m_ as u32, 8, 256, &scr.h, &gw.gates_w[0], &gw.gates_b[0], &mut scr.gates) }.unwrap();
+        unsafe { km.gemm_bias_64(&stream, tile_cfg_64(m_, 8), m_ as u32, 8, 256, &scr.h, &gw.gates_w[0], &gw.gates_b[0], &mut scr.gates) }.unwrap();
         // SAFETY: elementwise reorder.
         unsafe { km.qkv_to_attn(&stream, cuda_core::simt::LaunchConfig::for_num_elems((3 * 62 * 8 * t_frames * 64) as u32), &scr.qkv_rope, &mut scr.qkv_attn, t_frames as u32, bands as u32, 0) }.unwrap();
         {
@@ -2237,7 +2329,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
                 let kseg = slice_view(&stream, &scr.qkv_attn, bh * n_len * 64 + g * n_len * 64, n_len * 64).unwrap();
                 let mut pseg = mut_slice_view(&stream, &mut scr.p_big, g * n_len * n_len, n_len * n_len).unwrap();
                 // SAFETY: tile grid over n_len x n_len.
-                unsafe { km.gemm_bias(&stream, tile_cfg(n_len, n_len), n_len as u32, n_len as u32, 64, &*qseg, &*kseg, &scr.zero_bias_t, &mut *pseg) }.unwrap();
+                unsafe { km.gemm_bias_64(&stream, tile_cfg_64(n_len, n_len), n_len as u32, n_len as u32, 64, &*qseg, &*kseg, &scr.zero_bias_t, &mut *pseg) }.unwrap();
             }
             // SAFETY: one thread per row.
             unsafe { km.softmax_rows(&stream, cuda_core::simt::LaunchConfig::for_num_elems((bh * n_len) as u32), &mut scr.p_big, (bh * n_len) as u32, n_len as u32) }.unwrap();
@@ -2324,7 +2416,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
             }
         }
         // SAFETY: tile grid over m x 256.
-        unsafe { km.gemm_bias(&stream, tile_cfg(m_, 256), m_ as u32, 256, 512, &scr.scaled, &gw.out_w[0], &gw.shared_out_bias, &mut scr.oproj) }.unwrap();
+        unsafe { km.gemm_bias_64(&stream, tile_cfg_64(m_, 256), m_ as u32, 256, 512, &scr.scaled, &gw.out_w[0], &gw.shared_out_bias, &mut scr.oproj) }.unwrap();
         // SAFETY: elementwise over m*256.
         unsafe { km.add_resid(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 256) as u32), &scr.oproj, &x, &mut scr.attn_out) }.unwrap();
         {
@@ -2401,7 +2493,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
             let h_off = (s * bands + b) * t_frames * 1024;
             let mut hseg = mut_slice_view(&stream, &mut hidden, h_off, t_frames * 1024).unwrap();
             // SAFETY: tile grid over t_frames x 1024.
-            unsafe { km.gemm_bias(&stream, tile_cfg(t_frames, 1024), t_frames as u32, 1024, 256, &*xseg, &*w1seg, &*b1seg, &mut *hseg) }.expect("mask gemm1");
+            unsafe { km.gemm_bias_64(&stream, tile_cfg_64(t_frames, 1024), t_frames as u32, 1024, 256, &*xseg, &*w1seg, &*b1seg, &mut *hseg) }.expect("mask gemm1");
         }
     }
     {
@@ -2427,7 +2519,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
             let hseg = slice_view(&stream, &hidden_t, h_off, t_frames * 1024).unwrap();
             let mut oseg = mut_slice_view(&stream, &mut pre2, 0, t_frames * dim_out).unwrap();
             // SAFETY: tile grid over t_frames x dim_out.
-            unsafe { km.gemm_bias(&stream, tile_cfg(t_frames, dim_out), t_frames as u32, dim_out as u32, 1024, &*hseg, &*w2seg, &*b2seg, &mut *oseg) }.expect("mask gemm2");
+            unsafe { km.gemm_bias_64(&stream, tile_cfg_64(t_frames, dim_out), t_frames as u32, dim_out as u32, 1024, &*hseg, &*w2seg, &*b2seg, &mut *oseg) }.expect("mask gemm2");
             let pseg = slice_view(&stream, &pre2, 0, t_frames * dim_out).unwrap();
             let mut gseg = mut_slice_view(&stream, &mut glu1, 0, t_frames * dim_in).unwrap();
             // SAFETY: elementwise over t*dim_in.
