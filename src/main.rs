@@ -1000,10 +1000,17 @@ mod gpu_kernels {
             let fi = fpos - band_f0[band] as usize;
             let gcol = fi * 4 + ch * 2 + c;
             // glu rows are padded to max_dim = 516
-            let g = glu[((stem * bands_ + band) * t_f + t) * 516 + gcol];
-            let s = spec[((ch * t_f + t) * 1025 + fpos) * 2 + c];
+            // Complex multiplication: (sr + si*j) * (mr + mi*j)
+            // Each thread handles ONE component (c=0 for real, c=1 for imag).
+            // Read both spec and mask components to compute this component.
+            let g_base = ((stem * bands_ + band) * t_f + t) * 516 + fi * 4 + ch * 2;
+            let mr = glu[g_base];
+            let mi = glu[g_base + 1];
+            let sr = spec[((ch * t_f + t) * 1025 + fpos) * 2];
+            let si = spec[((ch * t_f + t) * 1025 + fpos) * 2 + 1];
+            let v = if c == 0 { sr * mr - si * mi } else { sr * mi + si * mr };
             if let Some(o) = out.get_mut(idx) {
-                *o = s * g;
+                *o = v;
             }
         }
     }
