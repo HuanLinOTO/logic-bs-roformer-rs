@@ -84,6 +84,8 @@ FF1+GELU 9.0、mask 两级 4.9、RMSNorm 2.9、STFT/FFT/杂项 1.4。
 | 寄存器预取双缓冲 / 128×128 tile / 双行组 warp | 186/231/217ms | 嵌套/跨循环寄存器数组 spill 到 local memory（累加上限 ~32 float） |
 | flash 六种几何（128/256、192/384、持久块、双组…） | 全部更慢 | 64 行/128 线程/1 组每块为最优 |
 | flash gather float4 化 | +3ms | warp 跨行拆散 128B 事务 |
+| 256 行宽 q-tile（512 线程） | 时间轴 25.8→31.9ms | K/V 流量不是墙；尾 tile 浪费 + barrier/LDS 压力 |
+| K/V 注意力主序预重排（RoPE 前移） | 时间轴 25.8→33.2ms，整曲 7.02→8.41s | 折叠布局聚合访问本就是顺序扫描；逐 grp 连续反而打散 DRAM 页局部性 |
 | cuBLAS / cuBLASLt | 不可用 | 与 cuda-oxide 上下文/流冲突（719 错误） |
 
 工具链两条硬约束：**非 2 幂行距惩罚**、**嵌套寄存器数组必 spill**。
