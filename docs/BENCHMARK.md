@@ -263,6 +263,26 @@ ncu（32 距离 flash）：时间轴 2.54 ms/launch，L2 82.9%、DRAM 70.7%
   chunk 的 GPU 时间，GPU 零空转）。正确性：新旧输出逐 stem SNR
   **143+ dB**（max|diff| 4.8e-7，纯 fp32 结合顺序差异）。
 
+### 第 33 轮：注意力结构实验两次证伪（宽 tile / 注意力主序重排）
+
+ncu（T=1151 时间轴 flash，25.8ms/launch）：L2 吞吐 85.3%（墙）、DRAM 76.5% 忙
+但数据率仅 ~100GB/s、占用率 33%（smem 限制）、scheduler 77.5% 无 eligible、
+65.5% stall 在 L1TEX scoreboard。两个结构性实验均以数据证伪：
+
+1. **256 行宽 q-tile**（512 线程，寄存器结构不变，K/V 流量 2.63GB→0.73GB）：
+   T=259 bench 73.5→93.9ms，T=1151 时间轴 25.8→31.9ms/launch。流量不是墙；
+   尾 tile 浪费 + 512 线程 barrier + LDS 压力反而更重。
+2. **K/V 注意力主序预重排**（新 qkv_kv_attn16 内核，K 的 RoPE 前移消表读；
+   重排本身仅 0.46ms/launch，内容逐位验证正确 badk=0/badv=0；修复 K/V 基址
+   bug 后 SNR 80.99 不变）：T=1151 时间轴 flash 25.8→33.2ms，整曲 7.02→8.41s。
+   教训：折叠布局下 496 个 grp 的 K/V 访问虽然各自 190KB 跨度，但聚合恰好是
+   219MB 缓冲的顺序扫描（DRAM 页局部性好、L2 命中 85.9%）；逐 grp 连续布局
+   把聚合流打散成 ~30 条相距 4-5MB 的独立流，反而更差。
+
+结论：该 flash 内核对"减流量/改布局"两类手段均不敏感（延迟+占用率受限），
+剩余可信杠杆只有 cp.async 双缓冲（但 GEMM 路线已实测零收益）或接受现状。
+本轮保留产出：GPU OLA 流水线（第 32 轮）不变，主分支回到 7.02s。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
