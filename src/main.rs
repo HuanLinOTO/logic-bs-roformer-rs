@@ -39,6 +39,7 @@ struct Args {
     e2e_test: bool,
     reorder_test: bool,
     bench: bool,
+    iters: usize,
     stems: Option<usize>,
 }
 
@@ -69,8 +70,12 @@ fn parse_args() -> Result<Args, String> {
             "--e2e-test" => args.e2e_test = true,
             "--reorder-test" => args.reorder_test = true,
             "--bench" => args.bench = true,
+            "--iters" => args.iters = need("--iters")?.parse().map_err(|_| "bad --iters")?,
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if args.iters == 0 {
+        args.iters = 10;
     }
     Ok(args)
 }
@@ -108,6 +113,11 @@ fn main() {
 
     if args.e2e_test {
         e2e_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        return;
+    }
+
+    if args.bench {
+        bench_warm(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), args.iters);
         return;
     }
 
@@ -4038,13 +4048,13 @@ unsafe fn transformer_step(
     unsafe {
         km.rmsnorm_gates(stream, launch1((m * 32) as u32), x, &gw.norm_gamma[idx], &gw.gates_w[idx], &gw.gates_b[idx], &mut scratch.h, &mut scratch.gates, m as u32, 256)
     }.map_err(|e| e.to_string())?;
-    eprintln!("step {layer_idx}.{axis}: rmsnorm ok");
+
     // 2. QKV GEMM (M,256 -> 1536) with shared bias
     // SAFETY: 2-D tile grid over m x 1536.
     unsafe {
         km.gemm_f16_128x64(stream, tile_cfg_tf32_64(m, 1536), m as u32, 1536, 256, &scratch.h, &gw.qkv_w[idx], &gw.shared_qkv_bias, &mut scratch.qkv)
     }.map_err(|e| e.to_string())?;
-    eprintln!("step {layer_idx}.{axis}: qkv gemm ok");
+
     // RoPE and attention-major reordering are fused into the raw-QKV
     // QK/PV attention kernels below.
     let (bh, n_len) = if axis == 0 { (bands * 8, t_frames) } else { (t_frames * 8, bands) };
@@ -4710,6 +4720,293 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     println!("E2E SNR vs ref_output: {snr:.2} dB");
     println!("forward+mask+parity host wall: {:?}", forward_t0.elapsed());
 
+}
+
+// ---------------------------------------------------------------------------
+// Warm benchmark: weights and every scratch buffer are allocated once; the
+// timed loop repeats full forwards on the golden 3 s input. Mirrors
+// tools/bench_ref.py methodology (warmup 3, single sync around the loop).
+// ---------------------------------------------------------------------------
+
+struct BenchBufs {
+    x_dev: DeviceBuffer<f32>,
+    win_dev: DeviceBuffer<f32>,
+    frames_dev: DeviceBuffer<f32>,
+    spec_dev: DeviceBuffer<f32>,
+    xin_dev: DeviceBuffer<f32>,
+    bsnorm: DeviceBuffer<f32>,
+    x: DeviceBuffer<f32>,
+    scr: E2eScratch,
+    x_final: DeviceBuffer<f32>,
+    xb: DeviceBuffer<f32>,
+    glu_all: DeviceBuffer<f32>,
+    hidden_t: DeviceBuffer<f32>,
+    pre2_all: DeviceBuffer<f32>,
+    c2r_in: DeviceBuffer<f32>,
+    pcm: DeviceBuffer<f32>,
+    offs_dev: DeviceBuffer<u32>,
+    dims_dev: DeviceBuffer<u32>,
+    f0_dev: DeviceBuffer<u32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn bench_forward(
+    km: &gpu_kernels::LoadedModule,
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    gw: &GpuWeights,
+    sp: &stft::Stft,
+    c2r: &cufft::CufftPlan,
+    b: &mut BenchBufs,
+    len: usize,
+    t_frames: usize,
+    bands: usize,
+) -> Result<(), String> {
+    let m = t_frames * bands;
+    let max_dim = 516usize;
+    let elems = |n: usize| LaunchConfig::for_num_elems(n as u32);
+    // 1. STFT front-end
+    // SAFETY: one thread per frame element.
+    unsafe {
+        km.frame_hann_reflect(stream, elems(2 * t_frames * stft::N_FFT),
+            &b.x_dev, &b.win_dev, &mut b.frames_dev, stft::N_FFT as u32, stft::HOP as u32, len as u32, t_frames as u32)
+    }.map_err(|e| e.to_string())?;
+    sp.exec_fwd(&b.frames_dev, &mut b.spec_dev)?;
+    // 2. reorder
+    // SAFETY: elementwise gather over t*4100.
+    unsafe {
+        km.spec_reorder(stream, elems(t_frames * 4100),
+            &b.spec_dev, &b.f0_dev, &b.offs_dev, &mut b.xin_dev, t_frames as u32)
+    }.map_err(|e| e.to_string())?;
+    // 3. BandSplit
+    // SAFETY: one warp per (band, time) row.
+    unsafe {
+        km.bandsplit_norm(stream, elems(m * 32),
+            &b.xin_dev, &gw.band_gamma, &b.offs_dev, &b.dims_dev, &mut b.bsnorm, t_frames as u32, bands as u32, max_dim as u32)
+    }.map_err(|e| e.to_string())?;
+    // SAFETY: 64x128 FP16 tiles for every band.
+    unsafe {
+        km.bandsplit_gemm_f16(stream, LaunchConfig { grid_dim: (4, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+            &b.offs_dev, &b.dims_dev, &b.bsnorm, &gw.band_w, &gw.band_b, &mut b.x, t_frames as u32, bands as u32, max_dim as u32)
+    }.map_err(|e| e.to_string())?;
+    // 4. trunk
+    for layer in 0..12usize {
+        for axis in 0..2usize {
+            unsafe { transformer_step(km, ctx, stream, gw, layer, axis, &mut b.x, t_frames, bands, &mut b.scr)?; }
+        }
+    }
+    // 5. final norm
+    // SAFETY: one warp per row.
+    unsafe {
+        km.rmsnorm(stream, elems(m * 32), &b.x, &gw.final_norm, &mut b.x_final, m as u32, 256)
+    }.map_err(|e| e.to_string())?;
+    // 6. band-major transpose
+    // SAFETY: elementwise transpose.
+    unsafe {
+        km.transpose_band_major(stream, elems(m * 256), &b.x_final, &mut b.xb, t_frames as u32, bands as u32)
+    }.map_err(|e| e.to_string())?;
+    // 7. MaskEstimator grouped GEMMs
+    let pre_width = 2 * max_dim;
+    for s in 0..6usize {
+        // SAFETY: 16 column tiles x ceil(T/128) row tiles x 62 bands.
+        unsafe {
+            km.mask_gemm1_f16(stream, LaunchConfig { grid_dim: (16, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                t_frames as u32, (s * bands) as u32, &b.xb, &gw.mask_w1[s], &gw.mask_b1[s], &mut b.hidden_t)
+        }.map_err(|e| e.to_string())?;
+    }
+    for s in 0..6usize {
+        // SAFETY: worst-case 17 column tiles; invalid per-band tiles return.
+        unsafe {
+            km.mask_gemm2_f16(stream, LaunchConfig { grid_dim: (pre_width.div_ceil(64) as u32, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                t_frames as u32, (s * bands) as u32, pre_width as u32, &b.offs_dev, &b.hidden_t, &gw.mask_w2[s], &gw.mask_b2[s], &mut b.pre2_all)
+        }.map_err(|e| e.to_string())?;
+    }
+    // SAFETY: one thread per padded GLU output element.
+    unsafe {
+        km.glu_scatter(stream, elems(b.glu_all.len()), &b.pre2_all, &b.offs_dev, &mut b.glu_all, t_frames as u32, bands as u32, max_dim as u32)
+    }.map_err(|e| e.to_string())?;
+    // 8. mask apply + ISTFT
+    // SAFETY: elementwise over 12*T*1025*2.
+    unsafe {
+        km.mask_apply(stream, elems(12 * t_frames * 1025 * 2), &b.spec_dev, &b.glu_all, &b.f0_dev, &mut b.c2r_in, t_frames as u32, bands as u32)
+    }.map_err(|e| e.to_string())?;
+    for g in 0..12usize {
+        let iseg = slice_view(stream, &b.c2r_in, g * t_frames * 1025 * 2, t_frames * 1025 * 2)?;
+        let mut oseg = mut_slice_view(stream, &mut b.pcm, g * t_frames * 2048, t_frames * 2048)?;
+        c2r.exec_c2r(iseg.cu_deviceptr(), oseg.cu_deviceptr())?;
+    }
+    Ok(())
+}
+
+fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize) {
+    let iters = iters.max(1);
+    let golden = npz::Npz::open(&model_dir.join("ref_output.npz")).unwrap_or_else(|e| panic!("{e}"));
+    let inp = golden.f32("inp").expect("inp");
+    let ref_out = golden.f32("out").expect("out");
+    let cfg = config::ModelConfig::parse(&std::fs::read_to_string(model_dir.join("logic_bs_roformer.yaml")).unwrap()).unwrap();
+    let t_frames = stft::num_frames(inp.len() / 2);
+    let bands = cfg.num_bands();
+    let m = t_frames * bands;
+    let len = inp.len() / 2;
+    println!("bench: L={len} T={t_frames} bands={bands} M={m} iters={iters}");
+
+    let ctx = CudaContext::new(device).expect("ctx");
+    let stream = ctx.default_stream();
+    let km = gpu_kernels::load(&ctx).expect("kernels");
+
+    let setup_t0 = std::time::Instant::now();
+    let st = weights::SafeTensors::open(&model_dir.join("model.safetensors")).unwrap();
+    let w = weights::ModelWeights::load(&st, &cfg).unwrap();
+    let gw = upload_weights(&ctx, &stream, &w).expect("weights upload");
+    println!("weights load+upload: {:?}", setup_t0.elapsed());
+
+    // input interleaved
+    let mut xi = vec![0.0f32; len * 2];
+    for i in 0..len {
+        xi[i * 2] = inp[i];
+        xi[i * 2 + 1] = inp[len + i];
+    }
+    let fft = std::sync::Arc::new(cufft::Cufft::load().expect("cufft"));
+    let sp = stft::Stft::new(fft.clone(), t_frames).expect("stft plan");
+    // One reusable C2R plan for all 12 stem/channel planes (same shape).
+    let c2r_plan = {
+        let r: &cufft::Cufft = &fft;
+        // SAFETY: the Arc<Cufft> outlives the plan in this scope.
+        unsafe {
+            let s: &'static cufft::Cufft = std::mem::transmute(r);
+            s.plan(2048, t_frames, false).expect("c2r plan")
+        }
+    };
+
+    // band tables
+    let freqs: Vec<usize> = cfg.freqs_per_bands.clone();
+    let dims: Vec<u32> = freqs.iter().map(|f| (2 * f * 2) as u32).collect();
+    let mut offs = vec![0u32; bands + 1];
+    let mut f0 = vec![0u32; bands];
+    for i in 0..bands {
+        offs[i + 1] = offs[i] + dims[i];
+        f0[i] = freqs[..i].iter().sum::<usize>() as u32;
+    }
+    let offs_dev = DeviceBuffer::from_host(&stream, &offs).unwrap();
+    let dims_dev = DeviceBuffer::from_host(&stream, &dims).unwrap();
+    let f0_dev = DeviceBuffer::from_host(&stream, &f0).unwrap();
+
+    // rotary tables
+    let cos_t: Vec<f32> = (0..t_frames).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).cos())).collect();
+    let sin_t: Vec<f32> = (0..t_frames).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).sin())).collect();
+    let cos_f: Vec<f32> = (0..bands).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).cos())).collect();
+    let sin_f: Vec<f32> = (0..bands).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).sin())).collect();
+
+    let z = |n: usize| DeviceBuffer::<f32>::zeroed(&stream, n).unwrap();
+    let alloc_t0 = std::time::Instant::now();
+    let mut bufs = BenchBufs {
+        x_dev: DeviceBuffer::from_host(&stream, &xi).unwrap(),
+        win_dev: DeviceBuffer::from_host(&stream, sp.window()).unwrap(),
+        frames_dev: z(2 * t_frames * stft::N_FFT),
+        spec_dev: z(2 * t_frames * stft::FREQ_BINS * 2),
+        xin_dev: z(t_frames * 4100),
+        bsnorm: z(bands * t_frames * 516),
+        x: z(m * 256),
+        scr: E2eScratch {
+            h: z(m * 256),
+            qkv: z(m * 1536),
+            qkv_rope: z(m * 1536),
+            qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64),
+            v_flat: z(m * 512),
+            gates: z(m * 8),
+            scaled: z(m * 512),
+            oproj: z(m * 256),
+            attn_out: z(m * 256),
+            ffpre: z(m * 1024),
+            ff1: z(m * 1024),
+            ff2: z(m * 256),
+            p_big: z(62 * 8 * t_frames * t_frames),
+            attn_out_long: z(496 * t_frames * 64),
+            cos: [DeviceBuffer::from_host(&stream, &cos_t).unwrap(), DeviceBuffer::from_host(&stream, &cos_f).unwrap()],
+            sin: [DeviceBuffer::from_host(&stream, &sin_t).unwrap(), DeviceBuffer::from_host(&stream, &sin_f).unwrap()],
+            zero_bias_t: z(t_frames),
+            zero_bias_64: z(64),
+            attn_max: z(m * 8),
+            attn_scale: z(m * 8),
+        },
+        x_final: z(m * 256),
+        xb: z(m * 256),
+        glu_all: z(6 * bands * t_frames * 516),
+        hidden_t: z(6 * bands * t_frames * 1024),
+        pre2_all: z(6 * bands * t_frames * 2 * 516),
+        c2r_in: z(12 * t_frames * stft::FREQ_BINS * 2),
+        pcm: z(12 * t_frames * 2048),
+        offs_dev,
+        dims_dev,
+        f0_dev,
+    };
+    println!("scratch alloc: {:?}", alloc_t0.elapsed());
+
+    // warmup
+    for _ in 0..3 {
+        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands).expect("forward"); }
+    }
+    stream.synchronize().expect("warmup sync");
+
+    // timed aggregate loop: single sync around all iters (same as bench_ref.py)
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands).expect("forward"); }
+    }
+    stream.synchronize().expect("timed sync");
+    let agg = t0.elapsed().as_secs_f64() / iters as f64;
+    println!("BENCH warm aggregate: {:.3} ms/iter over {iters} iters, RTF {:.4}", agg * 1000.0, agg / 3.0);
+
+    // per-iter breakdown with sync (shows variance; upper bound per chunk)
+    let mut per = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        stream.synchronize().expect("sync");
+        let i0 = std::time::Instant::now();
+        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands).expect("forward"); }
+        stream.synchronize().expect("sync");
+        per.push(i0.elapsed().as_secs_f64() * 1000.0);
+    }
+    let med = {
+        let mut v = per.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    println!("BENCH warm per-iter (sync each): min {:.3} ms, med {med:.3} ms, max {:.3} ms", per.iter().cloned().fold(f64::INFINITY, f64::min), per.iter().cloned().fold(0.0, f64::max));
+
+    // correctness spot-check on the last output (host OLA + SNR, untimed)
+    let frames_out = bufs.pcm.to_host_vec(&stream).unwrap();
+    let win = sp.window();
+    let hop = stft::HOP;
+    let padded = len + 2 * 1024;
+    let mut result = vec![0.0f32; 6 * 2 * padded];
+    let mut counter = vec![0.0f32; padded];
+    for t in 0..t_frames {
+        for n in 0..2048usize {
+            let pos = t * hop + n;
+            if pos < padded {
+                counter[pos] += win[n] * win[n];
+                for sc in 0..12usize {
+                    result[(sc / 2 * 2 + sc % 2) * padded + pos] += frames_out[(sc * t_frames + t) * 2048 + n] * win[n] * (1.0 / 2048.0);
+                }
+            }
+        }
+    }
+    let mut sig = 0.0f64;
+    let mut noise = 0.0f64;
+    for s in 0..6usize {
+        for ch in 0..2usize {
+            for i in 0..len {
+                let c = counter[1024 + i];
+                let v = if c > 1e-8 { result[(s * 2 + ch) * padded + 1024 + i] / c } else { 0.0 };
+                let r = ref_out[(s * 2 + ch) * len + i];
+                sig += (r as f64) * (r as f64);
+                let d = (v - r) as f64;
+                noise += d * d;
+            }
+        }
+    }
+    let snr = 10.0 * (sig / (noise + 1e-30)).log10();
+    println!("BENCH final SNR vs ref_output: {snr:.2} dB");
 }
 
 fn self_test(device: usize) {
