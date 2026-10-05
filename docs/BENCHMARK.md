@@ -165,6 +165,15 @@ ncu（32 距离 flash）：时间轴 2.54 ms/launch，L2 82.9%、DRAM 70.7%
   第四种几何证伪。小块多驻留（2480 块）在这个同步密集内核中胜出，
   64 行/128 线程最终确立。
 
+### 第 27 轮后续：residual/gelu float4（重大）
+
+- **residual + gelu GEMM float4 化**（与 QKV 同法）：105.1 → **99.1 ms**
+  （**1.218×**，RTF 0.0331）。至此全部五个 f16 GEMM 内核统一为
+  K64 tile + float4 加载。SNR 80.87 不变。
+- flash gather float4 向量化：102.3 ms（反亏 3 ms）——warp 跨行拆散
+  128B 事务，标量对（每 warp 恰一行 128B）在此内核更优，已回退。
+- 192 行 tile：138.4 ms（第四种几何证伪，见上）。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
