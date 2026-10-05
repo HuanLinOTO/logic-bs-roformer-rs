@@ -458,24 +458,59 @@ demix（OLA 竞争处理 + 双份 scratch + cufft 双 plan）投入远超 4% 收
   六 stem SNR **269–357 dB**（末位 bit 差异，能量加权口径
   scripts/snr_wav.py）；LBRR_NO_LT=1 回退手写路径实测 57.7ms 正常。
 
+### 第 45 轮：cudnn fused SDPA（两轴注意力全量切换，第四轮核心）
+
+- **spike 决策数据**（scripts/sdpa_probe*.py，torch SDPA 三后端实测）：
+  - head_dim 修正为 64（qkv 1536 = 3×8×64）后，cudnn 后端 time-song
+    (62,8,1151,64) 57T / freq (1151,8,62,64) 21.6T，而手写 flash 仅
+    14.9T / 3.3T——两轴都有 4× 空间。
+  - fold 布局 stride 化（Q/K/V/O 全部 as_strided 零 repack）实测
+    仅比 packed 慢 6.6%（57.0 vs 61.2T），免去全部搬运。
+- **集成方式**：cudnn 9.10 无原子 SDPA backend op，fused flash 走
+  cudnn-frontend Graph API → 写薄 extern-C wrapper（tools/cudnn_sdpa_wrap.cpp，
+  frontend v1.12.1 头 + nvrtc stub 编成 libcudnn_sdpa_wrap.so），Rust 侧
+  src/cudnn.rs dlopen 单文件、per-(B,S) plan 缓存、fold stride 直传。
+  集成层三个新 kernel：rope_q16_inplace（Q 旋转原地）、sdpa_gate（逐
+  (token,head) sigmoid 门控）、rope_k16 扩展到频率轴；LBRR_NO_CUDNN=1
+  回退手写 flash 全链。
+- **排障实录**（本轮最大时间坑，全程 dump+replay 三方对拍）：
+  1. "No valid engine configs"：sm86 sdpa 引擎是 runtime-compiled，
+     dlopen 链必须预注册 pip 包里的 libnvrtc.so.12（+builtins），
+     否则 heuristic 全拒；
+  2. 数值 parity：wrapper 输出与 torch cudnn sdpa **bit-exact**（rel=0），
+     numpy 参考 4.6e-4（fp16 正常）；probe 自带 C 参考实现有个 K/Q 索引
+     笔误险些误导（教训：参考实现也要交叉验证）；
+  3. 集成后 freq 轴 SNR 崩到 3.7dB："前 62 个 t 组对、之后全错"的签名
+     最终定位为调用层传错 shape（seq 传了 bands=62 而非 t_frames → 图
+     (62,62) 只覆盖前 3844 token）。修复后 80.83dB。
+- **OLA 写回存量 bug 修复**（借交付用户整曲之机发现）：分离输出自首版
+  起整体晚 29440 样本（0.668s）——host 写回读累积器 [0, out_len)，而累积
+  器是 reflect-pad 坐标系，正确区间 [BORDER, BORDER+len)。6-stem 重建
+  SNR -3.1dB → **16.46dB**（BS-RoFormer 正常量级），xcorr lag=0。
+- **结果**：bench 51.57 → **33.76 ms**；整曲 GPU wall 5.34 → **3.21 s**
+  （热态三次 3.204/3.208/3.216）；黄金 SNR 80.83dB；新旧整曲六 stem
+  SNR 47.7–70.1dB（注意力实现更换的正常 fp16 舍入差，黄金口径不降）；
+  LBRR_NO_CUDNN=1 回退实测 52.8ms / 80.99dB 完好。
 ### 最终成绩（vs PyTorch 2.14.1 / pymss，RTX 3080，同机同卡同口径）
 
 | 口径 | pymss | 本实现 | 加速比 |
 |---|---|---|---|
-| 单 chunk 前向（3s 合成输入） | 120.8 ms | **51.6 ms** | **2.34×** |
-| 整曲 demix（3:00 真实歌曲） | 9.7 s | **5.34 s** | **1.81×** |
-| 黄金 SNR（vs fp32 参考） | — | 80.99 dB | 验收线 ≥60 |
-| 整曲回归 SNR（vs 上一版 stems） | — | 269–357 dB | 末位 bit 级差异 |
+| 单 chunk 前向（3s 合成输入） | 120.8 ms | **33.8 ms** | **3.58×** |
+| 整曲 demix（3:00 真实歌曲） | 9.7 s | **3.21 s** | **3.01×** |
+| 黄金 SNR（vs fp32 参考） | — | 80.83 dB | 验收线 ≥60 |
+| 6-stem 重建 SNR（vs 源曲） | — | 16.5 dB | 逐样本对齐（OLA 修复后） |
 
-（第一/二轮改造逐字节一致；第三轮 cuBLASLt 数值为 ulp 级差异，
-整曲六 stem SNR 269dB+，末位 bit 翻动，量化/听感口径无影响。）
+（第一/二轮逐字节一致；第三轮 cuBLASLt ulp 级差异；第四轮 cudnn
+sdpa 为 fp16 舍入级差异，黄金 SNR -0.16dB，量化/听感口径无影响。）
 
 ### 下一步（收益均已边际化，按潜在排序）
 
-1. GEMM 已到 cuBLASLt 天花板附近：QKV 54-57 TFLOPS（heuristic 最优）、
-   resid 38.9T（BIAS+beta 约束下实测最优）。FF1 受 erf/tanh GELU 数值
-   口径约束保留手写（321µs vs ~200µs，-0.5dB 不可接受）。
-2. 注意力时间轴在 L2 带宽墙（108% @T=1151），指令侧剩 softmax 本质
-   开销；宽 tile/主序重排/Q 寄存器化共 6 次结构实验全部证伪。
-3. 小头：mask 两级分组 GEMM 2.9ms（62 组变宽结构，cublasLt 不适用，
-   需 pad 重构）、rmsnorm_gates 1.8ms、glu/apply/rope ~2ms。
+1. 注意力两轴已切 cudnn fused SDPA（62T/21.6T，接近 sm86 fp16 tensor 峰）；
+   GEMM 在 cuBLASLt 天花板附近（QKV 54-57T、resid 38.9T）。FF1 受
+   erf/tanh GELU 数值口径约束保留手写（-0.5dB 不可接受）。
+2. nsys 新分布（33.8ms 口径）：cudnn sdpa 两轴合计 ~7ms、cuBLASLt
+   resid×2 10.4ms、FF1 手写 6.0ms、QKV 5.3ms、RMSNorm 2.3ms、mask
+   两级 2.9ms、rope/gate/杂项 ~2ms。FF1 是下一个最大单体（erf-GELU
+   epilogue 自研 tensor-core kernel 的空间 ~2ms）。
+3. mask 两级分组 GEMM 2.9ms（62 组变宽结构，pad 重构已算死 7.7×
+   FLOPs 浪费，不可行）；rmsnorm/glu/rope 带宽型已近物理极限。
