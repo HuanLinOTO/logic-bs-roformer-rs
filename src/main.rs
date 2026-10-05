@@ -41,6 +41,7 @@ struct Args {
     forward_only: bool,
     reorder_test: bool,
     bench: bool,
+    dualbench: bool,
     iters: usize,
     stems: Option<usize>,
 }
@@ -74,6 +75,7 @@ fn parse_args() -> Result<Args, String> {
             "--forward-only" => args.forward_only = true,
             "--reorder-test" => args.reorder_test = true,
             "--bench" => args.bench = true,
+            "--dualbench" => args.dualbench = true,
             "--iters" => args.iters = need("--iters")?.parse().map_err(|_| "bad --iters")?,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -134,8 +136,8 @@ fn main() {
         return;
     }
 
-    if args.bench {
-        bench_warm(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), args.iters);
+    if args.bench || args.dualbench {
+        bench_warm(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), args.iters, args.dualbench);
         return;
     }
 
@@ -6545,7 +6547,64 @@ unsafe fn bench_forward(
     Ok(())
 }
 
-fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize) {
+fn make_bench_bufs(
+    st: &Arc<CudaStream>,
+    xi: &[f32], win: &[f32],
+    cos_t: &[f32], sin_t: &[f32], cos_f: &[f32], sin_f: &[f32],
+    offs: &[u32], dims: &[u32], f0: &[u32],
+    m: usize, t_frames: usize, bands: usize,
+) -> BenchBufs {
+    let zt = |n: usize| DeviceBuffer::<f32>::zeroed(st, n).unwrap();
+    BenchBufs {
+        x_dev: DeviceBuffer::from_host(st, &xi).unwrap(),
+        win_dev: DeviceBuffer::from_host(st, win).unwrap(),
+        frames_dev: zt(2 * t_frames * stft::N_FFT),
+        spec_dev: zt(2 * t_frames * stft::FREQ_BINS * 2),
+        xin_dev: zt(t_frames * 4100),
+        bsnorm: zt(bands * t_frames * 516),
+        x: zt(m * 256),
+        scr: E2eScratch {
+            h: zt(m * 256),
+            h16: DeviceBuffer::<u32>::zeroed(st, m * 128).unwrap(),
+        qkv16: DeviceBuffer::<u32>::zeroed(st, m * 768).unwrap(),
+k16r: DeviceBuffer::<u32>::zeroed(st, m * 256).unwrap(),
+        scaled16: DeviceBuffer::<u32>::zeroed(st, m * 256).unwrap(),
+        ff1_16: DeviceBuffer::<u32>::zeroed(st, m * 512).unwrap(),
+            qkv: zt(m * 1536),
+            qkv_rope: zt(m * 1536),
+            qkv_attn: zt(3 * 62 * 8 * t_frames.max(bands) * 64),
+            v_flat: zt(m * 512),
+            gates: zt(m * 8),
+            scaled: zt(m * 512),
+            oproj: zt(m * 256),
+            attn_out: zt(m * 256),
+            ffpre: zt(m * 1024),
+            ff1: zt(m * 1024),
+            ff2: zt(m * 256),
+            p_big: zt(62 * 8 * t_frames * t_frames),
+            attn_out_long: zt(496 * t_frames * 64),
+            cos: [DeviceBuffer::from_host(st, &cos_t).unwrap(), DeviceBuffer::from_host(st, &cos_f).unwrap()],
+            sin: [DeviceBuffer::from_host(st, &sin_t).unwrap(), DeviceBuffer::from_host(st, &sin_f).unwrap()],
+            zero_bias_t: zt(t_frames),
+            zero_bias_64: zt(64),
+            attn_max: zt(m * 8),
+            attn_scale: zt(m * 8),
+        },
+        x_final: zt(m * 256),
+        xb: zt(m * 256),
+        xb16: DeviceBuffer::<u32>::zeroed(st, m * 128).unwrap(),
+        glu_all: zt(6 * bands * t_frames * 516),
+        hidden_t: DeviceBuffer::<u32>::zeroed(st, 6 * bands * t_frames * 512).unwrap(),
+        pre2_all: zt(6 * bands * t_frames * 2 * 516),
+        c2r_in: zt(12 * t_frames * stft::FREQ_BINS * 2),
+        pcm: zt(12 * t_frames * 2048),
+        offs_dev,
+        dims_dev,
+        f0_dev,
+    };
+}
+
+fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bool) {
     let iters = iters.max(1);
     let golden = npz::Npz::open(&model_dir.join("ref_output.npz")).unwrap_or_else(|e| panic!("{e}"));
     let inp = golden.f32("inp").expect("inp");
@@ -6604,55 +6663,8 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize) {
     let cos_f: Vec<f32> = (0..bands).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).cos())).collect();
     let sin_f: Vec<f32> = (0..bands).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).sin())).collect();
 
-    let z = |n: usize| DeviceBuffer::<f32>::zeroed(&stream, n).unwrap();
     let alloc_t0 = std::time::Instant::now();
-    let mut bufs = BenchBufs {
-        x_dev: DeviceBuffer::from_host(&stream, &xi).unwrap(),
-        win_dev: DeviceBuffer::from_host(&stream, sp.window()).unwrap(),
-        frames_dev: z(2 * t_frames * stft::N_FFT),
-        spec_dev: z(2 * t_frames * stft::FREQ_BINS * 2),
-        xin_dev: z(t_frames * 4100),
-        bsnorm: z(bands * t_frames * 516),
-        x: z(m * 256),
-        scr: E2eScratch {
-            h: z(m * 256),
-            h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
-        qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
-k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
-        scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
-        ff1_16: DeviceBuffer::<u32>::zeroed(&stream, m * 512).unwrap(),
-            qkv: z(m * 1536),
-            qkv_rope: z(m * 1536),
-            qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64),
-            v_flat: z(m * 512),
-            gates: z(m * 8),
-            scaled: z(m * 512),
-            oproj: z(m * 256),
-            attn_out: z(m * 256),
-            ffpre: z(m * 1024),
-            ff1: z(m * 1024),
-            ff2: z(m * 256),
-            p_big: z(62 * 8 * t_frames * t_frames),
-            attn_out_long: z(496 * t_frames * 64),
-            cos: [DeviceBuffer::from_host(&stream, &cos_t).unwrap(), DeviceBuffer::from_host(&stream, &cos_f).unwrap()],
-            sin: [DeviceBuffer::from_host(&stream, &sin_t).unwrap(), DeviceBuffer::from_host(&stream, &sin_f).unwrap()],
-            zero_bias_t: z(t_frames),
-            zero_bias_64: z(64),
-            attn_max: z(m * 8),
-            attn_scale: z(m * 8),
-        },
-        x_final: z(m * 256),
-        xb: z(m * 256),
-        xb16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
-        glu_all: z(6 * bands * t_frames * 516),
-        hidden_t: DeviceBuffer::<u32>::zeroed(&stream, 6 * bands * t_frames * 512).unwrap(),
-        pre2_all: z(6 * bands * t_frames * 2 * 516),
-        c2r_in: z(12 * t_frames * stft::FREQ_BINS * 2),
-        pcm: z(12 * t_frames * 2048),
-        offs_dev,
-        dims_dev,
-        f0_dev,
-    };
+    let mut bufs = make_bench_bufs(&stream, &xi, sp.window(), &cos_t, &sin_t, &cos_f, &sin_f, &offs, &dims, &f0, m, t_frames, bands);
     println!("scratch alloc: {:?}", alloc_t0.elapsed());
 
     // warmup
@@ -6685,6 +6697,42 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         v[v.len() / 2]
     };
     println!("BENCH warm per-iter (sync each): min {:.3} ms, med {med:.3} ms, max {:.3} ms", per.iter().cloned().fold(f64::INFINITY, f64::min), per.iter().cloned().fold(0.0, f64::max));
+
+    // ---- dual-stream co-scheduling probe ----
+    // Rationale: nsys GPU metrics over the demix show SM Issue 18% avg and
+    // 53% unallocated warp slots on active SMs. Two independent forwards on
+    // two streams measure how much of that idle capacity co-residency can
+    // actually reclaim before committing to a full dual-stream demix.
+    if dual {
+        let stream2 = ctx.new_stream().unwrap();
+        let sp2 = stft::Stft::new(fft.clone(), t_frames).expect("stft plan 2");
+        let c2r2 = {
+            let r: &cufft::Cufft = &fft;
+            // SAFETY: the Arc<Cufft> outlives this plan in this scope.
+            unsafe {
+                let s: &'static cufft::Cufft = std::mem::transmute(r);
+                s.plan(2048, t_frames, false).expect("c2r plan 2")
+            }
+        };
+        let alloc2 = std::time::Instant::now();
+        let mut bufs2 = make_bench_bufs(&stream2, &xi, sp.window(), &cos_t, &sin_t, &cos_f, &sin_f, &offs, &dims, &f0, m, t_frames, bands);
+        println!("scratch2 alloc: {:?}", alloc2.elapsed());
+        for _ in 0..2 {
+            unsafe { bench_forward(&km, &ctx, &stream2, &gw, &sp2, &c2r2, &mut bufs2, len, t_frames, bands, None).expect("forward2"); }
+        }
+        stream.synchronize().expect("sync");
+        stream2.synchronize().expect("sync2");
+        let pairs = (iters / 2).max(2);
+        let d0 = std::time::Instant::now();
+        for _ in 0..pairs {
+            unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands, None).expect("f1"); }
+            unsafe { bench_forward(&km, &ctx, &stream2, &gw, &sp2, &c2r2, &mut bufs2, len, t_frames, bands, None).expect("f2"); }
+        }
+        stream.synchronize().expect("sync");
+        stream2.synchronize().expect("sync2");
+        let per = d0.elapsed().as_secs_f64() / (pairs * 2) as f64;
+        println!("BENCH dual-stream aggregate: {:.3} ms/iter over {pairs} pairs, RTF {:.4}", per * 1000.0, per / 3.0);
+    }
 
     // correctness spot-check on the last output (host OLA + SNR, untimed)
     let frames_out = bufs.pcm.to_host_vec(&stream).unwrap();
