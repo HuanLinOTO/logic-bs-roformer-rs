@@ -380,22 +380,77 @@ demix（OLA 竞争处理 + 双份 scratch + cufft 双 plan）投入远超 4% 收
 判定不投入。**至此所有结构性优化路径均已探测完毕，流水线到达当前
 工具链（cuda-oxide 无 ldmatrix/warp-spec）下的实际天花板。**
 
+### 第 40 轮：P0 探测 —— 旧结论翻案，ldmatrix 其实存在
+
+1. **事实核查推翻两个"天花板"前提**：
+   - cuda-oxide 的 cuda-device/wmma.rs **一直提供 ldmatrix_x1/x2/x4（含
+     .trans）**——此前"工具链无 ldmatrix"的认知是错的；
+   - cuBLASLt 的 719 冲突本质是 context/stream 绑定问题，cuda-core 公开
+     cu_stream()/set_current/borrow_raw，可修（本轮未集成，仅作天花板参照）。
+2. **cuBLASLt microbench**（tools/cublaslt_bench.c，f16 in / f32 acc，
+   heuristic 最优 algo）：
+   - 16058×256×256（resid）：**0.049 ms / 42.8 TFLOPS**（我方 ~1.0ms，20×）
+   - 16058×768×256：0.153ms；×1024×256：0.196ms；×256×1024：0.164ms
+   - 71362 系列 45-57 TFLOPS。GEMM 全家 cuBLASLt 等效 ~8-10ms。
+3. **ncu InstructionStats**（resid）：21.7M warp 指令 vs 514K mma =
+   **42 条指令/mma**；每 scheduler 每 ~21 cycle 才发一条 —— 纯延迟受限，
+   ldmatrix（一次 LDS 搬 4 个 8x8 fragment）正对靶心。
+
+### 第 41 轮：GEMM ldmatrix x4 + 16B chunk swizzle（5 个热路径内核）
+
+- **改造**：hout/gelu_a16w/resid/mask1/mask2 的计算循环 A 用
+  ldmatrix_x4（16x16）、B 用 x4（一次两个 n8 tile），每 mma 组 20 标量
+  LDS → 5 条 ldmatrix；读写两侧同步切到 **16B chunk 级 XOR swizzle**
+  （(c4^(row&7))*4）——word 级 swizzle 行内 16B 不连续，ldmatrix 会
+  716 misaligned（第一版实测）。
+- **两个数值教训**：
+  1. B 侧 SB 是 [n][k] 行主 = B 的转置存储，**non-trans** 分布恰好就是
+     mma B fragment；首版用 x4_trans → SNR -2.69dB（数据错位非精度）。
+  2. 改 swizzle 必须读写配套（写 chunk 化、读地址 ((w>>2)^r&7)<<2），
+     否则 716/错值。
+- **结果**：bench 66.24 → **63.09 ms**；六 stem 与基线 cmp **逐字节一致**
+  （fragment 语义等价，数学不变）；单 launch：resid ~1.0ms→204µs、
+  QKV 925→433µs、FF1 750→321µs（ncu 隔离测量）。
+
+### 第 42 轮：flash 注意力 ldmatrix 化（时间轴 async + 频率轴 tc）
+
+- 时间轴 attn_flash_async：QK 的 A（Q）x4 + B（K）x4（SK [key][d] 行主
+  = B 转置存储 → non-trans）；PV 的 B（V）**x2_trans**（SV 是 B 直存），
+  替换 4 标量 LDS + 半字拼接。每 kt 迭代 80 LDS → 13 ldmatrix。
+- 频率轴 attn_flash_tc 同款改造（三处 shared 写换 chunk 级 swizzle）。
+- **结果**：58.71 →（tc 后）**58.29 ms**；整曲 6.29 → **5.52 s**；
+  逐字节一致、SNR 80.99 不变。flash 回到 L2 带宽墙（73-108%），
+  指令侧剩余为 softmax 本质开销。
+- **证伪**（本轮两笔）：
+  1. 128×128/512thr 大 tile QKV（warp 4x4 各 32x32，acc 8 槽无 spill）：
+     64.54ms（+5.8ms）。A 全局流量减半 < 512 线程 barrier + A-ldmatrix
+     翻倍之和；每 warp ldm/mma 从 5/8 劣化到 6/8。内核保留未调用。
+  2. cargo-oxide --unchecked-indexing：66.75ms（+3.7ms），predicated
+     检查被去掉反而打乱寄存器分配/调度。数值无损但拒绝。
+
+### 第 43 轮：rmsnorm gamma/gate_w shared staging（边际收益）
+
+- gate_w 每 warp 读 8KB → 每 block staging 一份（~132MB/launch 的 L2
+  流量降 8×）。数值逐位一致，bench 58.29 → **58.23 ms**（-0.1%，
+  实测收益远小于流量账——该内核墙不止 L2 读）。保留（正收益）。
+
 ### 最终成绩（vs PyTorch 2.14.1 / pymss，RTX 3080，同机同卡同口径）
 
 | 口径 | pymss | 本实现 | 加速比 |
 |---|---|---|---|
-| 单 chunk 前向（3s 合成输入） | 120.8 ms | **67.3-67.6 ms** | **1.80×** |
-| 整曲 demix（3:00 真实歌曲） | 9.7 s | **6.57-6.58 s** | **1.47×** |
+| 单 chunk 前向（3s 合成输入） | 120.8 ms | **58.2 ms** | **2.07×** |
+| 整曲 demix（3:00 真实歌曲） | 9.7 s | **5.53 s** | **1.75×** |
 | 黄金 SNR（vs fp32 参考） | — | 80.99 dB | 验收线 ≥60 |
 | 能量加权 SNR（vs pymss stems） | — | 63.62 dB | 六 stem 逐位可复现 |
 
-### 下一步（按收益排序）
+（ldmatrix 系列改造全部逐字节一致 —— 六 stem 与 separated2 cmp 相等。）
 
-1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
-   标量读（cp.async 流水线已验证：内核时间与 f32 版完全相同，全局加载
-   不是瓶颈）。需要 128x128+ 大 tile（B 复用翻倍）但嵌套累加数组会
-   spill —— 出路是全展开手写寄存器命名（无循环索引）或 warp-specialized
-   producer/consumer 结构；或等 cuda-oxide 支持 ldmatrix 高效布局。
-2. 时间轴注意力：QK 单块全行（shared fp16 P 33.8KB）+ 块内 softmax +
-   PV 读 fp16 P，消除 softmax_stats 的 10.5 ms 与一半 P 流量。
-3. mask GEMM 同样接 cp.async 路线。
+### 下一步（收益均已边际化，按潜在排序）
+
+1. GEMM 距 cuBLASLt 仍有 2-4×（resid 204µs vs 49µs），但工具链内
+   手段已试尽（ldmatrix 已用、大 tile/barrier 证伪、cp.async 浅 k 证伪）。
+   下一台阶需要 warp-specialized producer/consumer（cuda-oxide 尚无
+   async barrier/mbarrier 绑定）或直接 cuBLASLt 集成（719 已知可修）。
+2. 注意力时间轴在 L2 带宽墙（108% @T=1151），指令侧剩 softmax 本质
+   开销；宽 tile/主序重排/Q 寄存器化共 6 次结构实验全部证伪。
+3. 小头：glu_scatter 0.6ms、mask_apply 0.8ms、rope_k16 1.3ms。
