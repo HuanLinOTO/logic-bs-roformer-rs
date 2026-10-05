@@ -2048,12 +2048,17 @@ mod gpu_kernels {
                     let xr = block_row_base + r;
                     // SAFETY: 16 B aligned words in SA; source row stride is
                     // half_k words (a multiple of four).
-                    let dst = (std::ptr::addr_of_mut!(SA) as *mut u32).add(r * 32 + c4 * 4);
-                    if xr < m_size {
+                    let vals: [u32; 4] = if xr < m_size {
                         let src = x.as_ptr().add(xr * (k_size / 2) + k_base / 2 + c4 * 4);
-                        *(dst as *mut [u32; 4]) = *(src as *const [u32; 4]);
+                        *(src as *const [u32; 4])
                     } else {
-                        *(dst as *mut [u32; 4]) = [0; 4];
+                        [0; 4]
+                    };
+                    let sa = std::ptr::addr_of_mut!(SA) as *mut u32;
+                    for q in 0..4usize {
+                        let w = c4 * 4 + q;
+                        // SAFETY: word index < 32 by construction.
+                        *sa.add(r * 32 + (w ^ (r & 7))) = vals[q];
                     }
                 }
                 for i in 0..4usize {
@@ -2068,8 +2073,8 @@ mod gpu_kernels {
                         let v: [f32; 4] = *(src as *const [f32; 4]);
                         (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
                     }
-                    SB[col * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SB[col * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                    SB[col * 32 + ((q4 * 2) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SB[col * 32 + ((q4 * 2 + 1) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
@@ -2079,17 +2084,17 @@ mod gpu_kernels {
                 unsafe {
                     let r0 = warp_id * 16 + group;
                     let r1 = r0 + 8;
-                    a[0] = SA[r0 * 32 + word + tig];
-                    a[1] = SA[r1 * 32 + word + tig];
-                    a[2] = SA[r0 * 32 + word + tig + 4];
-                    a[3] = SA[r1 * 32 + word + tig + 4];
+                    a[0] = SA[r0 * 32 + ((word + tig) ^ (r0 & 7))];
+                    a[1] = SA[r1 * 32 + ((word + tig) ^ (r1 & 7))];
+                    a[2] = SA[r0 * 32 + ((word + tig + 4) ^ (r0 & 7))];
+                    a[3] = SA[r1 * 32 + ((word + tig + 4) ^ (r1 & 7))];
                 }
                 for nt in 0..8usize {
                     let mut b = [0u32; 2];
                     unsafe {
-                        let col_word = (nt * 8 + group) * 32 + word;
-                        b[0] = SB[col_word + tig];
-                        b[1] = SB[col_word + tig + 4];
+                        let brow = nt * 8 + group;
+                        b[0] = SB[brow * 32 + ((word + tig) ^ (brow & 7))];
+                        b[1] = SB[brow * 32 + ((word + tig + 4) ^ (brow & 7))];
                     }
                     acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
                 }
@@ -2164,8 +2169,8 @@ mod gpu_kernels {
                         let v: [f32; 4] = *(src as *const [f32; 4]);
                         (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
                     }
-                    SA[r * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SA[r * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                    SA[r * 32 + ((q4 * 2) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SA[r * 32 + ((q4 * 2 + 1) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
                 // B: 64 columns x 16 float4 = 1024 loads, 4 per thread.
                 for i in 0..4usize {
@@ -2181,8 +2186,8 @@ mod gpu_kernels {
                         let v: [f32; 4] = *(src as *const [f32; 4]);
                         (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
                     }
-                    SB[col * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SB[col * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                    SB[col * 32 + ((q4 * 2) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SB[col * 32 + ((q4 * 2 + 1) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
@@ -2204,9 +2209,9 @@ mod gpu_kernels {
                 for nt in 0..8usize {
                     let mut b = [0u32; 2];
                     unsafe {
-                        let col_word = (nt * 8 + group) * 32 + word;
-                        b[0] = SB[col_word + tig];
-                        b[1] = SB[col_word + tig + 4];
+                        let brow = nt * 8 + group;
+                        b[0] = SB[brow * 32 + ((word + tig) ^ (brow & 7))];
+                        b[1] = SB[brow * 32 + ((word + tig + 4) ^ (brow & 7))];
                     }
                     acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
                 }
@@ -2268,8 +2273,8 @@ mod gpu_kernels {
                         let v: [f32; 4] = *(src as *const [f32; 4]);
                         (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
                     }
-                    SA[r * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SA[r * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                    SA[r * 32 + ((q4 * 2) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SA[r * 32 + ((q4 * 2 + 1) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
                 // B: f16x2 words, 2 chunks per thread.
                 for i in 0..2usize {
@@ -2277,13 +2282,17 @@ mod gpu_kernels {
                     let col = idx / 8;
                     let c4 = idx % 8;
                     let bc = col_base + col;
-                    // SAFETY: 16 B aligned words in SB / source.
-                    let dst = (std::ptr::addr_of_mut!(SB) as *mut u32).add(col * 32 + c4 * 4);
-                    if bc < n_size {
+                    // SAFETY: word index < 32 by construction.
+                    let vals: [u32; 4] = if bc < n_size {
                         let src = w.as_ptr().add(bc * half_k + k_base / 2 + c4 * 4);
-                        *(dst as *mut [u32; 4]) = *(src as *const [u32; 4]);
+                        *(src as *const [u32; 4])
                     } else {
-                        *(dst as *mut [u32; 4]) = [0; 4];
+                        [0; 4]
+                    };
+                    let sb = std::ptr::addr_of_mut!(SB) as *mut u32;
+                    for q in 0..4usize {
+                        let w = c4 * 4 + q;
+                        *sb.add(col * 32 + (w ^ (col & 7))) = vals[q];
                     }
                 }
             }
@@ -2295,18 +2304,18 @@ mod gpu_kernels {
                 unsafe {
                     let r0 = warp_id * 16 + group;
                     let r1 = r0 + 8;
-                    a[0] = SA[r0 * 32 + word + tig];
-                    a[1] = SA[r1 * 32 + word + tig];
-                    a[2] = SA[r0 * 32 + word + tig + 4];
-                    a[3] = SA[r1 * 32 + word + tig + 4];
+                    a[0] = SA[r0 * 32 + ((word + tig) ^ (r0 & 7))];
+                    a[1] = SA[r1 * 32 + ((word + tig) ^ (r1 & 7))];
+                    a[2] = SA[r0 * 32 + ((word + tig + 4) ^ (r0 & 7))];
+                    a[3] = SA[r1 * 32 + ((word + tig + 4) ^ (r1 & 7))];
                 }
                 for nt in 0..8usize {
                     let mut b = [0u32; 2];
                     // SAFETY: cols < 64, words < 32 inside SB.
                     unsafe {
-                        let col_word = (nt * 8 + group) * 32 + word;
-                        b[0] = SB[col_word + tig];
-                        b[1] = SB[col_word + tig + 4];
+                        let brow = nt * 8 + group;
+                        b[0] = SB[brow * 32 + ((word + tig) ^ (brow & 7))];
+                        b[1] = SB[brow * 32 + ((word + tig + 4) ^ (brow & 7))];
                     }
                     acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
                 }
@@ -2376,14 +2385,17 @@ mod gpu_kernels {
                     let r = idx / 8;
                     let c4 = idx % 8;
                     let xr = block_row_base + r;
-                    // SAFETY: destinations are 16 B aligned words in SA;
-                    // sources are 16 B aligned (half_k is a multiple of 4).
-                    let dst = (std::ptr::addr_of_mut!(SA) as *mut u32).add(r * 32 + c4 * 4);
-                    if xr < m_size {
+                    // SAFETY: word index < 32 by construction.
+                    let vals: [u32; 4] = if xr < m_size {
                         let src = x.as_ptr().add(xr * half_k + k_base / 2 + c4 * 4);
-                        *(dst as *mut [u32; 4]) = *(src as *const [u32; 4]);
+                        *(src as *const [u32; 4])
                     } else {
-                        *(dst as *mut [u32; 4]) = [0; 4];
+                        [0; 4]
+                    };
+                    let sa = std::ptr::addr_of_mut!(SA) as *mut u32;
+                    for q in 0..4usize {
+                        let w = c4 * 4 + q;
+                        *sa.add(r * 32 + (w ^ (r & 7))) = vals[q];
                     }
                 }
                 // B: 64 columns x 8 chunks, 2 per thread.
@@ -2392,13 +2404,17 @@ mod gpu_kernels {
                     let col = idx / 8;
                     let c4 = idx % 8;
                     let bc = col_base + col;
-                    // SAFETY: same alignment argument as A.
-                    let dst = (std::ptr::addr_of_mut!(SB) as *mut u32).add(col * 32 + c4 * 4);
-                    if bc < n_size {
+                    // SAFETY: word index < 32 by construction.
+                    let vals: [u32; 4] = if bc < n_size {
                         let src = w.as_ptr().add(bc * half_k + k_base / 2 + c4 * 4);
-                        *(dst as *mut [u32; 4]) = *(src as *const [u32; 4]);
+                        *(src as *const [u32; 4])
                     } else {
-                        *(dst as *mut [u32; 4]) = [0; 4];
+                        [0; 4]
+                    };
+                    let sb = std::ptr::addr_of_mut!(SB) as *mut u32;
+                    for q in 0..4usize {
+                        let w = c4 * 4 + q;
+                        *sb.add(col * 32 + (w ^ (col & 7))) = vals[q];
                     }
                 }
             }
@@ -2410,18 +2426,18 @@ mod gpu_kernels {
                 unsafe {
                     let r0 = warp_id * 16 + group;
                     let r1 = r0 + 8;
-                    a[0] = SA[r0 * 32 + word + tig];
-                    a[1] = SA[r1 * 32 + word + tig];
-                    a[2] = SA[r0 * 32 + word + tig + 4];
-                    a[3] = SA[r1 * 32 + word + tig + 4];
+                    a[0] = SA[r0 * 32 + ((word + tig) ^ (r0 & 7))];
+                    a[1] = SA[r1 * 32 + ((word + tig) ^ (r1 & 7))];
+                    a[2] = SA[r0 * 32 + ((word + tig + 4) ^ (r0 & 7))];
+                    a[3] = SA[r1 * 32 + ((word + tig + 4) ^ (r1 & 7))];
                 }
                 for nt in 0..8usize {
                     let mut b = [0u32; 2];
                     // SAFETY: cols < 64, words < 32 inside SB.
                     unsafe {
-                        let col_word = (nt * 8 + group) * 32 + word;
-                        b[0] = SB[col_word + tig];
-                        b[1] = SB[col_word + tig + 4];
+                        let brow = nt * 8 + group;
+                        b[0] = SB[brow * 32 + ((word + tig) ^ (brow & 7))];
+                        b[1] = SB[brow * 32 + ((word + tig + 4) ^ (brow & 7))];
                     }
                     acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
                 }
@@ -2489,8 +2505,8 @@ mod gpu_kernels {
                         let v: [f32; 4] = *(src as *const [f32; 4]);
                         (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
                     }
-                    SA[r * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SA[r * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                    SA[r * 32 + ((q4 * 2) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SA[r * 32 + ((q4 * 2 + 1) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
                 // B: 64 columns x 16 float4, 4 per thread.
                 for i in 0..4usize {
@@ -2506,8 +2522,8 @@ mod gpu_kernels {
                         let v: [f32; 4] = *(src as *const [f32; 4]);
                         (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
                     }
-                    SB[col * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SB[col * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                    SB[col * 32 + ((q4 * 2) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SB[col * 32 + ((q4 * 2 + 1) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
@@ -2529,9 +2545,9 @@ mod gpu_kernels {
                 for nt in 0..8usize {
                     let mut b = [0u32; 2];
                     unsafe {
-                        let col_word = (nt * 8 + group) * 32 + word;
-                        b[0] = SB[col_word + tig];
-                        b[1] = SB[col_word + tig + 4];
+                        let brow = nt * 8 + group;
+                        b[0] = SB[brow * 32 + ((word + tig) ^ (brow & 7))];
+                        b[1] = SB[brow * 32 + ((word + tig + 4) ^ (brow & 7))];
                     }
                     acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
                 }
@@ -2600,8 +2616,8 @@ mod gpu_kernels {
                         let v: [f32; 4] = *(src as *const [f32; 4]);
                         (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
                     }
-                    SA[r * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SA[r * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                    SA[r * 32 + ((q4 * 2) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SA[r * 32 + ((q4 * 2 + 1) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
                 // B: 64 columns x 16 float4, 4 per thread.
                 for i in 0..4usize {
@@ -2617,8 +2633,8 @@ mod gpu_kernels {
                         let v: [f32; 4] = *(src as *const [f32; 4]);
                         (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
                     }
-                    SB[col * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SB[col * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                    SB[col * 32 + ((q4 * 2) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SB[col * 32 + ((q4 * 2 + 1) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
@@ -2640,9 +2656,9 @@ mod gpu_kernels {
                 for nt in 0..8usize {
                     let mut b = [0u32; 2];
                     unsafe {
-                        let col_word = (nt * 8 + group) * 32 + word;
-                        b[0] = SB[col_word + tig];
-                        b[1] = SB[col_word + tig + 4];
+                        let brow = nt * 8 + group;
+                        b[0] = SB[brow * 32 + ((word + tig) ^ (brow & 7))];
+                        b[1] = SB[brow * 32 + ((word + tig + 4) ^ (brow & 7))];
                     }
                     acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
                 }
@@ -3770,8 +3786,8 @@ mod gpu_kernels {
                         let v: [f32; 4] = *(src as *const [f32; 4]);
                         (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
                     }
-                    SA[r * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SA[r * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                    SA[r * 32 + ((q4 * 2) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SA[r * 32 + ((q4 * 2 + 1) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
                 // B: 64 columns x 16 float4, 4 per thread.
                 for i in 0..4usize {
@@ -3787,8 +3803,8 @@ mod gpu_kernels {
                         let v: [f32; 4] = *(src as *const [f32; 4]);
                         (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
                     }
-                    SB[col * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SB[col * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                    SB[col * 32 + ((q4 * 2) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SB[col * 32 + ((q4 * 2 + 1) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
@@ -3801,18 +3817,18 @@ mod gpu_kernels {
                 unsafe {
                     let r0 = warp_id * 16 + group;
                     let r1 = r0 + 8;
-                    a[0] = SA[r0 * 32 + word + tig];
-                    a[1] = SA[r1 * 32 + word + tig];
-                    a[2] = SA[r0 * 32 + word + tig + 4];
-                    a[3] = SA[r1 * 32 + word + tig + 4];
+                    a[0] = SA[r0 * 32 + ((word + tig) ^ (r0 & 7))];
+                    a[1] = SA[r1 * 32 + ((word + tig) ^ (r1 & 7))];
+                    a[2] = SA[r0 * 32 + ((word + tig + 4) ^ (r0 & 7))];
+                    a[3] = SA[r1 * 32 + ((word + tig + 4) ^ (r1 & 7))];
                 }
                 for nt in 0..8usize {
                     let mut b = [0u32; 2];
                     // SAFETY: cols < 64, words < 32 inside SB.
                     unsafe {
-                        let col_word = (nt * 8 + group) * 32 + word;
-                        b[0] = SB[col_word + tig];
-                        b[1] = SB[col_word + tig + 4];
+                        let brow = nt * 8 + group;
+                        b[0] = SB[brow * 32 + ((word + tig) ^ (brow & 7))];
+                        b[1] = SB[brow * 32 + ((word + tig + 4) ^ (brow & 7))];
                     }
                     acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
                 }
@@ -3902,13 +3918,17 @@ mod gpu_kernels {
                     let r = idx / 8;
                     let c4 = idx % 8;
                     let xr = block_row_base + r;
-                    // SAFETY: 16 B aligned words in SA; source row stride 512.
-                    let dst = (std::ptr::addr_of_mut!(SA) as *mut u32).add(r * 32 + c4 * 4);
-                    if xr < m_size {
+                    // SAFETY: word index < 32 by construction.
+                    let vals: [u32; 4] = if xr < m_size {
                         let src = x.as_ptr().add(x_off + xr * 512 + k_base / 2 + c4 * 4);
-                        *(dst as *mut [u32; 4]) = *(src as *const [u32; 4]);
+                        *(src as *const [u32; 4])
                     } else {
-                        *(dst as *mut [u32; 4]) = [0; 4];
+                        [0; 4]
+                    };
+                    let sa = std::ptr::addr_of_mut!(SA) as *mut u32;
+                    for q in 0..4usize {
+                        let w = c4 * 4 + q;
+                        *sa.add(r * 32 + (w ^ (r & 7))) = vals[q];
                     }
                 }
                 for i in 0..4usize {
@@ -3924,8 +3944,8 @@ mod gpu_kernels {
                         let v: [f32; 4] = *(src as *const [f32; 4]);
                         (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
                     }
-                    SB[col * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SB[col * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                    SB[col * 32 + ((q4 * 2) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SB[col * 32 + ((q4 * 2 + 1) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
@@ -3937,18 +3957,18 @@ mod gpu_kernels {
                 unsafe {
                     let r0 = warp_id * 16 + group;
                     let r1 = r0 + 8;
-                    a[0] = SA[r0 * 32 + word + tig];
-                    a[1] = SA[r1 * 32 + word + tig];
-                    a[2] = SA[r0 * 32 + word + tig + 4];
-                    a[3] = SA[r1 * 32 + word + tig + 4];
+                    a[0] = SA[r0 * 32 + ((word + tig) ^ (r0 & 7))];
+                    a[1] = SA[r1 * 32 + ((word + tig) ^ (r1 & 7))];
+                    a[2] = SA[r0 * 32 + ((word + tig + 4) ^ (r0 & 7))];
+                    a[3] = SA[r1 * 32 + ((word + tig + 4) ^ (r1 & 7))];
                 }
                 for nt in 0..8usize {
                     let mut b = [0u32; 2];
                     // SAFETY: cols < 64, words < 32 inside SB.
                     unsafe {
-                        let col_word = (nt * 8 + group) * 32 + word;
-                        b[0] = SB[col_word + tig];
-                        b[1] = SB[col_word + tig + 4];
+                        let brow = nt * 8 + group;
+                        b[0] = SB[brow * 32 + ((word + tig) ^ (brow & 7))];
+                        b[1] = SB[brow * 32 + ((word + tig + 4) ^ (brow & 7))];
                     }
                     acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
                 }
