@@ -365,6 +365,30 @@ ncu 补充（async 版）：L2 吞吐 108.7%（墙）、DRAM 52.6%、占用率 2
    提交 b9c96ad）：远程构建被节点离线阻塞（Komari agent 掉线，多次重试
    未恢复），待恢复后先跑探测再决定是否投入完整双流 demix 重构。
 
+### 第 39 轮：双流并发探测完成 —— 边际收益（+3.8%），确认不投入
+
+节点恢复后跑通 --dualbench（golden T=259，双流交替 10 iter）：
+
+```text
+BENCH warm aggregate:      67.29 ms/iter   （单流基线）
+BENCH dual-stream aggregate: 64.75 ms/iter （双流交替）  → +3.8%
+```
+
+尽管 SM Issue 仅 18%/未分配 warp 槽 53%，共驻只回收了 3.8%——共驻块在
+LDS/LSU 上相互争抢，注意力内核的 per-SM 瓶颈不因并发而消失。完整双流
+demix（OLA 竞争处理 + 双份 scratch + cufft 双 plan）投入远超 4% 收益，
+判定不投入。**至此所有结构性优化路径均已探测完毕，流水线到达当前
+工具链（cuda-oxide 无 ldmatrix/warp-spec）下的实际天花板。**
+
+### 最终成绩（vs PyTorch 2.14.1 / pymss，RTX 3080，同机同卡同口径）
+
+| 口径 | pymss | 本实现 | 加速比 |
+|---|---|---|---|
+| 单 chunk 前向（3s 合成输入） | 120.8 ms | **67.3-67.6 ms** | **1.80×** |
+| 整曲 demix（3:00 真实歌曲） | 9.7 s | **6.57-6.58 s** | **1.47×** |
+| 黄金 SNR（vs fp32 参考） | — | 80.99 dB | 验收线 ≥60 |
+| 能量加权 SNR（vs pymss stems） | — | 63.62 dB | 六 stem 逐位可复现 |
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared

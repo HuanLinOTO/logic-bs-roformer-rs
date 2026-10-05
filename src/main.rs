@@ -6598,10 +6598,10 @@ k16r: DeviceBuffer::<u32>::zeroed(st, m * 256).unwrap(),
         pre2_all: zt(6 * bands * t_frames * 2 * 516),
         c2r_in: zt(12 * t_frames * stft::FREQ_BINS * 2),
         pcm: zt(12 * t_frames * 2048),
-        offs_dev,
-        dims_dev,
-        f0_dev,
-    };
+        offs_dev: DeviceBuffer::from_host(st, offs).unwrap(),
+        dims_dev: DeviceBuffer::from_host(st, dims).unwrap(),
+        f0_dev: DeviceBuffer::from_host(st, f0).unwrap(),
+    }
 }
 
 fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bool) {
