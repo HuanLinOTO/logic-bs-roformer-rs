@@ -147,6 +147,24 @@ mask 两级   8.3 ms / ~90 GFLOP ≈ 11 TFLOP/s
   剩余差距在注意力：flash 38.6 ms（1.63 TFLOP/s）vs PyTorch fmha
   24.6 ms（2.56 TFLOP/s）。
 
+### 第 27 轮成果（2026-10-05 深夜）
+
+两个净收益（已合入）：
+
+1. **flash PV 半选**：去掉 SVt 转置 pass（每 warp ~1536 次 shared 操作 →
+   128 次 LDS），shared 32→24KB。107.6 → **106.6 ms**。
+2. **mask GEMM 重写**：K16 标量加载 → K64 tile + float4（屏障 64→16 次/
+   块）。8.3 → ~6.8 ms。106.6 → **105.1 ms**（RTF 0.0351，SNR 80.87）。
+   **累计 1.149×。**
+
+ncu（32 距离 flash）：时间轴 2.54 ms/launch，L2 82.9%、DRAM 70.7%
+（522GB/s，1.33GB/launch）——K/V 被 5 个 q-tile 重复读且 82MB 工作集
+超过 5MB L2。
+
+- **192 行 tile/384 线程**（K/V 重读 5→2、占用率 32→50%）：138.4 ms，
+  第四种几何证伪。小块多驻留（2480 块）在这个同步密集内核中胜出，
+  64 行/128 线程最终确立。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
