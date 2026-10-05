@@ -8,21 +8,21 @@
 
 | 指标 | PyTorch 2.14.1（fp32） | 本实现 | 加速比 |
 |---|---|---|---|
-| wall（10 次均值） | 120.8 ms | **51.6 ms** | **2.34×** |
-| RTF | 0.0403 | **0.0172** | — |
-| 六 stem SNR（vs fp32 参考） | —（参考本身） | **80.99 dB** | 验收线 ≥60 dB |
+| wall（10 次均值） | 120.8 ms | **33.8 ms** | **3.58×** |
+| RTF | 0.0403 | **0.0113** | — |
+| 六 stem SNR（vs fp32 参考） | —（参考本身） | **80.83 dB** | 验收线 ≥60 dB |
 
 ### 真实歌曲端到端（Hanser《Cyberangel》，3:00，14 chunk demix）
 
 | 指标 | pymss | 本实现 |
 |---|---|---|
-| 整曲 wall | 9.7 s | **5.34 s（1.81×）**，GPU 前向 **0.381 vs 0.69 s/chunk（1.81×）**，14 chunk 全异步流水零空转 |
+| 整曲 wall | 9.7 s | **3.21 s（3.01×，热态三次 3.204/3.208/3.216）**，GPU 前向 **0.229 vs 0.69 s/chunk**，14 chunk 全异步流水零空转 |
 | 逐 stem SNR（vs pymss fp32） | — | bass 59.2 / drums 69.6 / other 62.2 / vocals 69.3 / guitar 64.3 dB，能量加权 **63.6 dB** |
+| 6-stem 重建 SNR（vs 源曲） | — | 16.46 dB（OLA 偏移修复后逐样本对齐） |
 
-最终每前向 kernel 分布（nsys，51.6ms 口径）：时间轴 flash ~18.5ms（36%）、
-cuBLASLt resid×2 ~10.4、cuBLASLt QKV ~5.3、频率轴 flash 7.3、
-FF1+GELU 6.0（手写 erf）、RMSNorm ~2.3、mask 两级 2.9、
-rope 0.52、glu/apply 1.3、STFT/杂项 1.5。
+最终每前向 kernel 分布（33.8ms 口径）：cudnn sdpa 两轴合计 ~7ms、
+cuBLASLt resid×2 ~10.4、cuBLASLt QKV ~5.3、FF1+GELU 6.0（手写 erf）、
+RMSNorm ~2.3、mask 两级 2.9、rope_q/gate ~1、glu/apply 1.3、STFT/杂项 1.5。
 
 第二轮优化（ldmatrix 系列，第 40-43 轮）在保持**六 stem 与基线
 逐字节一致**的前提下：bench 67.3 → 58.2ms（1.80×→2.07×），
@@ -32,6 +32,13 @@ rope 0.52、glu/apply 1.3、STFT/杂项 1.5。
 换 cuBLASLt（f16 输入、BIAS/残差 epilogue、per-shape autotune），
 bench 58.2 → **51.6ms（2.34×）**、整曲 5.53 → **5.34s（1.81×）**；
 黄金 SNR 80.99dB 不变，新旧整曲 stems SNR 269dB+（末位 bit 差异）。
+
+第四轮优化（cudnn fused SDPA，第 45 轮）：两轴注意力全量切
+cudnn-frontend 包装的 fused flash attention（fold 布局 stride 直传零
+repack，Q rope 前移 + gate 后置 epilogue），bench 51.6 → **33.8ms
+（3.58×）**、整曲 5.34 → **3.21s（3.01×）**；黄金 SNR 80.83dB，
+新旧整曲 SNR 47.7–70.1dB（fp16 舍入级）。附带修复存量 OLA 写回偏移
+（+29440 样本，6-stem 重建 SNR -3.1 → 16.46dB）。
 
 ## 二、加速手段（五类）
 
@@ -148,7 +155,7 @@ rmsnorm 的 gamma/8×256 gate_w 每 block staging 进 shared（gate_w 的
 | 组件 | PyTorch | 本实现 |
 |---|---|---|
 | GEMM 合计 | 58.5ms（cuBLAS SGEMM ~17 TFLOP/s） | ~21.7ms（cuBLASLt f16 39-57 TFLOP/s × 3 调用点 + 手写 erf-GELU FF1） |
-| 注意力 | 24.6ms（fmha fp32，2.56 TFLOP/s） | ~25.8ms（双轴 flash ldmatrix，含 RoPE+门控融合；L2 带宽墙） |
+| 注意力 | 24.6ms（fmha fp32，2.56 TFLOP/s） | ~7ms（cudnn fused sdpa 双轴 62T/21.6T，RoPE/gate 前后置 kernel） |
 | elementwise | ~36ms | ~4ms（全部融合进 epilogue） |
 
 GEMM 三热点已挂 cuBLASLt 并 autotune 到该库天花板（QKV 54-57T、
@@ -156,10 +163,12 @@ resid 38.9T）；FF1 受 erf/tanh 数值口径约束保留手写。
 
 ## 七、产物
 
-- 代码：`src/main.rs`（全部 CUDA 内核 + host 编排）+ `src/cublaslt.rs`（cuBLASLt dlopen 绑定），
-  main 分支（cuBLASLt 集成至 `ea0bd50`；LBRR_NO_LT=1 可回退纯手写路径）
-- 文档：`README.md`、`docs/BENCHMARK.md`（44 轮完整实验日志）
+- 代码：`src/main.rs`（全部 CUDA 内核 + host 编排）+ `src/cublaslt.rs`（cuBLASLt dlopen
+  绑定）+ `src/cudnn.rs`（cudnn fused SDPA dlopen 绑定）+ `tools/cudnn_sdpa_wrap.cpp`
+  （cudnn-frontend extern-C wrapper .so），main 分支（cudnn 集成至 `12a3f0b`；
+  LBRR_NO_LT / LBRR_NO_CUDNN=1 可分级回退手写路径）
+- 文档：`README.md`、`docs/BENCHMARK.md`（45 轮完整实验日志）
 - 工具：`tools/bench_ref.py`（PyTorch 基线）、`lbrr --bench/--separate/--forward-only`、
-  `tools/separate_ref.py`（pymss 分离）、`tools/download_file.js`（分块下载）、
-  `tools/cublaslt_probe{,2}.c`（heuristic/算法探测）、`scripts/snr_wav.py`（整曲 SNR 回归）
+  `tools/separate_ref.py`（pymss 分离）、`tools/cublaslt_probe{,2}.c` +
+  `tools/cudnn_sdpa_probe.c`（GEMM/SDPA 探测与 parity）、`scripts/snr_wav.py`（整曲 SNR 回归）
 - 本地 stem：`separated_local/cyberangel_{vocals,other}.mp3`
