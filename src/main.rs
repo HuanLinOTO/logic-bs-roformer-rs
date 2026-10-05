@@ -1797,33 +1797,46 @@ mod gpu_kernels {
         let (m_size, n_size, k_size) = (m as usize, n as usize, k as usize);
         let mut acc = [[0.0f32; 4]; 8];
 
+        // Vectorized cooperative load: each thread moves 16 B (four f32) per
+        // instruction, quartering the load-instruction count of the K loop.
         let num_k = k_size.div_ceil(64);
         for ks in 0..num_k {
             let k_base = ks * 64;
             unsafe {
-                // 128 rows x 32 K-pairs = 4096 assignments, 16 per thread.
-                for i in 0..16usize {
-                    let idx = tid + i * 256;
-                    let r = idx / 32;
-                    let kp = idx % 32;
-                    let xr = block_row_base + r;
-                    let k0 = k_base + kp * 2;
-                    let k1 = k0 + 1;
-                    let v0 = if xr < m_size && k0 < k_size { x[xr * k_size + k0] } else { 0.0 };
-                    let v1 = if xr < m_size && k1 < k_size { x[xr * k_size + k1] } else { 0.0 };
-                    SA[r * 32 + kp] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                }
-                // 64 columns x 32 K-pairs = 2048 assignments, 8 per thread.
+                // A: 128 rows x 16 float4 = 2048 loads, 8 per thread.
                 for i in 0..8usize {
                     let idx = tid + i * 256;
-                    let col = idx / 32;
-                    let kp = idx % 32;
+                    let r = idx / 16;
+                    let q4 = idx % 16;
+                    let xr = block_row_base + r;
+                    let k0 = k_base + q4 * 4;
+                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    if xr < m_size && k0 + 3 < k_size {
+                        // SAFETY: k0 is 16 B aligned (k0 % 4 == 0) and the
+                        // four elements are in-bounds by the guard.
+                        let src = x.as_ptr().add(xr * k_size + k0);
+                        let v: [f32; 4] = *(src as *const [f32; 4]);
+                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    }
+                    SA[r * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SA[r * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                }
+                // B: 64 columns x 16 float4 = 1024 loads, 4 per thread.
+                for i in 0..4usize {
+                    let idx = tid + i * 256;
+                    let col = idx / 16;
+                    let q4 = idx % 16;
                     let bc = col_base + col;
-                    let k0 = k_base + kp * 2;
-                    let k1 = k0 + 1;
-                    let v0 = if bc < n_size && k0 < k_size { w[bc * k_size + k0] } else { 0.0 };
-                    let v1 = if bc < n_size && k1 < k_size { w[bc * k_size + k1] } else { 0.0 };
-                    SB[col * 32 + kp] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    let k0 = k_base + q4 * 4;
+                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    if bc < n_size && k0 + 3 < k_size {
+                        // SAFETY: same 16 B alignment argument as A.
+                        let src = w.as_ptr().add(bc * k_size + k0);
+                        let v: [f32; 4] = *(src as *const [f32; 4]);
+                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    }
+                    SB[col * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SB[col * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
@@ -2464,6 +2477,263 @@ mod gpu_kernels {
                 unsafe {
                     *mo.add(idx) = sm;
                     *so.add(idx) = 1.0 / sz;
+                }
+            }
+        }
+    }
+    /// Tensor-core flash attention for one axis. One 256-thread block owns a
+    /// 128-row query tile of one (batch, head) group and iterates every 64-key
+    /// tile with an online softmax in registers. RoPE is fused into the Q/K
+    /// loads and the head-gate sigmoid into the epilogue, which writes the
+    /// gated folded attention output directly. Scores never touch global
+    /// memory. Fragment layouts: QK's C fragment (rows g/g+8, cols 2tig..)
+    /// is exactly the A fragment PV needs over the key dimension, so the
+    /// probability tile converts to A fragments in place.
+    #[kernel]
+    pub fn attn_flash_tc(
+        qkv: &[f32], cos: &[f32], sin: &[f32], gates: &[f32],
+        bands: u32, axis: u32, seq: u32,
+        mut y: DisjointSlice<f32>,
+        mut dbg_m: DisjointSlice<f32>, mut dbg_l: DisjointSlice<f32>,
+    ) {
+        // Rows are padded to 33 words so warp-lane column walks hit distinct
+        // banks (32-word rows would alias every 8 lanes onto one bank).
+        static mut SQ: SharedArray<u32, { 64 * 33 }> = SharedArray::UNINIT; // [q row][d word]
+        static mut SK: SharedArray<u32, { 64 * 33 }> = SharedArray::UNINIT; // [key][d word]
+        static mut SV: SharedArray<u32, { 64 * 33 }> = SharedArray::UNINIT; // [key][d word] row-major staging
+        static mut SVt: SharedArray<u32, { 64 * 33 }> = SharedArray::UNINIT; // [dim][key word] transposed
+
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let warp_id = tid / 32;
+        let group = lane / 4;
+        let tig = lane % 4;
+        let (n_size, bands_, axis_) = (seq as usize, bands as usize, axis as usize);
+        let row_base = thread::blockIdx_y() as usize * 64;
+        let grp = thread::blockIdx_z() as usize;
+        let (b, head) = (grp / 8, grp % 8);
+        let r0 = warp_id * 16 + group;
+        let r1 = r0 + 8;
+        let q_v0 = row_base + r0 < n_size;
+        let q_v1 = row_base + r1 < n_size;
+        let token_of = |r: usize| if axis_ == 0 { r * bands_ + b } else { b * bands_ + r };
+
+        // ---- load this block's 64 query rows once, fusing RoPE + 0.125 ----
+        // 128 threads = 4 warps x 16 rows = exactly the 64-row tile.
+        // Flat r*32+w mapping keeps every warp on one 128 B row.
+        // SAFETY: block-local writes; pad column 32 is never read.
+        unsafe {
+            for i in 0..16usize {
+                let idx = tid + i * 128;
+                let r = idx / 32;
+                let w = idx % 32;
+                let xr = row_base + r;
+                let (mut v0, mut v1) = (0.0f32, 0.0f32);
+                if xr < n_size {
+                    let base = token_of(xr) * 1536 + head * 64 + w * 2;
+                    let c = cos[xr * 32 + w];
+                    let sn = sin[xr * 32 + w];
+                    let (even, odd) = (qkv[base], qkv[base + 1]);
+                    v0 = (even * c - odd * sn) * 0.125;
+                    v1 = (odd * c + even * sn) * 0.125;
+                }
+                SQ[r * 33 + w] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+            }
+        }
+
+        let mut acc = [[0.0f32; 4]; 8];   // QK scores, later reused as P
+        let mut acc_pv = [[0.0f32; 4]; 8]; // attention output rows x 64 dims
+        let mut m_i = [f32::NEG_INFINITY; 2];
+        let mut l_i = [0.0f32; 2];
+
+        let mut kt = 0usize;
+        while kt < n_size {
+            // ---- cooperative K / V-tile load (64 keys) with RoPE on K ----
+            // Both tiles load row-major and coalesced; the PV B fragment is
+            // repacked from SV in shared memory with half-word selects.
+            // SAFETY: indices bounded by 64*33; guards on key position.
+            unsafe {
+                for i in 0..16usize {
+                    let idx = tid + i * 128;
+                    let k = idx / 32;
+                    let w = idx % 32;
+                    let key = kt + k;
+                    let (mut v0, mut v1) = (0.0f32, 0.0f32);
+                    if key < n_size {
+                        let base = token_of(key) * 1536 + 512 + head * 64 + w * 2;
+                        let c = cos[key * 32 + w];
+                        let sn = sin[key * 32 + w];
+                        let (even, odd) = (qkv[base], qkv[base + 1]);
+                        v0 = even * c - odd * sn;
+                        v1 = odd * c + even * sn;
+                    }
+                    SK[k * 33 + w] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                }
+                for i in 0..16usize {
+                    let idx = tid + i * 128;
+                    let k = idx / 32;
+                    let w = idx % 32;
+                    let key = kt + k;
+                    let v0 = if key < n_size { qkv[token_of(key) * 1536 + 1024 + head * 64 + w * 2] } else { 0.0 };
+                    let v1 = if key < n_size { qkv[token_of(key) * 1536 + 1024 + head * 64 + w * 2 + 1] } else { 0.0 };
+                    SV[k * 33 + w] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                }
+            }
+            thread::sync_threads();
+            // Transpose V into [dim][key-word] layout in shared so PV B
+            // fragments need exactly one word per operand half.
+            // SAFETY: SV reads see completed stores (sync above).
+            unsafe {
+                for i in 0..16usize {
+                    let idx = tid + i * 128;
+                    let d = idx / 32;
+                    let w = idx % 32;
+                    let dw = d / 2;
+                    let w0 = SV[(2 * w) * 33 + dw];
+                    let w1 = SV[(2 * w + 1) * 33 + dw];
+                    SVt[d * 33 + w] = if d % 2 == 0 {
+                        (w0 & 0xFFFF) | ((w1 & 0xFFFF) << 16)
+                    } else {
+                        (w0 >> 16) | ((w1 >> 16) << 16)
+                    };
+                }
+            }
+            thread::sync_threads();
+
+            // ---- Q@K^T over d=64 (4 k-fragments x 8 key tiles) ----
+            // Scores reset per key tile: each kt step is a fresh key range,
+            // not a K-dimension continuation.
+            for nt in 0..8usize {
+                acc[nt] = [0.0f32; 4];
+            }
+            for j in 0..4usize {
+                let mut a = [0u32; 4];
+                // SAFETY: r0/r1 < 128, word index 8j+tig(+4) < 32.
+                unsafe {
+                    a[0] = SQ[r0 * 33 + 8 * j + tig];
+                    a[1] = SQ[r1 * 33 + 8 * j + tig];
+                    a[2] = SQ[r0 * 33 + 8 * j + tig + 4];
+                    a[3] = SQ[r1 * 33 + 8 * j + tig + 4];
+                }
+                for nt in 0..8usize {
+                    let mut bb = [0u32; 2];
+                    // SAFETY: key row nt*8+group < 64, word < 32.
+                    unsafe {
+                        let kw = (nt * 8 + group) * 33 + 8 * j;
+                        bb[0] = SK[kw + tig];
+                        bb[1] = SK[kw + tig + 4];
+                    }
+                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, bb) };
+                }
+            }
+
+            // ---- online softmax per row half + P conversion ----
+            for half in 0..2usize {
+                let row_valid = if half == 0 { q_v0 } else { q_v1 };
+                let mut m_tile = f32::NEG_INFINITY;
+                for nt in 0..8usize {
+                    for jj in 0..2usize {
+                        let j = half * 2 + jj;
+                        let cc = kt + nt * 8 + tig * 2 + jj;
+                        if row_valid && cc < n_size {
+                            let v = acc[nt][j];
+                            if v > m_tile { m_tile = v; }
+                        }
+                    }
+                }
+                m_tile = warp::shuffle_xor_f32_sync(0xffffffff, m_tile, 1).max(m_tile);
+                m_tile = warp::shuffle_xor_f32_sync(0xffffffff, m_tile, 2).max(m_tile);
+                let mut m_new = m_i[half].max(m_tile);
+                if m_new == f32::NEG_INFINITY { m_new = 0.0; }
+                // m_i = -inf on the first tile gives correction 0 cleanly.
+                let corr = cuda_device::float::ex2_approx_f32((m_i[half] - m_new) * 1.4426950408889634f32);
+                let mut s_tile = 0.0f32;
+                for nt in 0..8usize {
+                    for jj in 0..2usize {
+                        let j = half * 2 + jj;
+                        let cc = kt + nt * 8 + tig * 2 + jj;
+                        let p = if row_valid && cc < n_size {
+                            cuda_device::float::ex2_approx_f32((acc[nt][j] - m_new) * 1.4426950408889634f32)
+                        } else {
+                            0.0
+                        };
+                        acc[nt][j] = p;
+                        s_tile += p;
+                    }
+                }
+                l_i[half] = l_i[half] * corr + s_tile;
+                m_i[half] = m_new;
+                for nt in 0..8usize {
+                    for jj in 0..2usize {
+                        let j = half * 2 + jj;
+                        acc_pv[nt][j] *= corr;
+                    }
+                }
+            }
+
+            // ---- P @ V over 64 keys (4 key fragments x 8 dim tiles) ----
+            // B fragments come from row-major SV via register preloads: each
+            // lane needs 4 key rows x 8 dim words per kf, loaded once and
+            // repacked with integer half selects (no shared reads per mma).
+            let g2 = group / 2;
+            let hi_half = group % 2 == 1;
+            for kf in 0..4usize {
+                let mut a = [0u32; 4];
+                // C tiles 2kf / 2kf+1 hold this A fragment's key columns.
+                // SAFETY: nt index 2kf+1 <= 7.
+                unsafe {
+                    a[0] = cuda_device::convert::cvt_f16x2_f32(acc[2 * kf][0], acc[2 * kf][1]);
+                    a[1] = cuda_device::convert::cvt_f16x2_f32(acc[2 * kf][2], acc[2 * kf][3]);
+                    a[2] = cuda_device::convert::cvt_f16x2_f32(acc[2 * kf + 1][0], acc[2 * kf + 1][1]);
+                    a[3] = cuda_device::convert::cvt_f16x2_f32(acc[2 * kf + 1][2], acc[2 * kf + 1][3]);
+                }
+                for nt in 0..8usize {
+                    let mut bb = [0u32; 2];
+                    // B fragment from the transposed tile: one word per half.
+                    // SAFETY: dim row < 64, word < 32.
+                    unsafe {
+                        let kw = (nt * 8 + group) * 33 + 8 * kf;
+                        bb[0] = SVt[kw + tig];
+                        bb[1] = SVt[kw + tig + 4];
+                    }
+                    acc_pv[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc_pv[nt], a, bb) };
+                }
+            }
+            thread::sync_threads();
+            kt += 64;
+        }
+
+        // ---- epilogue: normalize, gate, scatter into the folded tensor ----
+        for half in 0..2usize {
+            let mut l = l_i[half];
+            l += warp::shuffle_xor_f32_sync(0xffffffff, l, 1);
+            l += warp::shuffle_xor_f32_sync(0xffffffff, l, 2);
+            l_i[half] = l;
+        }
+        let out_ptr = y.as_mut_ptr();
+        for nt in 0..8usize {
+            for j in 0..4usize {
+                let half = j / 2;
+                let row = row_base + if half == 0 { r0 } else { r1 };
+                if row < n_size {
+                    let cc = nt * 8 + tig * 2 + (j & 1);
+                    let token = token_of(row);
+                    let g = gates[token * 8 + head];
+                    let sig = 1.0 / (1.0 + (-g).exp());
+                    let inv = if l_i[half] > 0.0 { 1.0 / l_i[half] } else { 0.0 };
+                    // SAFETY: token < M (row < seq), cc < 64; y is M*512.
+                    unsafe {
+                        *out_ptr.add(token * 512 + head * 64 + cc) = acc_pv[nt][j] * inv * sig;
+                    }
+                    if cc == 0 && (j & 1) == 0 {
+                        let dm = dbg_m.as_mut_ptr();
+                        let dl = dbg_l.as_mut_ptr();
+                        // SAFETY: grp*n_size+row < BH*seq <= buffer size.
+                        unsafe {
+                            *dm.add(grp * n_size + row) = m_i[half];
+                            *dl.add(grp * n_size + row) = l_i[half];
+                        }
+                    }
                 }
             }
         }
@@ -4062,23 +4332,16 @@ unsafe fn transformer_step(
     // 5. attention: short (freq) uses attn_short per (b,h) block; long (time)
     // uses 2-pass materialized with the batched kernels below.
     if axis == 1 {
-        // Frequency-axis attention uses the same three batched FP16 launches.
-        // BH*N has the same 128,464 rows as the time axis, so p_big and
-        // attn_out_long are already sized for it.
-        // SAFETY: one 64-column score tile per BH group.
+        // Frequency axis (seq=62, one key tile): flash attention in a single
+        // launch, ~8x faster than the three-kernel chain.
+        // SAFETY: one 128-thread block per (BH group, 64-row query tile).
         unsafe {
-            km.attn_qk_rope_f16_stats(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, 1, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, 62, 62, 64, &scratch.qkv, &scratch.cos[axis], &scratch.sin[axis], &scratch.zero_bias_64, bands as u32, axis as u32, &mut scratch.p_big, &mut scratch.attn_max, &mut scratch.attn_scale)
+            km.attn_flash_tc(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, bands.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &scratch.qkv, &scratch.cos[axis], &scratch.sin[axis], &scratch.gates, bands as u32, axis as u32, bands as u32, &mut scratch.scaled, &mut scratch.attn_max, &mut scratch.attn_scale)
         }.map_err(|e| e.to_string())?;
-        // Max/scale are fused into the frequency QK epilogue.
-
-        // SAFETY: one 64-column output tile per BH group.
-        unsafe {
-            km.attn_pv_raw_f16(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, 1, bh as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, 62, 64, 62, &scratch.p_big, &scratch.qkv, &scratch.zero_bias_64, &scratch.gates, bands as u32, axis as u32, &scratch.attn_max, &scratch.attn_scale, &mut scratch.scaled)
-        }.map_err(|e| e.to_string())?;
-        // PV writes the gated folded tensor directly.
     } else {
-        // Time-axis attention in three batched launches: FP16 QK^T, warp
-        // softmax, FP16 PV. grid.z is BH, so no per-(b,h) host loop remains.
+        // Time axis (seq=259): the materialized three-kernel chain still
+        // beats the flash kernel whose key-tile loop pays 5x sync/softmax
+        // serialization; see BENCHMARK.md.
         // SAFETY: 64x128 FP16 tiles over [BH, N, N].
         unsafe {
             km.attn_qk_rope_f16(stream, cuda_core::simt::LaunchConfig { grid_dim: (n_len.div_ceil(64) as u32, n_len.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, n_len as u32, n_len as u32, 64, &scratch.qkv, &scratch.cos[axis], &scratch.sin[axis], &scratch.zero_bias_t, bands as u32, axis as u32, &mut scratch.p_big)
@@ -4091,7 +4354,6 @@ unsafe fn transformer_step(
         unsafe {
             km.attn_pv_raw_f16(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, n_len.div_ceil(128) as u32, bh as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, n_len as u32, 64, n_len as u32, &scratch.p_big, &scratch.qkv, &scratch.zero_bias_64, &scratch.gates, bands as u32, axis as u32, &scratch.attn_max, &scratch.attn_scale, &mut scratch.scaled)
         }.map_err(|e| e.to_string())?;
-        // PV writes the gated folded tensor directly.
     }
     // 7. gate application was fused into attn_v_to_flat; out proj reads scaled.
     // SAFETY: 2-D tile grid over m x 256.
@@ -4528,6 +4790,120 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
             stage_check("L0.attn_out", &av, r, true);
         }
         let _ = &sub;
+    }
+    // DIAG: compare tensor-core flash attention against the proven three
+    // kernel chain on identical layer-0 axis-0 inputs.
+    if true {
+        let x0 = DeviceBuffer::from_host(&stream, &x.to_host_vec(&stream).unwrap()).unwrap();
+        let mut h0 = DeviceBuffer::<f32>::zeroed(&stream, m * 256).unwrap();
+        let mut g0b = DeviceBuffer::<f32>::zeroed(&stream, m * 8).unwrap();
+        // SAFETY: one warp per row.
+        unsafe { km.rmsnorm_gates(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * 32) as u32), &x0, &gw.norm_gamma[0], &gw.gates_w[0], &gw.gates_b[0], &mut h0, &mut g0b, m as u32, 256) }.unwrap();
+        let mut qkv0 = DeviceBuffer::<f32>::zeroed(&stream, m * 1536).unwrap();
+        // SAFETY: tile grid over m x 1536.
+        unsafe { km.gemm_f16_128x64(&stream, tile_cfg_tf32_64(m, 1536), m as u32, 1536, 256, &h0, &gw.qkv_w[0], &gw.shared_qkv_bias, &mut qkv0) }.unwrap();
+        let mut s_old = DeviceBuffer::<f32>::zeroed(&stream, m * 512).unwrap();
+        let mut s_new = DeviceBuffer::<f32>::zeroed(&stream, m * 512).unwrap();
+        let mut a_max = DeviceBuffer::<f32>::zeroed(&stream, m * 8).unwrap();
+        let mut a_scale = DeviceBuffer::<f32>::zeroed(&stream, m * 8).unwrap();
+        let bh_t = bands * 8;
+        // old chain
+        // SAFETY: 64x128 FP16 tiles over [BH, N, N].
+        unsafe { km.attn_qk_rope_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (t_frames.div_ceil(64) as u32, t_frames.div_ceil(64) as u32, bh_t as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, t_frames as u32, 64, &qkv0, &scr.cos[0], &scr.sin[0], &scr.zero_bias_t, bands as u32, 0, &mut scr.p_big) }.unwrap();
+        // SAFETY: one warp per score row.
+        unsafe { km.softmax_stats(&stream, cuda_core::simt::LaunchConfig::for_num_elems((bh_t * t_frames * 32) as u32), &scr.p_big, (bh_t * t_frames) as u32, t_frames as u32, &mut a_max, &mut a_scale) }.unwrap();
+        // SAFETY: one 64-column FP16 tile per row block and BH group.
+        unsafe { km.attn_pv_raw_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (1, t_frames.div_ceil(128) as u32, bh_t as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, 64, t_frames as u32, &scr.p_big, &qkv0, &scr.zero_bias_64, &g0b, bands as u32, 0, &a_max, &a_scale, &mut s_old) }.unwrap();
+        // new flash
+        // SAFETY: one 128-thread block per (BH group, 64-row query tile).
+        let mut f_max = DeviceBuffer::<f32>::zeroed(&stream, bh_t * t_frames).unwrap();
+        let mut f_l = DeviceBuffer::<f32>::zeroed(&stream, bh_t * t_frames).unwrap();
+        // SAFETY: one 128-thread block per (BH group, 64-row query tile).
+        unsafe { km.attn_flash_tc(&stream, cuda_core::simt::LaunchConfig { grid_dim: (1, t_frames.div_ceil(64) as u32, bh_t as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &qkv0, &scr.cos[0], &scr.sin[0], &g0b, bands as u32, 0, t_frames as u32, &mut s_new, &mut f_max, &mut f_l) }.unwrap();
+        let qkv0h = qkv0.to_host_vec(&stream).unwrap();
+        {
+            let mv = a_max.to_host_vec(&stream).unwrap();
+            let sv = a_scale.to_host_vec(&stream).unwrap();
+            let fmv = f_max.to_host_vec(&stream).unwrap();
+            let flv = f_l.to_host_vec(&stream).unwrap();
+            let (mut dm, mut dl, mut drows) = (0.0f32, 0.0f32, 0usize);
+            for g in 0..bh_t * t_frames {
+                let (mo, zo) = (mv[g], 1.0 / sv[g]);
+                let (mf, lf) = (fmv[g], flv[g]);
+                dm = dm.max((mo - mf).abs());
+                let ldiff = (zo - lf).abs() / zo.abs().max(1e-6);
+                if ldiff > dl { dl = ldiff; drows = g; }
+            }
+            println!("DIAG softmax stats: max|dm|={dm:.3e} max rel|dl|={dl:.3e} worst_row={drows} (grp {} row {})", drows / t_frames, drows % t_frames);
+            // Host reference for the worst row: RoPE + dot products.
+            {
+                let (grp_, row_) = (drows / t_frames, drows % t_frames);
+                let (b_, h_) = (grp_ / 8, grp_ % 8);
+                let token_q = row_ * bands + b_;
+                let mut s_host = vec![0.0f32; t_frames];
+                let mut m_host = f32::NEG_INFINITY;
+                for kc in 0..t_frames {
+                    let token_k = kc * bands + b_;
+                    let mut acc = 0.0f64;
+                    for pair in 0..32usize {
+                        let (qe, qo) = (qkv0h[token_q * 1536 + h_ * 64 + pair * 2] as f64, qkv0h[token_q * 1536 + h_ * 64 + pair * 2 + 1] as f64);
+                        let (ke, ko) = (qkv0h[token_k * 1536 + 512 + h_ * 64 + pair * 2] as f64, qkv0h[token_k * 1536 + 512 + h_ * 64 + pair * 2 + 1] as f64);
+                        let (c, sn) = (cos_t[row_ * 32 + pair] as f64, sin_t[row_ * 32 + pair] as f64);
+                        let (ck, sk) = (cos_t[kc * 32 + pair] as f64, sin_t[kc * 32 + pair] as f64);
+                        let qr0 = (qe * c - qo * sn) * 0.125;
+                        let qr1 = (qo * c + qe * sn) * 0.125;
+                        let kr0 = ke * ck - ko * sk;
+                        let kr1 = ko * ck + ke * sk;
+                        acc += qr0 * kr0 + qr1 * kr1;
+                    }
+                    s_host[kc] = acc as f32;
+                    if s_host[kc] > m_host { m_host = s_host[kc]; }
+                }
+                let mut l_host = 0.0f32;
+                for kc in 0..t_frames { l_host += ((s_host[kc] - m_host) as f32).exp(); }
+                let pb = scr.p_big.to_host_vec(&stream).unwrap();
+                let prow = grp_ * t_frames * t_frames + row_ * t_frames;
+                println!("DIAG host-vs-old scores[:8]: {:?}", &s_host[0..8]);
+                println!("DIAG pbig              [:8]: {:?}", &pb[prow..prow + 8]);
+                let mut pd = 0.0f32;
+                for kc in 0..t_frames { pd = pd.max((pb[prow + kc] - s_host[kc]).abs()); }
+                println!("DIAG host-vs-pbig max diff = {pd:.3e}");
+                println!("DIAG m: host={m_host:.4} old={:.4} flash={:.4}", mv[drows], fmv[drows]);
+                println!("DIAG l: host={l_host:.4} old={:.4} flash={:.4}", 1.0 / sv[drows], flv[drows]);
+            }
+        }
+        let ov = s_old.to_host_vec(&stream).unwrap();
+        let nv = s_new.to_host_vec(&stream).unwrap();
+        let (mut me, mut dn, mut bad) = (0.0f32, 0.0f32, 0usize);
+        let mut bad_by_tile = [0usize; 5];
+        let mut bad_by_head = [0usize; 8];
+        for i in 0..ov.len() {
+            let d = (nv[i] - ov[i]).abs();
+            if d > 1e-3 * ov[i].abs().max(1.0) {
+                bad += 1;
+                let row = i / 512;
+                let t = row / bands;
+                bad_by_tile[(t / 64).min(4)] += 1;
+                bad_by_head[(i % 512) / 64] += 1;
+            }
+            me = me.max(d);
+            dn = dn.max(ov[i].abs());
+        }
+        println!("DIAG flash-vs-old: max_abs={me:.3e} rel={:.3e} bad={bad}/{}", me / dn, ov.len());
+        println!("DIAG bad by q-tile: {bad_by_tile:?}");
+        println!("DIAG bad by head: {bad_by_head:?}");
+        {
+            // spot: first bad element coordinates
+            for i in 0..ov.len() {
+                let d = (nv[i] - ov[i]).abs();
+                if d > 1e-3 * ov[i].abs().max(1.0) {
+                    let row = i / 512;
+                    println!("DIAG first bad i={i} token={row} t={} band={} head={} col={} old={:.5} new={:.5}", row / bands, row % bands, (i % 512) / 64, i % 64, ov[i], nv[i]);
+                    break;
+                }
+            }
+            println!("DIAG spot token0: old[0..4]={:?} new[0..4]={:?}", &ov[0..4], &nv[0..4]);
+        }
     }
     // 4. 12 layers x 2 axes (layer 0 axis 0 redone fully inside)
     for layer in 0..12 {
