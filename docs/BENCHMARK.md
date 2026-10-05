@@ -313,6 +313,22 @@ ncu（T=1151 时间轴 flash，25.8ms/launch）：L2 吞吐 85.3%（墙）、DRA
   RTF 0.0374）**；输出与基线**逐位一致**（六 stem 全 True，vs pymss 63.62 dB
   不变，黄金 SNR 80.99 不变）。
 
+### 第 36 轮：时间轴 flash 的 cp.async 双缓冲 —— 攻下 65% L1TEX stall（净收益）
+
+- **依据**：ncu 显示时间轴 flash 65.5% stall 在 L1TEX scoreboard（K/V 的
+  LDG→STS→sync 串行链），此前四轮结构实验（宽 tile/主序重排/Q 寄存器化）
+  均证伪——瓶颈不在流量/布局/占用率，而在加载与计算的串行化。
+- **改造**：
+  1. `rope_k16`：K 的 RoPE 前移到独立一遍（折叠布局不变，逐位同式）；
+  2. `attn_flash_async`：K/V tile 用 cp.async 16B 双缓冲，预取 t+1 与
+     t 的 mma/softmax 重叠；shared swizzle 改 **16B chunk 级 XOR
+     （chunk ^ (row&7)）**——cp.async 可直写且 mma fragment 读仍无 bank
+     冲突（8 group 行 × 4 tig 恰好铺满 32 bank）。V 保持原样裸拷。
+- **两个 bug 教训**：首版 issue 闭包目标地址漏 swizzle（写直址/读置换 →
+  SNR -2.68dB）；闭包参数勿用 &dyn Fn（设备代码不支持，改捕获）。
+- **结果**：bench 69.0 → **67.7 ms（1.78×）**；整曲 6.76 → **6.58 s
+  （1.47×，RTF 0.0365）**；输出与基线**逐位一致**（80.99 dB / 63.62 dB）。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared

@@ -3180,6 +3180,37 @@ mod gpu_kernels {
             }
         }
     }
+    /// Pre-apply RoPE to the K block of the folded qkv16 tensor, writing a
+    /// compact [token][head][32 words] buffer. The flash kernel's cp.async
+    /// pipeline needs raw 16 B chunks (no in-flight arithmetic), so the K
+    /// rotation moves here; the math is expression-for-expression identical
+    /// to the old in-kernel path, keeping the output bit-identical.
+    #[kernel]
+    pub fn rope_k16(
+        qkv: &[u32], cos: &[f32], sin: &[f32],
+        mut out: DisjointSlice<u32>,
+        bands: u32, axis: u32,
+    ) {
+        let idx = thread::index_1d();
+        let g0 = idx.get();
+        let bands_ = bands as usize;
+        if g0 < out.len() {
+            let token = g0 / 256;
+            let rem = g0 % 256;
+            let w = rem % 32;
+            // folded token = t * bands + b: time axis rotates by t, freq by b
+            let pos = if axis == 0 { token / bands_ } else { token % bands_ };
+            let c = cos[pos * 32 + w];
+            let sn = sin[pos * 32 + w];
+            // SAFETY: guarded word index into qkv16 (K starts at word 256).
+            let (even, odd) = unsafe {
+                cuda_device::convert::cvt_f32x2_f16x2(*qkv.as_ptr().add(token * 768 + 256 + rem))
+            };
+            if let Some(o) = out.get_mut(idx) {
+                *o = cuda_device::convert::cvt_f16x2_f32(even * c - odd * sn, odd * c + even * sn);
+            }
+        }
+    }
     /// Tensor-core flash attention for one axis. One 256-thread block owns a
     /// 128-row query tile of one (batch, head) group and iterates every 64-key
     /// tile with an online softmax in registers. RoPE is fused into the Q/K
@@ -3436,6 +3467,274 @@ mod gpu_kernels {
                         // grp*62+row which can exceed the caller's buffer at
                         // large T (T=259 fits exactly, T=1151 overflows by
                         // ~200 words and corrupts adjacent allocations).
+                        let di = grp * n_size + row;
+                        if di < dbg_m.len() && di < dbg_l.len() {
+                            let dm = dbg_m.as_mut_ptr();
+                            let dl = dbg_l.as_mut_ptr();
+                            // SAFETY: bounds checked above.
+                            unsafe {
+                                *dm.add(di) = m_i[half];
+                                *dl.add(di) = l_i[half];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    /// cp.async double-buffered flash attention (TIME axis). Same math and
+    /// fragment structure as attn_flash_tc, but the K/V tile loads are raw
+    /// 16 B async copies (K pre-roped by rope_k16, V raw) issued one tile
+    /// ahead, overlapping the mma/softmax phase — attacking the measured
+    /// 65% L1TEX-scoreboard stall. Shared tiles use a 16 B CHUNK-level XOR
+    /// swizzle (chunk ^ (row & 7)), which cp.async can write directly and
+    /// which keeps every mma fragment read conflict-free (8 group rows x 4
+    /// tig lanes span all 32 banks).
+    #[kernel]
+    pub fn attn_flash_async(
+        qkv: &[u32], k16r: &[u32], cos: &[f32], sin: &[f32], gates: &[f32],
+        bands: u32, axis: u32, seq: u32,
+        mut y: DisjointSlice<u32>,
+        mut dbg_m: DisjointSlice<f32>, mut dbg_l: DisjointSlice<f32>,
+    ) {
+        static mut SQ: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT; // [q row][d word]
+        static mut SK: SharedArray<u32, { 2 * 64 * 32 }, 16> = SharedArray::UNINIT; // double K
+        static mut SV: SharedArray<u32, { 2 * 64 * 32 }, 16> = SharedArray::UNINIT; // double V
+
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let warp_id = tid / 32;
+        let group = lane / 4;
+        let tig = lane % 4;
+        let (n_size, bands_, axis_) = (seq as usize, bands as usize, axis as usize);
+        let row_base = thread::blockIdx_y() as usize * 64;
+        let grp = thread::blockIdx_z() as usize;
+        let (b, head) = (grp / 8, grp % 8);
+        let r0 = warp_id * 16 + group;
+        let r1 = r0 + 8;
+        let q_v0 = row_base + r0 < n_size;
+        let q_v1 = row_base + r1 < n_size;
+        let token_of = |r: usize| if axis_ == 0 { r * bands_ + b } else { b * bands_ + r };
+        // 16 B chunk-level XOR swizzle: chunk c of row k lands at c ^ (k & 7).
+        let cx = |w: usize, k: usize| -> usize { ((w & !3) ^ ((k & 7) << 2)) | (w & 3) };
+        // SAFETY: block-local statics; addresses only, no references formed.
+        let sq0: *mut u32 = std::ptr::addr_of_mut!(SQ) as *mut u32;
+        let sk0: *mut u32 = std::ptr::addr_of_mut!(SK) as *mut u32;
+        let sv0: *mut u32 = std::ptr::addr_of_mut!(SV) as *mut u32;
+
+        // ---- load this block's 64 query rows once, fusing RoPE + 0.125 ----
+        unsafe {
+            for i in 0..16usize {
+                let idx = tid + i * 128;
+                let r = idx / 32;
+                let w = idx % 32;
+                let xr = row_base + r;
+                let (mut v0, mut v1) = (0.0f32, 0.0f32);
+                if xr < n_size {
+                    let base = token_of(xr) * 768 + head * 32 + w;
+                    let c = cos[xr * 32 + w];
+                    let sn = sin[xr * 32 + w];
+                    // SAFETY: word index into qkv16 (m*768).
+                    let (even, odd) = cuda_device::convert::cvt_f32x2_f16x2(*qkv.as_ptr().add(base));
+                    v0 = (even * c - odd * sn) * 0.125;
+                    v1 = (odd * c + even * sn) * 0.125;
+                }
+                *sq0.add(r * 32 + cx(w, r)) = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+            }
+        }
+
+        let mut acc = [[0.0f32; 4]; 8];
+        let mut acc_pv = [[0.0f32; 4]; 8];
+        let mut m_i = [f32::NEG_INFINITY; 2];
+        let mut l_i = [0.0f32; 2];
+
+        // ---- issue one 64-key K/V tile into buffer `buf` ----
+        // SAFETY: destinations are 16 B aligned (row stride 32 words and the
+        // chunk swizzle keeps 4-word alignment); sources are 16 B contiguous
+        // runs of the folded rows; out-of-range keys zero-fill.
+        let issue = |kt: usize, buf: usize| unsafe {
+            let sk = sk0.add(buf * 2048);
+            let sv = sv0.add(buf * 2048);
+            for i in 0..4usize {
+                let idx = tid + i * 128;
+                let k = idx / 8;
+                let c4 = idx % 8;
+                let key = kt + k;
+                // chunk-XOR swizzle: chunk c4 of row k -> chunk c4 ^ (k & 7)
+                let cdst = k * 32 + ((c4 ^ (k & 7)) * 4);
+                let dst = sk.add(cdst);
+                if key < n_size {
+                    let src = k16r.as_ptr().add(token_of(key) * 256 + head * 32 + c4 * 4);
+                    cuda_device::async_copy::cp_async_cg_16(dst, src);
+                } else {
+                    cuda_device::async_copy::cp_async_cg_zfill_16(dst, k16r.as_ptr() as *const u8, 0);
+                }
+                let dstv = sv.add(cdst);
+                if key < n_size {
+                    let src = qkv.as_ptr().add(token_of(key) * 768 + 512 + head * 32 + c4 * 4);
+                    cuda_device::async_copy::cp_async_cg_16(dstv, src);
+                } else {
+                    cuda_device::async_copy::cp_async_cg_zfill_16(dstv, qkv.as_ptr() as *const u8, 0);
+                }
+            }
+        };
+
+        // Prologue: tile 0 into buffer 0.
+        unsafe {
+            issue(0, 0);
+            cuda_device::async_copy::cp_async_commit_group();
+        }
+
+        let mut kt = 0usize;
+        let mut buf = 0usize;
+        while kt < n_size {
+            // Issue tile kt+64 into the other buffer (empty group at the end
+            // keeps the wait discipline uniform).
+            unsafe {
+                if kt + 64 < n_size {
+                    issue(kt + 64, buf ^ 1);
+                }
+                cuda_device::async_copy::cp_async_commit_group();
+                cuda_device::async_copy::cp_async_wait_group(1);
+            }
+            thread::sync_threads();
+            let sk = unsafe { sk0.add(buf * 2048) };
+            let sv = unsafe { sv0.add(buf * 2048) };
+
+            // ---- Q@K^T over d=64 (4 k-fragments x 8 key tiles) ----
+            for nt in 0..8usize {
+                acc[nt] = [0.0f32; 4];
+            }
+            for j in 0..4usize {
+                let mut a = [0u32; 4];
+                // SAFETY: r0/r1 < 64, word index < 32.
+                unsafe {
+                    let wq = 8 * j + tig;
+                    a[0] = *sq0.add(r0 * 32 + cx(wq, r0));
+                    a[1] = *sq0.add(r1 * 32 + cx(wq, r1));
+                    a[2] = *sq0.add(r0 * 32 + cx(wq + 4, r0));
+                    a[3] = *sq0.add(r1 * 32 + cx(wq + 4, r1));
+                }
+                for nt in 0..8usize {
+                    let mut bb = [0u32; 2];
+                    // SAFETY: key row nt*8+group < 64, word < 32.
+                    unsafe {
+                        let row = nt * 8 + group;
+                        let wb = 8 * j + tig;
+                        bb[0] = *sk.add(row * 32 + cx(wb, row));
+                        bb[1] = *sk.add(row * 32 + cx(wb + 4, row));
+                    }
+                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, bb) };
+                }
+            }
+
+            // ---- online softmax per row half + P conversion ----
+            for half in 0..2usize {
+                let row_valid = if half == 0 { q_v0 } else { q_v1 };
+                let mut m_tile = f32::NEG_INFINITY;
+                for nt in 0..8usize {
+                    for jj in 0..2usize {
+                        let j = half * 2 + jj;
+                        let cc = kt + nt * 8 + tig * 2 + jj;
+                        if row_valid && cc < n_size {
+                            let v = acc[nt][j];
+                            if v > m_tile { m_tile = v; }
+                        }
+                    }
+                }
+                m_tile = warp::shuffle_xor_f32_sync(0xffffffff, m_tile, 1).max(m_tile);
+                m_tile = warp::shuffle_xor_f32_sync(0xffffffff, m_tile, 2).max(m_tile);
+                let mut m_new = m_i[half].max(m_tile);
+                if m_new == f32::NEG_INFINITY { m_new = 0.0; }
+                let corr = cuda_device::float::ex2_approx_f32((m_i[half] - m_new) * 1.4426950408889634f32);
+                let mut s_tile = 0.0f32;
+                for nt in 0..8usize {
+                    for jj in 0..2usize {
+                        let j = half * 2 + jj;
+                        let cc = kt + nt * 8 + tig * 2 + jj;
+                        let p = if row_valid && cc < n_size {
+                            cuda_device::float::ex2_approx_f32((acc[nt][j] - m_new) * 1.4426950408889634f32)
+                        } else {
+                            0.0
+                        };
+                        acc[nt][j] = p;
+                        s_tile += p;
+                    }
+                }
+                l_i[half] = l_i[half] * corr + s_tile;
+                m_i[half] = m_new;
+                for nt in 0..8usize {
+                    for jj in 0..2usize {
+                        let j = half * 2 + jj;
+                        acc_pv[nt][j] *= corr;
+                    }
+                }
+            }
+
+            // ---- P @ V over 64 keys ----
+            for kf in 0..4usize {
+                let mut a = [0u32; 4];
+                // SAFETY: nt index 2kf+1 <= 7.
+                unsafe {
+                    a[0] = cuda_device::convert::cvt_f16x2_f32(acc[2 * kf][0], acc[2 * kf][1]);
+                    a[1] = cuda_device::convert::cvt_f16x2_f32(acc[2 * kf][2], acc[2 * kf][3]);
+                    a[2] = cuda_device::convert::cvt_f16x2_f32(acc[2 * kf + 1][0], acc[2 * kf + 1][1]);
+                    a[3] = cuda_device::convert::cvt_f16x2_f32(acc[2 * kf + 1][2], acc[2 * kf + 1][3]);
+                }
+                for nt in 0..8usize {
+                    let mut bb = [0u32; 2];
+                    // SAFETY: key rows < 64, word < 32 inside SV.
+                    unsafe {
+                        let n = nt * 8 + group;
+                        let nw = n / 2;
+                        let hi_half = n % 2 == 1;
+                        let krow = 16 * kf + 2 * tig;
+                        let w0 = *sv.add(krow * 32 + cx(nw, krow));
+                        let w1 = *sv.add((krow + 1) * 32 + cx(nw, krow + 1));
+                        let w2 = *sv.add((krow + 8) * 32 + cx(nw, krow + 8));
+                        let w3 = *sv.add((krow + 9) * 32 + cx(nw, krow + 9));
+                        if hi_half {
+                            bb[0] = (w0 >> 16) | ((w1 >> 16) << 16);
+                            bb[1] = (w2 >> 16) | ((w3 >> 16) << 16);
+                        } else {
+                            bb[0] = (w0 & 0xFFFF) | ((w1 & 0xFFFF) << 16);
+                            bb[1] = (w2 & 0xFFFF) | ((w3 & 0xFFFF) << 16);
+                        }
+                    }
+                    acc_pv[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc_pv[nt], a, bb) };
+                }
+            }
+            // Protect this buffer before tile kt+128 reuses it.
+            thread::sync_threads();
+            kt += 64;
+            buf ^= 1;
+        }
+
+        // ---- epilogue: normalize, gate, scatter into the folded tensor ----
+        for half in 0..2usize {
+            let mut l = l_i[half];
+            l += warp::shuffle_xor_f32_sync(0xffffffff, l, 1);
+            l += warp::shuffle_xor_f32_sync(0xffffffff, l, 2);
+            l_i[half] = l;
+        }
+        let out_ptr = y.as_mut_ptr();
+        for nt in 0..8usize {
+            for half in 0..2usize {
+                let row = row_base + if half == 0 { r0 } else { r1 };
+                if row < n_size {
+                    let token = token_of(row);
+                    let g = gates[token * 8 + head];
+                    let sig = 1.0 / (1.0 + (-g).exp());
+                    let inv = if l_i[half] > 0.0 { 1.0 / l_i[half] } else { 0.0 };
+                    let w0 = nt * 8 + tig * 2;
+                    // SAFETY: token < M, w0 < 64; y is M*256 words.
+                    unsafe {
+                        *out_ptr.add(token * 256 + head * 32 + w0 / 2) = cuda_device::convert::cvt_f16x2_f32(
+                            acc_pv[nt][half * 2] * inv * sig,
+                            acc_pv[nt][half * 2 + 1] * inv * sig,
+                        );
+                    }
+                    if w0 == 0 {
                         let di = grp * n_size + row;
                         if di < dbg_m.len() && di < dbg_l.len() {
                             let dm = dbg_m.as_mut_ptr();
@@ -5145,6 +5444,7 @@ struct E2eScratch {
     h16: DeviceBuffer<u32>,        // (M, 128) packed f16x2
     qkv: DeviceBuffer<f32>,        // (M, 1536)
     qkv16: DeviceBuffer<u32>,      // (M, 768) packed f16x2 (Q|K|V)
+    k16r: DeviceBuffer<u32>,       // (M, 256) pre-roped K, folded layout
     qkv_rope: DeviceBuffer<f32>,   // (M, 1536)
     qkv_attn: DeviceBuffer<f32>,   // time: [3*496, T, 64]; freq: [3*9208, 62, 64]
     v_flat: DeviceBuffer<f32>,     // (M, 512)
@@ -5290,11 +5590,21 @@ unsafe fn transformer_step(
     // uses 2-pass materialized with the batched kernels below.
     {
         let seq = if axis == 0 { t_frames } else { bands };
-        // EXPERIMENT: both axes on the (now power-of-two-stride) flash kernel.
-        // SAFETY: one 128-thread block per (BH group, 64-row query tile).
-        unsafe {
+        // Time axis: cp.async double-buffered flash (K pre-roped by rope_k16,
+        // attacking the measured 65% L1TEX-scoreboard stall). Freq axis keeps
+        // the synchronous kernel (n=62, a single tile, nothing to pipeline).
+        if axis == 0 {
+            // SAFETY: one thread per output word; m*256 words.
+            km.rope_k16(stream, launch1((m * 256) as u32), &scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], &mut scratch.k16r, bands as u32, axis as u32)
+                .map_err(|e| e.to_string())?;
+            // SAFETY: one 128-thread block per (BH group, 64-row query tile).
+            km.attn_flash_async(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, n_len.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &scratch.qkv16, &scratch.k16r, &scratch.cos[axis], &scratch.sin[axis], &scratch.gates, bands as u32, axis as u32, seq as u32, &mut scratch.scaled16, &mut scratch.attn_max, &mut scratch.attn_scale)
+                .map_err(|e| e.to_string())?;
+        } else {
+            // SAFETY: one 128-thread block per (BH group, 64-row query tile).
             km.attn_flash_tc(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, n_len.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], &scratch.gates, bands as u32, axis as u32, seq as u32, &mut scratch.scaled16, &mut scratch.attn_max, &mut scratch.attn_scale)
-        }.map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?;
+        }
     }
     // 7. gate application was fused into attn_v_to_flat; out proj reads scaled.
     // SAFETY: 2-D tile grid over m x 256.
@@ -5545,6 +5855,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
         h: z(m * 256),
         h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
         qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
+k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         ff1_16: DeviceBuffer::<u32>::zeroed(&stream, m * 512).unwrap(),
         qkv: z(m * 1536),
@@ -6307,6 +6618,7 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize) {
             h: z(m * 256),
             h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
         qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
+k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         ff1_16: DeviceBuffer::<u32>::zeroed(&stream, m * 512).unwrap(),
             qkv: z(m * 1536),
@@ -6525,6 +6837,7 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
             h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
             qkv: z(m * 1536),
             qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
+k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             qkv_rope: z(m * 1536),
             qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64),
@@ -6713,6 +7026,7 @@ fn forward_only(device: usize, model_dir: &std::path::Path, input: &std::path::P
             h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
             qkv: z(m * 1536),
             qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
+k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             qkv_rope: z(m * 1536),
             qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64),
