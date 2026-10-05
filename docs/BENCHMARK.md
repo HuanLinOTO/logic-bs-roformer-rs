@@ -434,23 +434,48 @@ demix（OLA 竞争处理 + 双份 scratch + cufft 双 plan）投入远超 4% 收
   流量降 8×）。数值逐位一致，bench 58.29 → **58.23 ms**（-0.1%，
   实测收益远小于流量账——该内核墙不止 L2 读）。保留（正收益）。
 
+### 第 44 轮：cuBLASLt 集成（QKV / out-proj / FF2，第三轮核心）
+
+- **719 翻案落地**：dlopen libcublasLt + CudaContext::bind_to_thread()
+  （cuda-core 现成 pub API）后再 cublasLtCreate——handle 绑定到我们
+  的 primary context，一次通过。
+- **布局映射**：行主权重 [N,K] ≡ colmain (K,N) ld=K → **opA=T**、
+  opB=N，D colmain (N,M) ld=N 恰是行主输出；残差白送：beta=1, C=resid,
+  D=y（C≠D 合法），bias 走 BIAS epilogue。resid 直接 f32 out，QKV
+  f16 out（布局与 qkv16 的 f16x2 行主逐位同构，下游 rope/flash 零改动）。
+- **三个工程坑**（探测程序 tools/cublaslt_probe.c 定位）：
+  1. f16 D + BIAS_DATA_TYPE=f32 被 heuristic 拒（status 7）→ QKV bias
+     host 侧预转 f16 打包（单次舍入，优于拆开加）；
+  2. heuristic 顺序不可靠：resid M=71362 时 algo0 比最优慢 **2.4×**
+     （927 vs 384µs，tools/cublaslt_probe2.c 实测）→ 首次调用用 dummy
+     buffer 对 8 个候选实测定时（1 warmup + 8 reps，cuCtxSynchronize
+     同步），最优入 per-shape 缓存。一次性成本 ~每形状 40ms，摊 14
+     chunk 可忽略；
+  3. FF1 的 GELU_BIAS（tanh 形）只快 0.2ms 却 -0.5dB 黄金 SNR
+     （我们/PymTorch 是 erf 形）→ **回退手写**，数值口径优先。
+- **结果**：bench 58.23 → **51.57 ms**；整曲 5.53 → **5.34 s**（大 M
+  autotune 择优每 chunk 省 ~26ms）；黄金 SNR 80.99 不变；新旧整曲
+  六 stem SNR **269–357 dB**（末位 bit 差异，能量加权口径
+  scripts/snr_wav.py）；LBRR_NO_LT=1 回退手写路径实测 57.7ms 正常。
+
 ### 最终成绩（vs PyTorch 2.14.1 / pymss，RTX 3080，同机同卡同口径）
 
 | 口径 | pymss | 本实现 | 加速比 |
 |---|---|---|---|
-| 单 chunk 前向（3s 合成输入） | 120.8 ms | **58.2 ms** | **2.07×** |
-| 整曲 demix（3:00 真实歌曲） | 9.7 s | **5.53 s** | **1.75×** |
+| 单 chunk 前向（3s 合成输入） | 120.8 ms | **51.6 ms** | **2.34×** |
+| 整曲 demix（3:00 真实歌曲） | 9.7 s | **5.34 s** | **1.81×** |
 | 黄金 SNR（vs fp32 参考） | — | 80.99 dB | 验收线 ≥60 |
-| 能量加权 SNR（vs pymss stems） | — | 63.62 dB | 六 stem 逐位可复现 |
+| 整曲回归 SNR（vs 上一版 stems） | — | 269–357 dB | 末位 bit 级差异 |
 
-（ldmatrix 系列改造全部逐字节一致 —— 六 stem 与 separated2 cmp 相等。）
+（第一/二轮改造逐字节一致；第三轮 cuBLASLt 数值为 ulp 级差异，
+整曲六 stem SNR 269dB+，末位 bit 翻动，量化/听感口径无影响。）
 
 ### 下一步（收益均已边际化，按潜在排序）
 
-1. GEMM 距 cuBLASLt 仍有 2-4×（resid 204µs vs 49µs），但工具链内
-   手段已试尽（ldmatrix 已用、大 tile/barrier 证伪、cp.async 浅 k 证伪）。
-   下一台阶需要 warp-specialized producer/consumer（cuda-oxide 尚无
-   async barrier/mbarrier 绑定）或直接 cuBLASLt 集成（719 已知可修）。
+1. GEMM 已到 cuBLASLt 天花板附近：QKV 54-57 TFLOPS（heuristic 最优）、
+   resid 38.9T（BIAS+beta 约束下实测最优）。FF1 受 erf/tanh GELU 数值
+   口径约束保留手写（321µs vs ~200µs，-0.5dB 不可接受）。
 2. 注意力时间轴在 L2 带宽墙（108% @T=1151），指令侧剩 softmax 本质
    开销；宽 tile/主序重排/Q 寄存器化共 6 次结构实验全部证伪。
-3. 小头：glu_scatter 0.6ms、mask_apply 0.8ms、rope_k16 1.3ms。
+3. 小头：mask 两级分组 GEMM 2.9ms（62 组变宽结构，cublasLt 不适用，
+   需 pad 重构）、rmsnorm_gates 1.8ms、glu/apply/rope ~2ms。
