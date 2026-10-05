@@ -228,6 +228,19 @@ ncu（32 距离 flash）：时间轴 2.54 ms/launch，L2 82.9%、DRAM 70.7%
   行距同源的 ~4× 惩罚）。GEMM 的冲突优化第三次证伪（33 距离、词级
   swizzle 的复杂形态、chunk swizzle），仅 flash 的简单 XOR 形式可用。
 
+### 第 31 轮终局：GEMM 词级 XOR swizzle —— 1.64× 达成
+
+- **全部 f16 GEMM 内核的 shared 读写改用词级 XOR swizzle**
+  （w' = w ^ (row & 7)，纯 pow2 运算、行距保持 32）：
+  87.0 → **73.5 ms（1.643×，RTF 0.0245，SNR 80.99）**。
+- 关键教训（三次实验的完整故事）：
+  1. 33/9 字行距 → ~5× 编译惩罚（第 24 轮）；
+  2. chunk 级 swizzle（移位+掩码复合表达式）→ 360 ms，同样惩罚；
+  3. **纯 w ^ (r & 7) 简单形式 → 零惩罚，8 路 bank 冲突消除**。
+  惩罚的根源是复杂地址表达式破坏代码生成，而非 swizzle 本身。
+- 最终分布（每前向）：注意力 33.0（44%）、residual 12.1、qkv 11.1、
+  gelu 9.0、mask 4.9、rmsnorm 2.9、misc 1.4。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
