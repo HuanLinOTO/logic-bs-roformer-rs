@@ -136,6 +136,17 @@ mask 两级   8.3 ms / ~90 GFLOP ≈ 11 TFLOP/s
    **116.3 ms**：gather 延迟本已被 warp 级 MLP 掩盖，cp.async 逐块
    issue 反而更贵。qkv16 基础设施保留在 git 历史中可复用。
 
+### 第 26 轮补充
+
+- **128 行 q-tile flash（32 字行距）**：114.4 ms（比 64 行差 7 ms）。
+  第三次确认 64 行 / 128 线程是该内核在此工具链的最优几何。
+- **GEMM 认知校准**：基线 nsys 复核显示 PyTorch 的 cuBLAS SGEMM 在同
+  形状上同样只有 ~17 TFLOP/s（58.5 ms GEMM / ~1000 GFLOP）——我们的
+  f16 内核（16 TFLOP/s）已处于同工作量 parity，并非工具链短板；该
+  工作负载（M=16058 高瘦、K=256/512）在 3080 上就是 L2/布局受限。
+  剩余差距在注意力：flash 38.6 ms（1.63 TFLOP/s）vs PyTorch fmha
+  24.6 ms（2.56 TFLOP/s）。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
