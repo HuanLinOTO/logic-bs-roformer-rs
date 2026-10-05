@@ -2150,9 +2150,8 @@ mod gpu_kernels {
                     };
                     let sa = std::ptr::addr_of_mut!(SA) as *mut u32;
                     for q in 0..4usize {
-                        let w = c4 * 4 + q;
                         // SAFETY: word index < 32 by construction.
-                        *sa.add(r * 32 + (w ^ (r & 7))) = vals[q];
+                        *sa.add(r * 32 + ((c4 ^ (r & 7)) * 4 + q)) = vals[q];
                     }
                 }
                 // B: pre-packed f16x2 words, 2 chunks per thread (halves
@@ -2172,31 +2171,37 @@ mod gpu_kernels {
                     };
                     let sb = std::ptr::addr_of_mut!(SB) as *mut u32;
                     for q in 0..4usize {
-                        let w = c4 * 4 + q;
-                        *sb.add(col * 32 + (w ^ (col & 7))) = vals[q];
+                        *sb.add(col * 32 + ((c4 ^ (col & 7)) * 4 + q)) = vals[q];
                     }
                 }
             }
             thread::sync_threads();
             for kk in 0..4usize {
                 let word = kk * 8;
-                let mut a = [0u32; 4];
+                // ldmatrix lane addresses are 16B-aligned swizzled row heads
+                // inside SA/SB (rows < 128/64, words < 32 by construction).
                 unsafe {
-                    let r0 = warp_id * 16 + group;
-                    let r1 = r0 + 8;
-                    a[0] = SA[r0 * 32 + ((word + tig) ^ (r0 & 7))];
-                    a[1] = SA[r1 * 32 + ((word + tig) ^ (r1 & 7))];
-                    a[2] = SA[r0 * 32 + ((word + tig + 4) ^ (r0 & 7))];
-                    a[3] = SA[r1 * 32 + ((word + tig + 4) ^ (r1 & 7))];
-                }
-                for nt in 0..8usize {
-                    let mut b = [0u32; 2];
-                    unsafe {
-                        let brow = nt * 8 + group;
-                        b[0] = SB[brow * 32 + ((word + tig) ^ (brow & 7))];
-                        b[1] = SB[brow * 32 + ((word + tig + 4) ^ (brow & 7))];
+                    let sa = std::ptr::addr_of_mut!(SA) as *const u32;
+                    let sb = std::ptr::addr_of_mut!(SB) as *const u32;
+                    // A 16x16 f16 tile via x4: matrix0..3 = {m0-7 k0-7, m8-15 k0-7,
+                    // m0-7 k8-15, m8-15 k8-15}, matching mma A {a0..a3}.
+                    let arow = warp_id * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+                    let akh = if lane >= 16 { 4 } else { 0 };
+                    let a: [u32; 4] = wmma::ldmatrix_x4(
+                        sa.add(arow * 32 + ((((word + akh) >> 2) ^ (arow & 7)) << 2)),
+                    );
+                    for j in 0..4usize {
+                        // B: two n8 tiles per x4 (SB is [n][k] row-major, whose
+                        // non-trans lane distribution IS the mma B fragment).
+                        // matrix0..3 = {n-lo k-lo, n-lo k-hi, n-hi k-lo, n-hi k-hi}.
+                        let bcol = j * 16 + (lane & 7) + if lane >= 16 { 8 } else { 0 };
+                        let bkh = if ((lane >> 3) & 1) == 1 { 4 } else { 0 };
+                        let bb: [u32; 4] = wmma::ldmatrix_x4(
+                            sb.add(bcol * 32 + ((((word + bkh) >> 2) ^ (bcol & 7)) << 2)),
+                        );
+                        acc[j * 2] = wmma::mma_m16n8k16_f32_f16(acc[j * 2], a, [bb[0], bb[1]]);
+                        acc[j * 2 + 1] = wmma::mma_m16n8k16_f32_f16(acc[j * 2 + 1], a, [bb[2], bb[3]]);
                     }
-                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
                 }
             }
             thread::sync_threads();
@@ -2376,9 +2381,8 @@ mod gpu_kernels {
                     };
                     let sa = std::ptr::addr_of_mut!(SA) as *mut u32;
                     for q in 0..4usize {
-                        let w = c4 * 4 + q;
                         // SAFETY: word index < 32 by construction.
-                        *sa.add(r * 32 + (w ^ (r & 7))) = vals[q];
+                        *sa.add(r * 32 + ((c4 ^ (r & 7)) * 4 + q)) = vals[q];
                     }
                 }
                 // B: f16x2 words, 2 chunks per thread.
@@ -2396,33 +2400,37 @@ mod gpu_kernels {
                     };
                     let sb = std::ptr::addr_of_mut!(SB) as *mut u32;
                     for q in 0..4usize {
-                        let w = c4 * 4 + q;
-                        *sb.add(col * 32 + (w ^ (col & 7))) = vals[q];
+                        *sb.add(col * 32 + ((c4 ^ (col & 7)) * 4 + q)) = vals[q];
                     }
                 }
             }
             thread::sync_threads();
             for kk in 0..4usize {
                 let word = kk * 8;
-                let mut a = [0u32; 4];
-                // SAFETY: rows < 128, words < 32 inside SA.
+                // ldmatrix lane addresses are 16B-aligned swizzled row heads
+                // inside SA/SB (rows < 128/64, words < 32 by construction).
                 unsafe {
-                    let r0 = warp_id * 16 + group;
-                    let r1 = r0 + 8;
-                    a[0] = SA[r0 * 32 + ((word + tig) ^ (r0 & 7))];
-                    a[1] = SA[r1 * 32 + ((word + tig) ^ (r1 & 7))];
-                    a[2] = SA[r0 * 32 + ((word + tig + 4) ^ (r0 & 7))];
-                    a[3] = SA[r1 * 32 + ((word + tig + 4) ^ (r1 & 7))];
-                }
-                for nt in 0..8usize {
-                    let mut b = [0u32; 2];
-                    // SAFETY: cols < 64, words < 32 inside SB.
-                    unsafe {
-                        let brow = nt * 8 + group;
-                        b[0] = SB[brow * 32 + ((word + tig) ^ (brow & 7))];
-                        b[1] = SB[brow * 32 + ((word + tig + 4) ^ (brow & 7))];
+                    let sa = std::ptr::addr_of_mut!(SA) as *const u32;
+                    let sb = std::ptr::addr_of_mut!(SB) as *const u32;
+                    // A 16x16 f16 tile via x4: matrix0..3 = {m0-7 k0-7, m8-15 k0-7,
+                    // m0-7 k8-15, m8-15 k8-15}, matching mma A {a0..a3}.
+                    let arow = warp_id * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+                    let akh = if lane >= 16 { 4 } else { 0 };
+                    let a: [u32; 4] = wmma::ldmatrix_x4(
+                        sa.add(arow * 32 + ((((word + akh) >> 2) ^ (arow & 7)) << 2)),
+                    );
+                    for j in 0..4usize {
+                        // B: two n8 tiles per x4 (SB is [n][k] row-major, whose
+                        // non-trans lane distribution IS the mma B fragment).
+                        // matrix0..3 = {n-lo k-lo, n-lo k-hi, n-hi k-lo, n-hi k-hi}.
+                        let bcol = j * 16 + (lane & 7) + if lane >= 16 { 8 } else { 0 };
+                        let bkh = if ((lane >> 3) & 1) == 1 { 4 } else { 0 };
+                        let bb: [u32; 4] = wmma::ldmatrix_x4(
+                            sb.add(bcol * 32 + ((((word + bkh) >> 2) ^ (bcol & 7)) << 2)),
+                        );
+                        acc[j * 2] = wmma::mma_m16n8k16_f32_f16(acc[j * 2], a, [bb[0], bb[1]]);
+                        acc[j * 2 + 1] = wmma::mma_m16n8k16_f32_f16(acc[j * 2 + 1], a, [bb[2], bb[3]]);
                     }
-                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
                 }
             }
             thread::sync_threads();
@@ -2499,8 +2507,7 @@ mod gpu_kernels {
                     };
                     let sa = std::ptr::addr_of_mut!(SA) as *mut u32;
                     for q in 0..4usize {
-                        let w = c4 * 4 + q;
-                        *sa.add(r * 32 + (w ^ (r & 7))) = vals[q];
+                        *sa.add(r * 32 + ((c4 ^ (r & 7)) * 4 + q)) = vals[q];
                     }
                 }
                 // B: 64 columns x 8 chunks, 2 per thread.
@@ -2518,33 +2525,37 @@ mod gpu_kernels {
                     };
                     let sb = std::ptr::addr_of_mut!(SB) as *mut u32;
                     for q in 0..4usize {
-                        let w = c4 * 4 + q;
-                        *sb.add(col * 32 + (w ^ (col & 7))) = vals[q];
+                        *sb.add(col * 32 + ((c4 ^ (col & 7)) * 4 + q)) = vals[q];
                     }
                 }
             }
             thread::sync_threads();
             for kk in 0..4usize {
                 let word = kk * 8;
-                let mut a = [0u32; 4];
-                // SAFETY: rows < 128, words < 32 inside SA.
+                // ldmatrix lane addresses are 16B-aligned swizzled row heads
+                // inside SA/SB (rows < 128/64, words < 32 by construction).
                 unsafe {
-                    let r0 = warp_id * 16 + group;
-                    let r1 = r0 + 8;
-                    a[0] = SA[r0 * 32 + ((word + tig) ^ (r0 & 7))];
-                    a[1] = SA[r1 * 32 + ((word + tig) ^ (r1 & 7))];
-                    a[2] = SA[r0 * 32 + ((word + tig + 4) ^ (r0 & 7))];
-                    a[3] = SA[r1 * 32 + ((word + tig + 4) ^ (r1 & 7))];
-                }
-                for nt in 0..8usize {
-                    let mut b = [0u32; 2];
-                    // SAFETY: cols < 64, words < 32 inside SB.
-                    unsafe {
-                        let brow = nt * 8 + group;
-                        b[0] = SB[brow * 32 + ((word + tig) ^ (brow & 7))];
-                        b[1] = SB[brow * 32 + ((word + tig + 4) ^ (brow & 7))];
+                    let sa = std::ptr::addr_of_mut!(SA) as *const u32;
+                    let sb = std::ptr::addr_of_mut!(SB) as *const u32;
+                    // A 16x16 f16 tile via x4: matrix0..3 = {m0-7 k0-7, m8-15 k0-7,
+                    // m0-7 k8-15, m8-15 k8-15}, matching mma A {a0..a3}.
+                    let arow = warp_id * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+                    let akh = if lane >= 16 { 4 } else { 0 };
+                    let a: [u32; 4] = wmma::ldmatrix_x4(
+                        sa.add(arow * 32 + ((((word + akh) >> 2) ^ (arow & 7)) << 2)),
+                    );
+                    for j in 0..4usize {
+                        // B: two n8 tiles per x4 (SB is [n][k] row-major, whose
+                        // non-trans lane distribution IS the mma B fragment).
+                        // matrix0..3 = {n-lo k-lo, n-lo k-hi, n-hi k-lo, n-hi k-hi}.
+                        let bcol = j * 16 + (lane & 7) + if lane >= 16 { 8 } else { 0 };
+                        let bkh = if ((lane >> 3) & 1) == 1 { 4 } else { 0 };
+                        let bb: [u32; 4] = wmma::ldmatrix_x4(
+                            sb.add(bcol * 32 + ((((word + bkh) >> 2) ^ (bcol & 7)) << 2)),
+                        );
+                        acc[j * 2] = wmma::mma_m16n8k16_f32_f16(acc[j * 2], a, [bb[0], bb[1]]);
+                        acc[j * 2 + 1] = wmma::mma_m16n8k16_f32_f16(acc[j * 2 + 1], a, [bb[2], bb[3]]);
                     }
-                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
                 }
             }
             thread::sync_threads();
@@ -4199,8 +4210,7 @@ mod gpu_kernels {
                     };
                     let sa = std::ptr::addr_of_mut!(SA) as *mut u32;
                     for q in 0..4usize {
-                        let w = c4 * 4 + q;
-                        *sa.add(r * 32 + (w ^ (r & 7))) = vals[q];
+                        *sa.add(r * 32 + ((c4 ^ (r & 7)) * 4 + q)) = vals[q];
                     }
                 }
                 // B: pre-packed f16x2 words, 2 chunks per thread.
@@ -4219,8 +4229,7 @@ mod gpu_kernels {
                     };
                     let sb = std::ptr::addr_of_mut!(SB) as *mut u32;
                     for q in 0..4usize {
-                        let w = c4 * 4 + q;
-                        *sb.add(col * 32 + (w ^ (col & 7))) = vals[q];
+                        *sb.add(col * 32 + ((c4 ^ (col & 7)) * 4 + q)) = vals[q];
                     }
                 }
             }
@@ -4229,25 +4238,30 @@ mod gpu_kernels {
             // Four K=16 MMA steps per shared-memory barrier.
             for kk in 0..4usize {
                 let word = kk * 8;
-                let mut a = [0u32; 4];
-                // SAFETY: rows < 128, words < 32 inside SA.
+                // ldmatrix lane addresses are 16B-aligned swizzled row heads
+                // inside SA/SB (rows < 128/64, words < 32 by construction).
                 unsafe {
-                    let r0 = warp_id * 16 + group;
-                    let r1 = r0 + 8;
-                    a[0] = SA[r0 * 32 + ((word + tig) ^ (r0 & 7))];
-                    a[1] = SA[r1 * 32 + ((word + tig) ^ (r1 & 7))];
-                    a[2] = SA[r0 * 32 + ((word + tig + 4) ^ (r0 & 7))];
-                    a[3] = SA[r1 * 32 + ((word + tig + 4) ^ (r1 & 7))];
-                }
-                for nt in 0..8usize {
-                    let mut b = [0u32; 2];
-                    // SAFETY: cols < 64, words < 32 inside SB.
-                    unsafe {
-                        let brow = nt * 8 + group;
-                        b[0] = SB[brow * 32 + ((word + tig) ^ (brow & 7))];
-                        b[1] = SB[brow * 32 + ((word + tig + 4) ^ (brow & 7))];
+                    let sa = std::ptr::addr_of_mut!(SA) as *const u32;
+                    let sb = std::ptr::addr_of_mut!(SB) as *const u32;
+                    // A 16x16 f16 tile via x4: matrix0..3 = {m0-7 k0-7, m8-15 k0-7,
+                    // m0-7 k8-15, m8-15 k8-15}, matching mma A {a0..a3}.
+                    let arow = warp_id * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+                    let akh = if lane >= 16 { 4 } else { 0 };
+                    let a: [u32; 4] = wmma::ldmatrix_x4(
+                        sa.add(arow * 32 + ((((word + akh) >> 2) ^ (arow & 7)) << 2)),
+                    );
+                    for j in 0..4usize {
+                        // B: two n8 tiles per x4 (SB is [n][k] row-major, whose
+                        // non-trans lane distribution IS the mma B fragment).
+                        // matrix0..3 = {n-lo k-lo, n-lo k-hi, n-hi k-lo, n-hi k-hi}.
+                        let bcol = j * 16 + (lane & 7) + if lane >= 16 { 8 } else { 0 };
+                        let bkh = if ((lane >> 3) & 1) == 1 { 4 } else { 0 };
+                        let bb: [u32; 4] = wmma::ldmatrix_x4(
+                            sb.add(bcol * 32 + ((((word + bkh) >> 2) ^ (bcol & 7)) << 2)),
+                        );
+                        acc[j * 2] = wmma::mma_m16n8k16_f32_f16(acc[j * 2], a, [bb[0], bb[1]]);
+                        acc[j * 2 + 1] = wmma::mma_m16n8k16_f32_f16(acc[j * 2 + 1], a, [bb[2], bb[3]]);
                     }
-                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
                 }
             }
             thread::sync_threads();
@@ -4344,8 +4358,7 @@ mod gpu_kernels {
                     };
                     let sa = std::ptr::addr_of_mut!(SA) as *mut u32;
                     for q in 0..4usize {
-                        let w = c4 * 4 + q;
-                        *sa.add(r * 32 + (w ^ (r & 7))) = vals[q];
+                        *sa.add(r * 32 + ((c4 ^ (r & 7)) * 4 + q)) = vals[q];
                     }
                 }
                 // B: pre-packed f16x2 words, 2 chunks per thread.
@@ -4364,8 +4377,7 @@ mod gpu_kernels {
                     };
                     let sb = std::ptr::addr_of_mut!(SB) as *mut u32;
                     for q in 0..4usize {
-                        let w = c4 * 4 + q;
-                        *sb.add(col * 32 + (w ^ (col & 7))) = vals[q];
+                        *sb.add(col * 32 + ((c4 ^ (col & 7)) * 4 + q)) = vals[q];
                     }
                 }
             }
@@ -4373,25 +4385,30 @@ mod gpu_kernels {
 
             for kk in 0..4usize {
                 let word = kk * 8;
-                let mut a = [0u32; 4];
-                // SAFETY: rows < 128, words < 32 inside SA.
+                // ldmatrix lane addresses are 16B-aligned swizzled row heads
+                // inside SA/SB (rows < 128/64, words < 32 by construction).
                 unsafe {
-                    let r0 = warp_id * 16 + group;
-                    let r1 = r0 + 8;
-                    a[0] = SA[r0 * 32 + ((word + tig) ^ (r0 & 7))];
-                    a[1] = SA[r1 * 32 + ((word + tig) ^ (r1 & 7))];
-                    a[2] = SA[r0 * 32 + ((word + tig + 4) ^ (r0 & 7))];
-                    a[3] = SA[r1 * 32 + ((word + tig + 4) ^ (r1 & 7))];
-                }
-                for nt in 0..8usize {
-                    let mut b = [0u32; 2];
-                    // SAFETY: cols < 64, words < 32 inside SB.
-                    unsafe {
-                        let brow = nt * 8 + group;
-                        b[0] = SB[brow * 32 + ((word + tig) ^ (brow & 7))];
-                        b[1] = SB[brow * 32 + ((word + tig + 4) ^ (brow & 7))];
+                    let sa = std::ptr::addr_of_mut!(SA) as *const u32;
+                    let sb = std::ptr::addr_of_mut!(SB) as *const u32;
+                    // A 16x16 f16 tile via x4: matrix0..3 = {m0-7 k0-7, m8-15 k0-7,
+                    // m0-7 k8-15, m8-15 k8-15}, matching mma A {a0..a3}.
+                    let arow = warp_id * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+                    let akh = if lane >= 16 { 4 } else { 0 };
+                    let a: [u32; 4] = wmma::ldmatrix_x4(
+                        sa.add(arow * 32 + ((((word + akh) >> 2) ^ (arow & 7)) << 2)),
+                    );
+                    for j in 0..4usize {
+                        // B: two n8 tiles per x4 (SB is [n][k] row-major, whose
+                        // non-trans lane distribution IS the mma B fragment).
+                        // matrix0..3 = {n-lo k-lo, n-lo k-hi, n-hi k-lo, n-hi k-hi}.
+                        let bcol = j * 16 + (lane & 7) + if lane >= 16 { 8 } else { 0 };
+                        let bkh = if ((lane >> 3) & 1) == 1 { 4 } else { 0 };
+                        let bb: [u32; 4] = wmma::ldmatrix_x4(
+                            sb.add(bcol * 32 + ((((word + bkh) >> 2) ^ (bcol & 7)) << 2)),
+                        );
+                        acc[j * 2] = wmma::mma_m16n8k16_f32_f16(acc[j * 2], a, [bb[0], bb[1]]);
+                        acc[j * 2 + 1] = wmma::mma_m16n8k16_f32_f16(acc[j * 2 + 1], a, [bb[2], bb[3]]);
                     }
-                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
                 }
             }
             thread::sync_threads();
