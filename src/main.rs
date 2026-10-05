@@ -2677,8 +2677,7 @@ mod gpu_kernels {
         // codegen penalty that dwarfs the 8-way bank conflicts they would fix.
         static mut SQ: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT; // [q row][d word]
         static mut SK: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT; // [key][d word]
-        static mut SV: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT; // [key][d word] row-major staging
-        static mut SVt: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT; // [dim][key word] transposed
+        static mut SV: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT; // [key][d word] row-major
 
         let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id() as usize;
@@ -2754,25 +2753,6 @@ mod gpu_kernels {
                     let v0 = if key < n_size { qkv[token_of(key) * 1536 + 1024 + head * 64 + w * 2] } else { 0.0 };
                     let v1 = if key < n_size { qkv[token_of(key) * 1536 + 1024 + head * 64 + w * 2 + 1] } else { 0.0 };
                     SV[k * 32 + w] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                }
-            }
-            thread::sync_threads();
-            // Transpose V into [dim][key-word] layout in shared so PV B
-            // fragments need exactly one word per operand half.
-            // SAFETY: SV reads see completed stores (sync above).
-            unsafe {
-                for i in 0..16usize {
-                    let idx = tid + i * 128;
-                    let d = idx / 32;
-                    let w = idx % 32;
-                    let dw = d / 2;
-                    let w0 = SV[(2 * w) * 32 + dw];
-                    let w1 = SV[(2 * w + 1) * 32 + dw];
-                    SVt[d * 32 + w] = if d % 2 == 0 {
-                        (w0 & 0xFFFF) | ((w1 & 0xFFFF) << 16)
-                    } else {
-                        (w0 >> 16) | ((w1 >> 16) << 16)
-                    };
                 }
             }
             thread::sync_threads();
@@ -2866,12 +2846,26 @@ mod gpu_kernels {
                 }
                 for nt in 0..8usize {
                     let mut bb = [0u32; 2];
-                    // B fragment from the transposed tile: one word per half.
-                    // SAFETY: dim row < 64, word < 32.
+                    // b packs V[k][n], V[k+1][n] for k = 16kf+2tig (b1 +8):
+                    // integer half-word selects from row-major SV, no
+                    // shared-memory transpose pass needed.
+                    // SAFETY: key rows < 64, word < 32 inside SV.
                     unsafe {
-                        let kw = (nt * 8 + group) * 32 + 8 * kf;
-                        bb[0] = SVt[kw + tig];
-                        bb[1] = SVt[kw + tig + 4];
+                        let n = nt * 8 + group;
+                        let nw = n / 2;
+                        let hi_half = n % 2 == 1;
+                        let kr = (16 * kf + 2 * tig) * 32 + nw;
+                        let w0 = SV[kr];
+                        let w1 = SV[kr + 32];
+                        let w2 = SV[kr + 8 * 32];
+                        let w3 = SV[kr + 9 * 32];
+                        if hi_half {
+                            bb[0] = (w0 >> 16) | ((w1 >> 16) << 16);
+                            bb[1] = (w2 >> 16) | ((w3 >> 16) << 16);
+                        } else {
+                            bb[0] = (w0 & 0xFFFF) | ((w1 & 0xFFFF) << 16);
+                            bb[1] = (w2 & 0xFFFF) | ((w3 & 0xFFFF) << 16);
+                        }
                     }
                     acc_pv[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc_pv[nt], a, bb) };
                 }
