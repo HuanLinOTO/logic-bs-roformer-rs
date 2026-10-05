@@ -2092,29 +2092,39 @@ mod gpu_kernels {
         for ks in 0..num_k {
             let k_base = ks * 64;
             unsafe {
-                // 128 rows x 32 K-pairs = 4096 assignments, 16 per thread.
-                for i in 0..16usize {
-                    let idx = tid + i * 256;
-                    let r = idx / 32;
-                    let kp = idx % 32;
-                    let xr = block_row_base + r;
-                    let k0 = k_base + kp * 2;
-                    let k1 = k0 + 1;
-                    let v0 = if xr < m_size && k0 < k_size { x[xr * k_size + k0] } else { 0.0 };
-                    let v1 = if xr < m_size && k1 < k_size { x[xr * k_size + k1] } else { 0.0 };
-                    SA[r * 32 + kp] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                }
-                // 64 columns x 32 K-pairs = 2048 assignments, 8 per thread.
+                // A: 128 rows x 16 float4, 8 per thread (16 B aligned).
                 for i in 0..8usize {
                     let idx = tid + i * 256;
-                    let col = idx / 32;
-                    let kp = idx % 32;
+                    let r = idx / 16;
+                    let q4 = idx % 16;
+                    let xr = block_row_base + r;
+                    let k0 = k_base + q4 * 4;
+                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    if xr < m_size && k0 + 3 < k_size {
+                        // SAFETY: k0 % 4 == 0 gives 16 B alignment.
+                        let src = x.as_ptr().add(xr * k_size + k0);
+                        let v: [f32; 4] = *(src as *const [f32; 4]);
+                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    }
+                    SA[r * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SA[r * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                }
+                // B: 64 columns x 16 float4, 4 per thread.
+                for i in 0..4usize {
+                    let idx = tid + i * 256;
+                    let col = idx / 16;
+                    let q4 = idx % 16;
                     let bc = col_base + col;
-                    let k0 = k_base + kp * 2;
-                    let k1 = k0 + 1;
-                    let v0 = if bc < n_size && k0 < k_size { w[bc * k_size + k0] } else { 0.0 };
-                    let v1 = if bc < n_size && k1 < k_size { w[bc * k_size + k1] } else { 0.0 };
-                    SB[col * 32 + kp] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    let k0 = k_base + q4 * 4;
+                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    if bc < n_size && k0 + 3 < k_size {
+                        // SAFETY: same 16 B alignment argument as A.
+                        let src = w.as_ptr().add(bc * k_size + k0);
+                        let v: [f32; 4] = *(src as *const [f32; 4]);
+                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    }
+                    SB[col * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SB[col * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
@@ -2193,29 +2203,39 @@ mod gpu_kernels {
         for ks in 0..num_k {
             let k_base = ks * 64;
             unsafe {
-                // 128 rows x 32 K-pairs = 4096 assignments, 16 per thread.
-                for i in 0..16usize {
-                    let idx = tid + i * 256;
-                    let r = idx / 32;
-                    let kp = idx % 32;
-                    let xr = block_row_base + r;
-                    let k0 = k_base + kp * 2;
-                    let k1 = k0 + 1;
-                    let v0 = if xr < m_size && k0 < k_size { x[xr * k_size + k0] } else { 0.0 };
-                    let v1 = if xr < m_size && k1 < k_size { x[xr * k_size + k1] } else { 0.0 };
-                    SA[r * 32 + kp] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                }
-                // 64 columns x 32 K-pairs = 2048 assignments, 8 per thread.
+                // A: 128 rows x 16 float4, 8 per thread (16 B aligned).
                 for i in 0..8usize {
                     let idx = tid + i * 256;
-                    let col = idx / 32;
-                    let kp = idx % 32;
+                    let r = idx / 16;
+                    let q4 = idx % 16;
+                    let xr = block_row_base + r;
+                    let k0 = k_base + q4 * 4;
+                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    if xr < m_size && k0 + 3 < k_size {
+                        // SAFETY: k0 % 4 == 0 gives 16 B alignment.
+                        let src = x.as_ptr().add(xr * k_size + k0);
+                        let v: [f32; 4] = *(src as *const [f32; 4]);
+                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    }
+                    SA[r * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SA[r * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                }
+                // B: 64 columns x 16 float4, 4 per thread.
+                for i in 0..4usize {
+                    let idx = tid + i * 256;
+                    let col = idx / 16;
+                    let q4 = idx % 16;
                     let bc = col_base + col;
-                    let k0 = k_base + kp * 2;
-                    let k1 = k0 + 1;
-                    let v0 = if bc < n_size && k0 < k_size { w[bc * k_size + k0] } else { 0.0 };
-                    let v1 = if bc < n_size && k1 < k_size { w[bc * k_size + k1] } else { 0.0 };
-                    SB[col * 32 + kp] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    let k0 = k_base + q4 * 4;
+                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    if bc < n_size && k0 + 3 < k_size {
+                        // SAFETY: same 16 B alignment argument as A.
+                        let src = w.as_ptr().add(bc * k_size + k0);
+                        let v: [f32; 4] = *(src as *const [f32; 4]);
+                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    }
+                    SB[col * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SB[col * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
