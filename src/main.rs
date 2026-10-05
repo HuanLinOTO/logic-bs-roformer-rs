@@ -2226,6 +2226,127 @@ mod gpu_kernels {
         }
     }
 
+    /// FP16 tensor-core GEMM, 128x128 tile / 512 threads (4x4 warps of 32x32).
+    /// Same per-element k accumulation chain as gemm_f16_128x64_hout (k-tiles
+    /// in order, one mma per 16-k step), so outputs are bitwise identical,
+    /// while halving A global-load traffic (column blocks halve) and shared
+    /// fragment loads per output element.
+    #[kernel]
+    pub fn gemm_f16_hout_128x128(
+        m: u32, n: u32, k: u32,
+        x: &[u32], w: &[u32], bias: &[f32],
+        mut y: DisjointSlice<u32>,
+    ) {
+        static mut SA: SharedArray<u32, { 128 * 32 }> = SharedArray::UNINIT;
+        static mut SB: SharedArray<u32, { 128 * 32 }> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let warp_id = tid / 32;
+        let group = lane / 4;
+        let tig = lane % 4;
+        let block_row_base = thread::blockIdx_y() as usize * 128;
+        let block_col_base = thread::blockIdx_x() as usize * 128;
+        let row_base = block_row_base + (warp_id / 4) * 32;
+        let col_base = block_col_base + (warp_id % 4) * 32;
+        let (m_size, n_size, k_size) = (m as usize, n as usize, k as usize);
+        let mut acc = [[0.0f32; 4]; 8];
+        let num_k = k_size.div_ceil(64);
+        for ks in 0..num_k {
+            let k_base = ks * 64;
+            unsafe {
+                let sa = std::ptr::addr_of_mut!(SA) as *mut u32;
+                let sb = std::ptr::addr_of_mut!(SB) as *mut u32;
+                // A: 128 rows x 8 chunks, 2 per thread.
+                for i in 0..2usize {
+                    let idx = tid + i * 512;
+                    let r = idx / 8;
+                    let c4 = idx % 8;
+                    let xr = block_row_base + r;
+                    // SAFETY: 16 B aligned words in SA; row stride k/2 words
+                    // (a multiple of four).
+                    let vals: [u32; 4] = if xr < m_size {
+                        let src = x.as_ptr().add(xr * (k_size / 2) + k_base / 2 + c4 * 4);
+                        *(src as *const [u32; 4])
+                    } else {
+                        [0; 4]
+                    };
+                    for q in 0..4usize {
+                        *sa.add(r * 32 + ((c4 ^ (r & 7)) * 4 + q)) = vals[q];
+                    }
+                }
+                // B: 128 cols x 8 chunks, 2 per thread.
+                for i in 0..2usize {
+                    let idx = tid + i * 512;
+                    let col = idx / 8;
+                    let c4 = idx % 8;
+                    let bc = block_col_base + col;
+                    let vals: [u32; 4] = if bc < n_size {
+                        let src = w.as_ptr().add(bc * (k_size / 2) + k_base / 2 + c4 * 4);
+                        *(src as *const [u32; 4])
+                    } else {
+                        [0; 4]
+                    };
+                    for q in 0..4usize {
+                        *sb.add(col * 32 + ((c4 ^ (col & 7)) * 4 + q)) = vals[q];
+                    }
+                }
+            }
+            thread::sync_threads();
+            for kk in 0..4usize {
+                let word = kk * 8;
+                // ldmatrix lane addresses are 16B-aligned swizzled chunk heads
+                // inside SA/SB (rows/cols < 128, chunks < 8).
+                unsafe {
+                    let sa = std::ptr::addr_of_mut!(SA) as *const u32;
+                    let sb = std::ptr::addr_of_mut!(SB) as *const u32;
+                    for ah in 0..2usize {
+                        let arow = (warp_id / 4) * 32 + ah * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+                        let akh = if lane >= 16 { 4 } else { 0 };
+                        let a: [u32; 4] = wmma::ldmatrix_x4(
+                            sa.add(arow * 32 + ((((word + akh) >> 2) ^ (arow & 7)) << 2)),
+                        );
+                        for j in 0..2usize {
+                            let bcol = (warp_id % 4) * 32 + j * 16 + (lane & 7) + if lane >= 16 { 8 } else { 0 };
+                            let bkh = if ((lane >> 3) & 1) == 1 { 4 } else { 0 };
+                            let bb: [u32; 4] = wmma::ldmatrix_x4(
+                                sb.add(bcol * 32 + ((((word + bkh) >> 2) ^ (bcol & 7)) << 2)),
+                            );
+                            let t = ah * 4 + j * 2;
+                            acc[t] = wmma::mma_m16n8k16_f32_f16(acc[t], a, [bb[0], bb[1]]);
+                            acc[t + 1] = wmma::mma_m16n8k16_f32_f16(acc[t + 1], a, [bb[2], bb[3]]);
+                        }
+                    }
+                }
+            }
+            thread::sync_threads();
+        }
+        let out_ptr = y.as_mut_ptr();
+        let half_n = n_size / 2;
+        for ah in 0..2usize {
+            for j in 0..2usize {
+                for half in 0..2usize {
+                    let t = ah * 4 + j * 2 + half;
+                    let cbase = col_base + j * 16 + half * 8;
+                    let cw = (cbase + tig * 2) / 2;
+                    let (b0, b1) = (bias[cbase + tig * 2], bias[cbase + tig * 2 + 1]);
+                    let r_lo = row_base + ah * 16 + group;
+                    let r_hi = r_lo + 8;
+                    if r_lo < m_size {
+                        // SAFETY: cw < half_n since n is a multiple of 128.
+                        unsafe {
+                            *out_ptr.add(r_lo * half_n + cw) = cuda_device::convert::cvt_f16x2_f32(acc[t][0] + b0, acc[t][1] + b1);
+                        }
+                    }
+                    if r_hi < m_size {
+                        unsafe {
+                            *out_ptr.add(r_hi * half_n + cw) = cuda_device::convert::cvt_f16x2_f32(acc[t][2] + b0, acc[t][3] + b1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// FP16 tensor-core GEMM, 128x64 tile / 256 threads. Inputs are fp32 in
     /// global memory; cooperative loads pack adjacent K values into f16x2.
     /// Accumulation stays f32, so accuracy is close to PyTorch's autocast path.
