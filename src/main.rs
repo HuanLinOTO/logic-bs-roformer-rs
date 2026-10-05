@@ -2673,12 +2673,12 @@ mod gpu_kernels {
         mut y: DisjointSlice<f32>,
         mut dbg_m: DisjointSlice<f32>, mut dbg_l: DisjointSlice<f32>,
     ) {
-        // Rows are padded to 33 words so warp-lane column walks hit distinct
-        // banks (32-word rows would alias every 8 lanes onto one bank).
-        static mut SQ: SharedArray<u32, { 64 * 33 }> = SharedArray::UNINIT; // [q row][d word]
-        static mut SK: SharedArray<u32, { 64 * 33 }> = SharedArray::UNINIT; // [key][d word]
-        static mut SV: SharedArray<u32, { 64 * 33 }> = SharedArray::UNINIT; // [key][d word] row-major staging
-        static mut SVt: SharedArray<u32, { 64 * 33 }> = SharedArray::UNINIT; // [dim][key word] transposed
+        // 32-word rows (power of two): non-pow2 strides trigger a ~5x
+        // codegen penalty that dwarfs the 8-way bank conflicts they would fix.
+        static mut SQ: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT; // [q row][d word]
+        static mut SK: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT; // [key][d word]
+        static mut SV: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT; // [key][d word] row-major staging
+        static mut SVt: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT; // [dim][key word] transposed
 
         let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id() as usize;
@@ -2714,7 +2714,7 @@ mod gpu_kernels {
                     v0 = (even * c - odd * sn) * 0.125;
                     v1 = (odd * c + even * sn) * 0.125;
                 }
-                SQ[r * 33 + w] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                SQ[r * 32 + w] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
             }
         }
 
@@ -2744,7 +2744,7 @@ mod gpu_kernels {
                         v0 = even * c - odd * sn;
                         v1 = odd * c + even * sn;
                     }
-                    SK[k * 33 + w] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SK[k * 32 + w] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
                 }
                 for i in 0..16usize {
                     let idx = tid + i * 128;
@@ -2753,7 +2753,7 @@ mod gpu_kernels {
                     let key = kt + k;
                     let v0 = if key < n_size { qkv[token_of(key) * 1536 + 1024 + head * 64 + w * 2] } else { 0.0 };
                     let v1 = if key < n_size { qkv[token_of(key) * 1536 + 1024 + head * 64 + w * 2 + 1] } else { 0.0 };
-                    SV[k * 33 + w] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SV[k * 32 + w] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
                 }
             }
             thread::sync_threads();
@@ -2766,9 +2766,9 @@ mod gpu_kernels {
                     let d = idx / 32;
                     let w = idx % 32;
                     let dw = d / 2;
-                    let w0 = SV[(2 * w) * 33 + dw];
-                    let w1 = SV[(2 * w + 1) * 33 + dw];
-                    SVt[d * 33 + w] = if d % 2 == 0 {
+                    let w0 = SV[(2 * w) * 32 + dw];
+                    let w1 = SV[(2 * w + 1) * 32 + dw];
+                    SVt[d * 32 + w] = if d % 2 == 0 {
                         (w0 & 0xFFFF) | ((w1 & 0xFFFF) << 16)
                     } else {
                         (w0 >> 16) | ((w1 >> 16) << 16)
@@ -2787,16 +2787,16 @@ mod gpu_kernels {
                 let mut a = [0u32; 4];
                 // SAFETY: r0/r1 < 128, word index 8j+tig(+4) < 32.
                 unsafe {
-                    a[0] = SQ[r0 * 33 + 8 * j + tig];
-                    a[1] = SQ[r1 * 33 + 8 * j + tig];
-                    a[2] = SQ[r0 * 33 + 8 * j + tig + 4];
-                    a[3] = SQ[r1 * 33 + 8 * j + tig + 4];
+                    a[0] = SQ[r0 * 32 + 8 * j + tig];
+                    a[1] = SQ[r1 * 32 + 8 * j + tig];
+                    a[2] = SQ[r0 * 32 + 8 * j + tig + 4];
+                    a[3] = SQ[r1 * 32 + 8 * j + tig + 4];
                 }
                 for nt in 0..8usize {
                     let mut bb = [0u32; 2];
                     // SAFETY: key row nt*8+group < 64, word < 32.
                     unsafe {
-                        let kw = (nt * 8 + group) * 33 + 8 * j;
+                        let kw = (nt * 8 + group) * 32 + 8 * j;
                         bb[0] = SK[kw + tig];
                         bb[1] = SK[kw + tig + 4];
                     }
@@ -2869,7 +2869,7 @@ mod gpu_kernels {
                     // B fragment from the transposed tile: one word per half.
                     // SAFETY: dim row < 64, word < 32.
                     unsafe {
-                        let kw = (nt * 8 + group) * 33 + 8 * kf;
+                        let kw = (nt * 8 + group) * 32 + 8 * kf;
                         bb[0] = SVt[kw + tig];
                         bb[1] = SVt[kw + tig + 4];
                     }
@@ -4575,28 +4575,12 @@ unsafe fn transformer_step(
     // Gates were fused into the pre-attention RMSNorm kernel.
     // 5. attention: short (freq) uses attn_short per (b,h) block; long (time)
     // uses 2-pass materialized with the batched kernels below.
-    if axis == 1 {
-        // Frequency axis (seq=62, one key tile): flash attention in a single
-        // launch, ~8x faster than the three-kernel chain.
+    {
+        let seq = if axis == 0 { t_frames } else { bands };
+        // EXPERIMENT: both axes on the (now power-of-two-stride) flash kernel.
         // SAFETY: one 128-thread block per (BH group, 64-row query tile).
         unsafe {
-            km.attn_flash_tc(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, bands.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &scratch.qkv, &scratch.cos[axis], &scratch.sin[axis], &scratch.gates, bands as u32, axis as u32, bands as u32, &mut scratch.scaled, &mut scratch.attn_max, &mut scratch.attn_scale)
-        }.map_err(|e| e.to_string())?;
-    } else {
-        // Time axis (seq=259): the materialized three-kernel chain still
-        // beats the flash kernel whose key-tile loop pays 5x sync/softmax
-        // serialization; see BENCHMARK.md.
-        // SAFETY: 64x128 FP16 tiles over [BH, N, N].
-        unsafe {
-            km.attn_qk_rope_f16(stream, cuda_core::simt::LaunchConfig { grid_dim: (n_len.div_ceil(64) as u32, n_len.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, n_len as u32, n_len as u32, 64, &scratch.qkv, &scratch.cos[axis], &scratch.sin[axis], &scratch.zero_bias_t, bands as u32, axis as u32, &mut scratch.p_big)
-        }.map_err(|e| e.to_string())?;
-        // SAFETY: one warp per score row.
-        unsafe {
-            km.softmax_stats(stream, launch1((bh * n_len * 32) as u32), &scratch.p_big, (bh * n_len) as u32, n_len as u32, &mut scratch.attn_max, &mut scratch.attn_scale)
-        }.map_err(|e| e.to_string())?;
-        // SAFETY: one 64-column FP16 tile per row block and BH group.
-        unsafe {
-            km.attn_pv_raw_f16(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, n_len.div_ceil(128) as u32, bh as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, n_len as u32, 64, n_len as u32, &scratch.p_big, &scratch.qkv, &scratch.zero_bias_64, &scratch.gates, bands as u32, axis as u32, &scratch.attn_max, &scratch.attn_scale, &mut scratch.scaled)
+            km.attn_flash_tc(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, n_len.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &scratch.qkv, &scratch.cos[axis], &scratch.sin[axis], &scratch.gates, bands as u32, axis as u32, seq as u32, &mut scratch.scaled, &mut scratch.attn_max, &mut scratch.attn_scale)
         }.map_err(|e| e.to_string())?;
     }
     // 7. gate application was fused into attn_v_to_flat; out proj reads scaled.
