@@ -16,7 +16,7 @@
 
 | 指标 | pymss | 本实现 |
 |---|---|---|
-| 整曲 wall | 9.7 s | 11.9 s（GPU 前向 **0.51 vs 0.69 s/chunk，1.35×**；host OLA 拖累） |
+| 整曲 wall | 9.7 s | **7.02 s（1.38×）**，GPU 前向 **0.50 vs 0.69 s/chunk（1.38×）**，14 chunk 全异步流水零空转 |
 | 逐 stem SNR（vs pymss fp32） | — | bass 59.2 / drums 69.6 / other 62.2 / vocals 69.3 / guitar 64.3 dB，能量加权 **63.6 dB** |
 
 最终每前向 kernel 分布：注意力 33.0ms（44%）、residual GEMM 12.1、QKV 11.1、

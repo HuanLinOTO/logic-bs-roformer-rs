@@ -248,7 +248,7 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 use cuda_core::simt::LaunchConfig;
-use cuda_core::{CudaContext, DeviceBuffer};
+use cuda_core::{CudaContext, CudaEvent, DeviceBuffer, PinnedHostBuffer};
 use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread, warp};
 use cuda_device::wmma;
 
@@ -4066,6 +4066,90 @@ mod gpu_kernels {
             *o = x[g0];
         }
     }
+
+    /// Full-song demix overlap-add, gather form (no atomics). One thread per
+    /// demix output sample j of the current chunk. The thread re-gathers the
+    /// <=4 ISTFT frames covering padded position pos = j + n_fft/2, weights
+    /// each by the window and the precomputed reciprocal window-energy
+    /// (istft_inv), applies the linear cross-fade (with the reference's
+    /// first/last-chunk border overrides), and accumulates into the
+    /// persistent result/counter buffers. Writes are disjoint: thread j is
+    /// the sole writer of {result[sc][s+j], counter[s+j]} within a launch,
+    /// and chunk launches are serialized by the single in-order stream, so
+    /// the read-modify-write accumulation is safe.
+    #[kernel]
+    pub fn ola_demix(
+        pcm: &[f32],
+        win: &[f32],
+        istft_inv: &[f32],
+        mut result: DisjointSlice<f32>,
+        mut counter: DisjointSlice<f32>,
+        t_frames: u32,
+        out_len: u32,
+        chunk_s: u32,
+        take: u32,
+        c_len: u32,
+        border: u32,
+        hop: u32,
+        n_fft: u32,
+        is_first: u32,
+        is_last: u32,
+    ) {
+        let j = thread::index_1d().get();
+        if j >= take as usize {
+            return;
+        }
+        let (t_f, out_l, s, c, b, h, nf) = (
+            t_frames as usize,
+            out_len as usize,
+            chunk_s as usize,
+            c_len as usize,
+            border as usize,
+            hop as usize,
+            n_fft as usize,
+        );
+        // linear fade with the first/last chunk border overrides (host parity)
+        let mut wf = 1.0f32;
+        if j < b {
+            wf = j as f32 / b as f32;
+        }
+        let j2 = c - 1 - j;
+        if j2 < b {
+            wf = j2 as f32 / b as f32;
+        }
+        if is_first != 0 && j < b {
+            wf = 1.0;
+        }
+        if is_last != 0 && j + b >= c {
+            wf = 1.0;
+        }
+        // fade-energy accumulator: sole writer of counter[s+j] in this launch
+        let cp = counter.as_mut_ptr();
+        // SAFETY: s + j < out_len because j < take <= out_len - s.
+        unsafe {
+            *cp.add(s + j) += wf * wf;
+        }
+        // padded chunk coordinate: frames cover [0, c + n_fft)
+        let pos = j + nf / 2;
+        let ic = istft_inv[pos];
+        if ic > 0.0 {
+            let t_last = (pos / h).min(t_f - 1);
+            let t_first = (pos.saturating_sub(nf - 1) + h - 1) / h;
+            let g = (1.0 / nf as f32) * wf * ic;
+            let rp = result.as_mut_ptr();
+            for sc in 0..12usize {
+                let mut acc = 0.0f32;
+                for t in t_first..(t_last + 1) {
+                    let n = pos - t * h;
+                    acc += pcm[(sc * t_f + t) * nf + n] * win[n];
+                }
+                // SAFETY: sc*out_l + s + j < 12*out_len by construction.
+                unsafe {
+                    *rp.add(sc * out_l + s + j) += acc * g;
+                }
+            }
+        }
+    }
 }
 
 /// STFT parity vs torch.stft (parity/stft.npz from tools/dump_refs.py).
@@ -6270,14 +6354,6 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
     let xp = reflect_pad(&wav.samples, len * 2, BORDER * 2, BORDER * 4); // interleaved: per-channel counts doubled
     let xp_len = xp.len() / 2;
     let out_len = xp_len - 2 * BORDER; // matches xp.shape[-1] - 2*border in samples
-    let mut fade = vec![0.0f32; C];
-    for i in 0..BORDER {
-        fade[i] = i as f32 / BORDER as f32;
-        fade[C - 1 - i] = i as f32 / BORDER as f32;
-    }
-    for v in fade.iter_mut().take(C).skip(BORDER).take(C - 2 * BORDER) {
-        *v = 1.0;
-    }
     let starts: Vec<usize> = {
         let mut v = Vec::new();
         let mut s = 0usize;
@@ -6374,15 +6450,14 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
     };
     let _ = &mut bufs;
 
-    let mut result = vec![0.0f32; 6 * 2 * out_len];
-    let mut demix_counter = vec![0.0f32; out_len];
-    let win = sp.window();
     // Per-chunk ISTFT window-energy counter: identical for every chunk (same
-    // frame layout), so computed once. The final normalization divides by
-    // istft_counter * demix_counter, exactly reproducing the reference
-    // (per-chunk istft normalize, then fade-weighted demix average).
-    // ISTFT window-energy counter over PADDED chunk coordinates (the C2R
-    // frames cover [0, C + 2048); the demix coordinate is pos - 1024).
+    // frame layout), so computed once and uploaded once. The GPU OLA kernel
+    // divides by it at accumulation time (the counter is chunk-relative, so a
+    // later absolute-index division would be wrong), exactly reproducing the
+    // reference (per-chunk istft normalize, then fade-weighted demix average).
+    // The counter is over PADDED chunk coordinates (the C2R frames cover
+    // [0, C + 2048); the demix coordinate is pos - 1024).
+    let win = sp.window();
     let mut istft_counter = vec![0.0f32; C + 2048];
     for t in 0..t_frames {
         for n in 0..2048usize {
@@ -6394,61 +6469,65 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
     }
     // Precomputed reciprocals turn the per-sample divide into a multiply.
     let istft_inv: Vec<f32> = istft_counter.iter().map(|&c| if c > 1e-8 { 1.0 / c } else { 0.0 }).collect();
+    let istft_inv_dev = DeviceBuffer::from_host(&stream, &istft_inv).unwrap();
 
-    let mut upload_buf = vec![0u8; 0];
-    let _ = &mut upload_buf;
+    // ---- GPU overlap-add accumulators (persistent across chunks) ----
+    let mut result_dev = DeviceBuffer::<f32>::zeroed(&stream, 12 * out_len).unwrap();
+    let mut counter_dev = DeviceBuffer::<f32>::zeroed(&stream, out_len).unwrap();
+    // Async input pipeline: two device x buffers (ping-pong) + two pinned
+    // host stagers. Each stager slot is guarded by a CUDA event recorded
+    // right after its H2D copy; the host waits on that event before
+    // refilling the slot. Everything else (forward, OLA kernel, scratch
+    // buffer reuse) is ordered by the single in-order stream, so chunk
+    // ci+1's enqueues overlap chunk ci's execution freely.
+    let mut x_spare = DeviceBuffer::<f32>::zeroed(&stream, C * 2).unwrap();
+    let mut pin: Vec<PinnedHostBuffer<f32>> = (0..2)
+        .map(|_| PinnedHostBuffer::zeroed(&ctx, C * 2).unwrap())
+        .collect();
+    let evs: Vec<CudaEvent> = (0..2).map(|_| ctx.new_event(None).unwrap()).collect();
+    for e in &evs {
+        e.record(&stream).unwrap(); // both slots start idle
+    }
+    stream.synchronize().unwrap();
+
     let total_t0 = std::time::Instant::now();
+    let mut slot = 0usize;
     for (ci, &s) in starts.iter().enumerate() {
         let chunk_t0 = std::time::Instant::now();
-        // copy chunk into x_dev (re-create the device buffer per chunk; the
-        // old one drops after the forward reads it)
-        let xi: Vec<f32> = {
-            let base = s * 2;
-            xp[base..base + C * 2].to_vec()
-        };
-        let new_x = DeviceBuffer::from_host(&stream, &xi).unwrap();
-        let old_x = std::mem::replace(&mut bufs.x_dev, new_x);
-        drop(old_x);
-        let trunk_path = if ci == 0 { Some(std::path::PathBuf::from("trunk0.bin")) } else { None };
-        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, C, t_frames, bands, trunk_path.as_deref()).expect("forward"); }
-        stream.synchronize().expect("sync");
-        let frames_out = bufs.pcm.to_host_vec(&stream).unwrap();
-        // per-chunk fade with the reference's first/last border overrides
-        let mut wfade = fade.clone();
-        if ci == 0 {
-            for v in wfade.iter_mut().take(BORDER) { *v = 1.0; }
+        // 1. wait out the previous H2D from this pinned slot
+        evs[slot].synchronize().expect("stager event");
+        // 2. stage the chunk into pinned memory (~1 ms host memcpy)
+        pin[slot].as_mut_slice().copy_from_slice(&xp[s * 2..s * 2 + C * 2]);
+        // 3. async H2D into this ping-pong x buffer, then free the slot
+        unsafe {
+            bufs.x_dev.copy_from_pinned_host_async(&stream, &pin[slot]).expect("htod");
         }
-        if ci + 1 == starts.len() {
-            for v in wfade.iter_mut().rev().take(BORDER) { *v = 1.0; }
+        evs[slot].record(&stream).expect("event record");
+        // 4. full forward (STFT -> trunk -> mask -> C2R), all stream-ordered
+        unsafe {
+            bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, C, t_frames, bands, None).expect("forward");
         }
+        // 5. GPU overlap-add into the persistent accumulators
         let take = (out_len - s).min(C);
-        for t in 0..t_frames {
-            let base_frame = t * stft::HOP;
-            for n in 0..2048usize {
-                let pos = base_frame + n;
-                // padded -> demix coordinate (center-pad trim)
-                let j = pos as isize - 1024;
-                if j >= 0 && (j as usize) < take {
-                    let ju = j as usize;
-                    // Normalize by this chunk's ISTFT window energy AT
-                    // ACCUMULATION TIME (the counter is chunk-relative, so a
-                    // later absolute-index division would be wrong).
-                    let ic = istft_inv[pos];
-                    if ic > 0.0 {
-                        let wgain = win[n] * (1.0 / 2048.0) * wfade[ju] * ic;
-                        for sc in 0..12usize {
-                            result[sc * out_len + s + ju] += frames_out[(sc * t_frames + t) * 2048 + n] * wgain;
-                        }
-                    }
-                }
-            }
+        unsafe {
+            km.ola_demix(&stream, LaunchConfig::for_num_elems(take as u32),
+                &bufs.pcm, &bufs.win_dev, &istft_inv_dev, &mut result_dev, &mut counter_dev,
+                t_frames as u32, out_len as u32, s as u32, take as u32,
+                C as u32, BORDER as u32, stft::HOP as u32, stft::N_FFT as u32,
+                (ci == 0) as u32, (ci + 1 == starts.len()) as u32).expect("ola_demix");
         }
-        for pos in 0..take {
-            demix_counter[s + pos] += wfade[pos] * wfade[pos];
-        }
-        println!("chunk {}/{} done in {:?}", ci + 1, starts.len(), chunk_t0.elapsed());
+        std::mem::swap(&mut bufs.x_dev, &mut x_spare);
+        slot ^= 1;
+        println!("chunk {}/{} enqueued in {:?}", ci + 1, starts.len(), chunk_t0.elapsed());
     }
-    println!("demix total: {:?} (RTF {:.4})", total_t0.elapsed(), total_t0.elapsed().as_secs_f64() / (len as f64 / 44100.0));
+    stream.synchronize().expect("final sync");
+    let gpu_wall = total_t0.elapsed();
+    // 6. single bulk download of the accumulators
+    let dl_t0 = std::time::Instant::now();
+    let result = result_dev.to_host_vec(&stream).unwrap();
+    let demix_counter = counter_dev.to_host_vec(&stream).unwrap();
+    println!("demix: GPU wall {gpu_wall:?}, download {:?}, RTF {:.4}",
+        dl_t0.elapsed(), gpu_wall.as_secs_f64() / (len as f64 / 44100.0));
 
     std::fs::create_dir_all(outdir).unwrap();
     let names: Vec<String> = cfg.instruments.clone();

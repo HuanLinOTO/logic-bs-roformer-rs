@@ -241,6 +241,28 @@ ncu（32 距离 flash）：时间轴 2.54 ms/launch，L2 82.9%、DRAM 70.7%
 - 最终分布（每前向）：注意力 33.0（44%）、residual 12.1、qkv 11.1、
   gelu 9.0、mask 4.9、rmsnorm 2.9、misc 1.4。
 
+### 第 32 轮：整曲 demix GPU OLA + 全异步流水线
+
+- **问题**：单 chunk 前向 73.5 ms 但整曲 wall 反超（11.9 s vs pymss 9.7 s）。
+  每 chunk 串行地 GPU 前向 → stream sync → pcm 113 MB D2H → host OLA
+  0.34 s，GPU 大段空转。
+- **改造**（gather 式 OLA 内核 + 全异步流水）：
+  1. `ola_demix` 内核：一线程一输出样本 j，重汇聚覆盖 pos=j+1024 的
+     <=4 帧 C2R 输出，窗口×istft_inv×fade 一次融合，累加进常驻
+     result/counter 显存缓冲（每 launch 内写不相交，chunk 间靠单
+     in-order 流排序 —— 无原子、无竞争）。fade/首尾 border 覆盖在内核
+     内重算（与 host 公式逐位一致）。
+  2. 输入流水线：双 ping-pong x_dev + 双 pinned host stager，H2D 用
+     `copy_from_pinned_host_async`（零每 chunk 分配），pinned 复用以
+     per-slot CUDA event 保护。
+  3. chunk 间零同步：bench_forward(None) 全链无隐式 sync，OLA 内核入队
+     后直接进入下一 chunk；整曲只在结尾一次 sync + 384 MB result 一次
+     下载（84 ms）。
+- **结果**：整曲 180.5 s → **GPU wall 7.02 s（RTF 0.0389，pymss 9.7 s
+  的 1.38×）**；14 chunk 完全背压流水（第 4 chunk 起 enqueue 恰等一个
+  chunk 的 GPU 时间，GPU 零空转）。正确性：新旧输出逐 stem SNR
+  **143+ dB**（max|diff| 4.8e-7，纯 fp32 结合顺序差异）。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
