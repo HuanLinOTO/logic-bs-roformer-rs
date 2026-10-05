@@ -2160,6 +2160,121 @@ mod gpu_kernels {
         }
     }
 
+    /// FF1 GEMM: f32 activation input, f16x2 weight, GELU epilogue packed
+    /// to f16x2 words (halves the 66 MB/launch ff1 stream).
+    #[kernel]
+    pub fn gemm_f16_gelu_a16w(
+        m: u32, n: u32, k: u32,
+        x: &[f32], w: &[u32], bias: &[f32],
+        mut y: DisjointSlice<u32>,
+    ) {
+        static mut SA: SharedArray<u32, { 128 * 32 }> = SharedArray::UNINIT;
+        static mut SB: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let warp_id = tid / 32;
+        let group = lane / 4;
+        let tig = lane % 4;
+        let block_row_base = thread::blockIdx_y() as usize * 128;
+        let row_base = block_row_base + warp_id * 16;
+        let col_base = thread::blockIdx_x() as usize * 64;
+        let (m_size, n_size, k_size) = (m as usize, n as usize, k as usize);
+        let half_k = k_size / 2;
+        let mut acc = [[0.0f32; 4]; 8];
+        let num_k = k_size.div_ceil(64);
+        for ks in 0..num_k {
+            let k_base = ks * 64;
+            unsafe {
+                // A: f32 rows via float4, 8 per thread.
+                for i in 0..8usize {
+                    let idx = tid + i * 256;
+                    let r = idx / 16;
+                    let q4 = idx % 16;
+                    let xr = block_row_base + r;
+                    let k0 = k_base + q4 * 4;
+                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    if xr < m_size && k0 + 3 < k_size {
+                        // SAFETY: k0 % 4 == 0 gives 16 B alignment.
+                        let src = x.as_ptr().add(xr * k_size + k0);
+                        let v: [f32; 4] = *(src as *const [f32; 4]);
+                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    }
+                    SA[r * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SA[r * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                }
+                // B: f16x2 words, 2 chunks per thread.
+                for i in 0..2usize {
+                    let idx = tid + i * 256;
+                    let col = idx / 8;
+                    let c4 = idx % 8;
+                    let bc = col_base + col;
+                    // SAFETY: 16 B aligned words in SB / source.
+                    let dst = (std::ptr::addr_of_mut!(SB) as *mut u32).add(col * 32 + c4 * 4);
+                    if bc < n_size {
+                        let src = w.as_ptr().add(bc * half_k + k_base / 2 + c4 * 4);
+                        *(dst as *mut [u32; 4]) = *(src as *const [u32; 4]);
+                    } else {
+                        *(dst as *mut [u32; 4]) = [0; 4];
+                    }
+                }
+            }
+            thread::sync_threads();
+            for kk in 0..4usize {
+                let word = kk * 8;
+                let mut a = [0u32; 4];
+                // SAFETY: rows < 128, words < 32 inside SA.
+                unsafe {
+                    let r0 = warp_id * 16 + group;
+                    let r1 = r0 + 8;
+                    a[0] = SA[r0 * 32 + word + tig];
+                    a[1] = SA[r1 * 32 + word + tig];
+                    a[2] = SA[r0 * 32 + word + tig + 4];
+                    a[3] = SA[r1 * 32 + word + tig + 4];
+                }
+                for nt in 0..8usize {
+                    let mut b = [0u32; 2];
+                    // SAFETY: cols < 64, words < 32 inside SB.
+                    unsafe {
+                        let col_word = (nt * 8 + group) * 32 + word;
+                        b[0] = SB[col_word + tig];
+                        b[1] = SB[col_word + tig + 4];
+                    }
+                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
+                }
+            }
+            thread::sync_threads();
+        }
+        // GELU epilogue packed to f16x2 words.
+        let out_ptr = y.as_mut_ptr();
+        let half_n = n_size / 2;
+        for nt in 0..8usize {
+            let cw = (col_base + nt * 8 + tig * 2) / 2;
+            let r_lo = row_base + group;
+            let r_hi = r_lo + 8;
+            let (b0, b1) = (bias[col_base + nt * 8 + tig * 2], bias[col_base + nt * 8 + tig * 2 + 1]);
+            let gelu = |v: f32| -> f32 {
+                let sign = if v < 0.0 { -1.0f32 } else { 1.0 };
+                let a = v.abs() * 0.70710678;
+                let t = 1.0 / (1.0 + 0.3275911 * a);
+                let poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+                let erfa = sign * (1.0 - poly * (-a * a).exp());
+                0.5 * v * (1.0 + erfa)
+            };
+            if r_lo < m_size && cw < half_n {
+                // SAFETY: bounds checked; y has m*(n/2) words.
+                unsafe {
+                    *out_ptr.add(r_lo * half_n + cw) = cuda_device::convert::cvt_f16x2_f32(gelu(acc[nt][0] + b0), gelu(acc[nt][1] + b1));
+                }
+            }
+            if r_hi < m_size && cw < half_n {
+                // SAFETY: bounds checked.
+                unsafe {
+                    *out_ptr.add(r_hi * half_n + cw) = cuda_device::convert::cvt_f16x2_f32(gelu(acc[nt][2] + b0), gelu(acc[nt][3] + b1));
+                }
+            }
+        }
+    }
+
     /// Residual GEMM with f16x2-word operands (activation + weight), f32
     /// epilogue. Same tile geometry as gemm_f16_residual_128x64; the A/B
     /// loaders copy four-word chunks without any conversion.
@@ -4727,6 +4842,7 @@ struct E2eScratch {
     attn_out: DeviceBuffer<f32>,   // (M, 256)
     ffpre: DeviceBuffer<f32>,      // (M, 1024)
     ff1: DeviceBuffer<f32>,        // (M, 1024)
+    ff1_16: DeviceBuffer<u32>,     // (M, 512) packed f16x2 GELU output
     ff2: DeviceBuffer<f32>,        // (M, 256)
     p_big: DeviceBuffer<f32>,      // time scores: 496*T*T
     attn_out_long: DeviceBuffer<f32>, // [496, T, 64]
@@ -4873,12 +4989,12 @@ unsafe fn transformer_step(
     }.map_err(|e| e.to_string())?;
     // SAFETY: 2-D tile grid over m x 1024.
     unsafe {
-        km.gemm_f16_gelu_128x64(stream, tile_cfg_tf32_64(m, 1024), m as u32, 1024, 256, &scratch.h, &gw.ff_w1[idx], &gw.ff_b1[idx], &mut scratch.ff1)
+        km.gemm_f16_gelu_a16w(stream, tile_cfg_tf32_64(m, 1024), m as u32, 1024, 256, &scratch.h, &gw.ff_w1_h[idx], &gw.ff_b1[idx], &mut scratch.ff1_16)
     }.map_err(|e| e.to_string())?;
     // GELU is fused into the FF1 tensor-core epilogue.
     // SAFETY: 2-D tile grid over m x 256.
     unsafe {
-        km.gemm_f16_residual_128x64(stream, tile_cfg_tf32_64(m, 256), m as u32, 256, 1024, &scratch.ff1, &gw.ff_w2[idx], &gw.ff_b2[idx], &scratch.attn_out, x)
+        km.gemm_f16_resid_a16(stream, tile_cfg_tf32_64(m, 256), m as u32, 256, 1024, &scratch.ff1_16, &gw.ff_w2_h[idx], &gw.ff_b2[idx], &scratch.attn_out, x)
     }.map_err(|e| e.to_string())?;
     // Residual addition is fused into the FF2 epilogue.
     Ok(())
@@ -5110,6 +5226,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
         h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
         qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
         scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
+        ff1_16: DeviceBuffer::<u32>::zeroed(&stream, m * 512).unwrap(),
         qkv: z(m * 1536),
         qkv_rope: z(m * 1536),
         qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64), // max of both axes' layouts
@@ -5809,6 +5926,7 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize) {
             h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
         qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
         scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
+        ff1_16: DeviceBuffer::<u32>::zeroed(&stream, m * 512).unwrap(),
             qkv: z(m * 1536),
             qkv_rope: z(m * 1536),
             qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64),
