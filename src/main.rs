@@ -348,6 +348,60 @@ mod gpu_kernels {
         }
     }
 
+    /// RMSNorm with the output packed to f16x2 words (halves the h stream
+    /// feeding the FF1 GEMM and removes its per-load f32->f16 converts).
+    /// Even lanes fetch their odd neighbor's value via shuffle so pairs
+    /// pack without any layout change. Same math as `rmsnorm`.
+    #[kernel]
+    pub fn rmsnorm_h16(x: &[f32], gamma: &[f32], mut out: DisjointSlice<u32>, rows: u32, dim: u32) {
+        let gid = thread::index_1d();
+        let g0 = gid.get();
+        let lane = warp::lane_id() as usize;
+        let warp_id = g0 / 32;
+        let rows = rows as usize;
+        let dim = dim as usize;
+        let per_lane = dim / 32;
+        if warp_id >= rows {
+            return;
+        }
+        let base = warp_id * dim;
+        let mut vals = [0.0f32; 8];
+        let mut s = 0.0f32;
+        for k in 0..per_lane {
+            let i = base + k * 32 + lane;
+            let v = x[i];
+            vals[k] = v;
+            s += v * v;
+        }
+        s += warp::shuffle_xor_f32(s, 16);
+        s += warp::shuffle_xor_f32(s, 8);
+        s += warp::shuffle_xor_f32(s, 4);
+        s += warp::shuffle_xor_f32(s, 2);
+        s += warp::shuffle_xor_f32(s, 1);
+        let norm = s.sqrt();
+        let denom = if norm > 1e-12 { norm } else { 1e-12 };
+        let scale = (dim as f32).sqrt() / denom;
+        let out_ptr = out.as_mut_ptr();
+        for k in 0..per_lane {
+            let i = base + k * 32 + lane;
+            // Left-associated exactly like rmsnorm: (v * scale) * gamma.
+            // A different association perturbs the last f32 ulp and flips
+            // some f16 quantization boundaries downstream.
+            vals[k] = vals[k] * scale * gamma[i % dim];
+        }
+        for k in 0..per_lane {
+            // Shuffle must be warp-converged: both lanes execute it, only
+            // the even lane stores the packed pair.
+            let partner = warp::shuffle_xor_f32(vals[k], 1);
+            if lane % 2 == 0 {
+                let word = warp_id * (dim / 2) + k * 16 + lane / 2;
+                // SAFETY: word < rows*dim/2 by construction.
+                unsafe {
+                    *out_ptr.add(word) = cuda_device::convert::cvt_f16x2_f32(vals[k], partner);
+                }
+            }
+        }
+    }
     /// RMSNorm fused with the eight head-gate projections. One warp owns a
     /// row; after normalization it performs eight 256-wide dot products.
     #[kernel]
@@ -2263,7 +2317,7 @@ mod gpu_kernels {
     #[kernel]
     pub fn gemm_f16_gelu_a16w(
         m: u32, n: u32, k: u32,
-        x: &[f32], w: &[u32], bias: &[f32],
+        x: &[u32], w: &[u32], bias: &[f32],
         mut y: DisjointSlice<u32>,
     ) {
         static mut SA: SharedArray<u32, { 128 * 32 }> = SharedArray::UNINIT;
@@ -2283,22 +2337,27 @@ mod gpu_kernels {
         for ks in 0..num_k {
             let k_base = ks * 64;
             unsafe {
-                // A: f32 rows via float4, 8 per thread.
-                for i in 0..8usize {
+                // A: pre-packed f16x2 words (from rmsnorm_h16), 4
+                // four-word chunks per thread.
+                for i in 0..4usize {
                     let idx = tid + i * 256;
-                    let r = idx / 16;
-                    let q4 = idx % 16;
+                    let r = idx / 8;
+                    let c4 = idx % 8;
                     let xr = block_row_base + r;
-                    let k0 = k_base + q4 * 4;
-                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-                    if xr < m_size && k0 + 3 < k_size {
-                        // SAFETY: k0 % 4 == 0 gives 16 B alignment.
-                        let src = x.as_ptr().add(xr * k_size + k0);
-                        let v: [f32; 4] = *(src as *const [f32; 4]);
-                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    // SAFETY: 16 B aligned words in SA; source row stride is
+                    // half_k words (a multiple of four).
+                    let vals: [u32; 4] = if xr < m_size {
+                        let src = x.as_ptr().add(xr * (k_size / 2) + k_base / 2 + c4 * 4);
+                        *(src as *const [u32; 4])
+                    } else {
+                        [0; 4]
+                    };
+                    let sa = std::ptr::addr_of_mut!(SA) as *mut u32;
+                    for q in 0..4usize {
+                        let w = c4 * 4 + q;
+                        // SAFETY: word index < 32 by construction.
+                        *sa.add(r * 32 + (w ^ (r & 7))) = vals[q];
                     }
-                    SA[r * 32 + ((q4 * 2) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SA[r * 32 + ((q4 * 2 + 1) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
                 // B: f16x2 words, 2 chunks per thread.
                 for i in 0..2usize {
@@ -5223,11 +5282,11 @@ unsafe fn transformer_step(
     // 8. FF: norm -> w1+gelu -> w2 -> residual
     // SAFETY: one warp per row.
     unsafe {
-        km.rmsnorm(stream, launch1((m * 32) as u32), &scratch.attn_out, &gw.ff_gamma[idx], &mut scratch.h, m as u32, 256)
+        km.rmsnorm_h16(stream, launch1((m * 32) as u32), &scratch.attn_out, &gw.ff_gamma[idx], &mut scratch.h16, m as u32, 256)
     }.map_err(|e| e.to_string())?;
     // SAFETY: 2-D tile grid over m x 1024.
     unsafe {
-        km.gemm_f16_gelu_a16w(stream, tile_cfg_tf32_64(m, 1024), m as u32, 1024, 256, &scratch.h, &gw.ff_w1_h[idx], &gw.ff_b1[idx], &mut scratch.ff1_16)
+        km.gemm_f16_gelu_a16w(stream, tile_cfg_tf32_64(m, 1024), m as u32, 1024, 256, &scratch.h16, &gw.ff_w1_h[idx], &gw.ff_b1[idx], &mut scratch.ff1_16)
     }.map_err(|e| e.to_string())?;
     // GELU is fused into the FF1 tensor-core epilogue.
     // SAFETY: 2-D tile grid over m x 256.
