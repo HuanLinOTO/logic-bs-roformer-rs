@@ -2039,7 +2039,7 @@ mod gpu_kernels {
     #[kernel]
     pub fn gemm_f16_128x64_hout(
         m: u32, n: u32, k: u32,
-        x: &[u32], w: &[f32], bias: &[f32],
+        x: &[u32], w: &[u32], bias: &[f32],
         mut y: DisjointSlice<u32>,
     ) {
         static mut SA: SharedArray<u32, { 128 * 32 }> = SharedArray::UNINIT;
@@ -2079,20 +2079,26 @@ mod gpu_kernels {
                         *sa.add(r * 32 + (w ^ (r & 7))) = vals[q];
                     }
                 }
-                for i in 0..4usize {
+                // B: pre-packed f16x2 words, 2 chunks per thread (halves
+                // the W re-read traffic vs the old f32 + per-load convert).
+                for i in 0..2usize {
                     let idx = tid + i * 256;
-                    let col = idx / 16;
-                    let q4 = idx % 16;
+                    let col = idx / 8;
+                    let c4 = idx % 8;
                     let bc = col_base + col;
-                    let k0 = k_base + q4 * 4;
-                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-                    if bc < n_size && k0 + 3 < k_size {
-                        let src = w.as_ptr().add(bc * k_size + k0);
-                        let v: [f32; 4] = *(src as *const [f32; 4]);
-                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    // SAFETY: word index < 32 by construction; k is a
+                    // multiple of 64 so k_base/2 + c4*4 never crosses rows.
+                    let vals: [u32; 4] = if bc < n_size {
+                        let src = w.as_ptr().add(bc * (k_size / 2) + k_base / 2 + c4 * 4);
+                        *(src as *const [u32; 4])
+                    } else {
+                        [0; 4]
+                    };
+                    let sb = std::ptr::addr_of_mut!(SB) as *mut u32;
+                    for q in 0..4usize {
+                        let w = c4 * 4 + q;
+                        *sb.add(col * 32 + (w ^ (col & 7))) = vals[q];
                     }
-                    SB[col * 32 + ((q4 * 2) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SB[col * 32 + ((q4 * 2 + 1) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
@@ -3762,7 +3768,7 @@ mod gpu_kernels {
     #[kernel]
     pub fn mask_gemm1_f16(
         t_rows: u32, group_base: u32,
-        x: &[f32], w: &[f32], bias: &[f32],
+        x: &[f32], w: &[u32], bias: &[f32],
         mut y: DisjointSlice<u32>,
     ) {
         // Packed f16 shared tiles. SA is row-major with adjacent K pairs;
@@ -3786,7 +3792,7 @@ mod gpu_kernels {
         let band = thread::blockIdx_z() as usize;
         let out_group = group_base as usize + band;
         let x_off = band * m_size * 256;
-        let w_off = band * 1024 * 256;
+        let w_off = band * 1024 * (k_size / 2); // f16x2 words
         let bias_off = band * 1024;
         let y_off = out_group * m_size * 512; // word stride (f16x2)
         let mut acc = [[0.0f32; 4]; 8];
@@ -3814,22 +3820,25 @@ mod gpu_kernels {
                     SA[r * 32 + ((q4 * 2) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
                     SA[r * 32 + ((q4 * 2 + 1) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
-                // B: 64 columns x 16 float4, 4 per thread.
-                for i in 0..4usize {
+                // B: pre-packed f16x2 words, 2 chunks per thread.
+                for i in 0..2usize {
                     let idx = tid + i * 256;
-                    let col = idx / 16;
-                    let q4 = idx % 16;
+                    let col = idx / 8;
+                    let c4 = idx % 8;
                     let bc = col_base + col;
-                    let k0 = k_base + q4 * 4;
-                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-                    if bc < n_size && k0 + 3 < k_size {
-                        // SAFETY: same 16 B alignment argument as A.
-                        let src = w.as_ptr().add(w_off + bc * k_size + k0);
-                        let v: [f32; 4] = *(src as *const [f32; 4]);
-                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    // SAFETY: word index < 32 by construction; k is a
+                    // multiple of 64 so the offset never crosses rows.
+                    let vals: [u32; 4] = if bc < n_size {
+                        let src = w.as_ptr().add(w_off + bc * (k_size / 2) + k_base / 2 + c4 * 4);
+                        *(src as *const [u32; 4])
+                    } else {
+                        [0; 4]
+                    };
+                    let sb = std::ptr::addr_of_mut!(SB) as *mut u32;
+                    for q in 0..4usize {
+                        let w = c4 * 4 + q;
+                        *sb.add(col * 32 + (w ^ (col & 7))) = vals[q];
                     }
-                    SB[col * 32 + ((q4 * 2) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SB[col * 32 + ((q4 * 2 + 1) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
@@ -3898,7 +3907,7 @@ mod gpu_kernels {
     pub fn mask_gemm2_f16(
         t_rows: u32, group_base: u32, out_width: u32,
         band_off: &[u32],
-        x: &[u32], w: &[f32], bias: &[f32],
+        x: &[u32], w: &[u32], bias: &[f32],
         mut y: DisjointSlice<f32>,
     ) {
         // Packed f16 shared tiles. SA is row-major with adjacent K pairs;
@@ -3926,7 +3935,7 @@ mod gpu_kernels {
         }
         let out_group = group_base as usize + band;
         let x_off = out_group * m_size * 512; // word stride (f16x2)
-        let w_off = (2 * band_off[band] as usize) * 1024;
+        let w_off = (2 * band_off[band] as usize) * (k_size / 2); // f16x2 words
         let bias_off = 2 * band_off[band] as usize;
         let out_width = out_width as usize;
         let y_off = out_group * m_size * out_width;
@@ -3956,21 +3965,25 @@ mod gpu_kernels {
                         *sa.add(r * 32 + (w ^ (r & 7))) = vals[q];
                     }
                 }
-                for i in 0..4usize {
+                // B: pre-packed f16x2 words, 2 chunks per thread.
+                for i in 0..2usize {
                     let idx = tid + i * 256;
-                    let col = idx / 16;
-                    let q4 = idx % 16;
+                    let col = idx / 8;
+                    let c4 = idx % 8;
                     let bc = col_base + col;
-                    let k0 = k_base + q4 * 4;
-                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-                    if bc < n_size && k0 + 3 < k_size {
-                        // SAFETY: same 16 B alignment argument as A.
-                        let src = w.as_ptr().add(w_off + bc * k_size + k0);
-                        let v: [f32; 4] = *(src as *const [f32; 4]);
-                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    // SAFETY: word index < 32 by construction; k is a
+                    // multiple of 64 so the offset never crosses rows.
+                    let vals: [u32; 4] = if bc < n_size {
+                        let src = w.as_ptr().add(w_off + bc * (k_size / 2) + k_base / 2 + c4 * 4);
+                        *(src as *const [u32; 4])
+                    } else {
+                        [0; 4]
+                    };
+                    let sb = std::ptr::addr_of_mut!(SB) as *mut u32;
+                    for q in 0..4usize {
+                        let w = c4 * 4 + q;
+                        *sb.add(col * 32 + (w ^ (col & 7))) = vals[q];
                     }
-                    SB[col * 32 + ((q4 * 2) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SB[col * 32 + ((q4 * 2 + 1) ^ (col & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
@@ -5040,6 +5053,8 @@ struct GpuWeights {
     mask_b1: Vec<DeviceBuffer<f32>>,
     mask_w2: Vec<DeviceBuffer<f32>>,
     mask_b2: Vec<DeviceBuffer<f32>>,
+    mask_w1_h: Vec<DeviceBuffer<u32>>, // packed f16x2 (hot-path GEMMs)
+    mask_w2_h: Vec<DeviceBuffer<u32>>,
 }
 
 
@@ -5112,10 +5127,15 @@ fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights:
     let mut mask_b1 = Vec::new();
     let mut mask_w2 = Vec::new();
     let mut mask_b2 = Vec::new();
+    let mut mask_w1_h = Vec::new();
+    let mut mask_w2_h = Vec::new();
     for s in 0..w.mask_w1.len() {
-        mask_w1.push(up(&w.mask_w1[s].concat())?);
+        let (w1c, w2c) = (w.mask_w1[s].concat(), w.mask_w2[s].concat());
+        mask_w1_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&w1c)).map_err(|e| e.to_string())?);
+        mask_w2_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&w2c)).map_err(|e| e.to_string())?);
+        mask_w1.push(up(&w1c)?);
         mask_b1.push(up(&w.mask_b1[s].concat())?);
-        mask_w2.push(up(&w.mask_w2[s].concat())?);
+        mask_w2.push(up(&w2c)?);
         mask_b2.push(up(&w.mask_b2[s].concat())?);
     }
     Ok(GpuWeights {
@@ -5130,6 +5150,8 @@ fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights:
         ff_w2,
         ff_b2,
         qkv_w_h,
+        mask_w1_h,
+        mask_w2_h,
         out_w_h,
         ff_w1_h,
         ff_w2_h,
@@ -5175,7 +5197,7 @@ unsafe fn transformer_step(
     // (L1TEX shared-read bound, not global-load bound) plus pack overhead.
     // SAFETY: 2-D tile grid over m x 1536.
     unsafe {
-        km.gemm_f16_128x64_hout(stream, tile_cfg_tf32_64(m, 1536), m as u32, 1536, 256, &scratch.h16, &gw.qkv_w[idx], &gw.shared_qkv_bias, &mut scratch.qkv16)
+        km.gemm_f16_128x64_hout(stream, tile_cfg_tf32_64(m, 1536), m as u32, 1536, 256, &scratch.h16, &gw.qkv_w_h[idx], &gw.shared_qkv_bias, &mut scratch.qkv16)
     }.map_err(|e| e.to_string())?;
 
     // RoPE and attention-major reordering are fused into the raw-QKV
@@ -5812,7 +5834,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     for s in 0..6usize {
         // SAFETY: 16 column tiles x ceil(T/128) row tiles x 62 bands.
         unsafe {
-            km.mask_gemm1_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (16, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, (s * bands) as u32, &xb, &gw.mask_w1[s], &gw.mask_b1[s], &mut hidden_t)
+            km.mask_gemm1_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (16, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, (s * bands) as u32, &xb, &gw.mask_w1_h[s], &gw.mask_b1[s], &mut hidden_t)
         }.expect("grouped mask gemm1");
     }
     // Tanh is fused into the grouped mask GEMM1 epilogue.
@@ -5821,7 +5843,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     for s in 0..6usize {
         // SAFETY: worst-case 17 column tiles; invalid per-band tiles return.
         unsafe {
-            km.mask_gemm2_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (pre_width.div_ceil(64) as u32, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, (s * bands) as u32, pre_width as u32, &offs_dev, &hidden_t, &gw.mask_w2[s], &gw.mask_b2[s], &mut pre2_all)
+            km.mask_gemm2_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (pre_width.div_ceil(64) as u32, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, (s * bands) as u32, pre_width as u32, &offs_dev, &hidden_t, &gw.mask_w2_h[s], &gw.mask_b2[s], &mut pre2_all)
         }.expect("grouped mask gemm2");
     }
     // SAFETY: one thread per padded GLU output element.
@@ -6081,14 +6103,14 @@ unsafe fn bench_forward(
         // SAFETY: 16 column tiles x ceil(T/128) row tiles x 62 bands.
         unsafe {
             km.mask_gemm1_f16(stream, LaunchConfig { grid_dim: (16, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                t_frames as u32, (s * bands) as u32, &b.xb, &gw.mask_w1[s], &gw.mask_b1[s], &mut b.hidden_t)
+                t_frames as u32, (s * bands) as u32, &b.xb, &gw.mask_w1_h[s], &gw.mask_b1[s], &mut b.hidden_t)
         }.map_err(|e| e.to_string())?;
     }
     for s in 0..6usize {
         // SAFETY: worst-case 17 column tiles; invalid per-band tiles return.
         unsafe {
             km.mask_gemm2_f16(stream, LaunchConfig { grid_dim: (pre_width.div_ceil(64) as u32, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                t_frames as u32, (s * bands) as u32, pre_width as u32, &b.offs_dev, &b.hidden_t, &gw.mask_w2[s], &gw.mask_b2[s], &mut b.pre2_all)
+                t_frames as u32, (s * bands) as u32, pre_width as u32, &b.offs_dev, &b.hidden_t, &gw.mask_w2_h[s], &gw.mask_b2[s], &mut b.pre2_all)
         }.map_err(|e| e.to_string())?;
     }
     // SAFETY: one thread per padded GLU output element.

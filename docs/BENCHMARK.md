@@ -283,6 +283,21 @@ ncu（T=1151 时间轴 flash，25.8ms/launch）：L2 吞吐 85.3%（墙）、DRA
 剩余可信杠杆只有 cp.async 双缓冲（但 GEMM 路线已实测零收益）或接受现状。
 本轮保留产出：GPU OLA 流水线（第 32 轮）不变，主分支回到 7.02s。
 
+### 第 34 轮：QKV/mask GEMM 权重 f16x2 化（净收益）+ Q 寄存器化证伪
+
+- **发现**：resid/FF GEMM 的 W 早已是打包 f16x2（out_w_h/ff_w1_h/ff_w2_h），
+  但 QKV GEMM（hout）与 mask 两级 GEMM 仍在用 f32 W、每次 cooperative load
+  时现场 cvt——W 被行块网格反复重读（QKV 每 launch 高达 ~857MB 的 L2 流量）。
+- **改造**：hout/mask_gemm1/mask_gemm2 的 W 参数改 `&[u32]`（qkv_w_h 与新增
+  mask_w1_h/mask_w2_h，上传时 pack_f16x2 一次性打包），加载循环照 gelu 内核
+  的 [u32;4] 16B 直拷（cvt 与流量同时减半）。
+- **结果**：bench 73.5 → **71.9ms（1.68×）**；整曲 7.02 → **6.95s（RTF
+  0.0385）**；SNR 80.99 不变，整曲输出与改造前逐位一致（pack 时机前移、
+  RNE 舍入相同）。
+- **证伪**：flash Q 片段寄存器化（删 SQ、Q 不变量驻留寄存器、占用率 33→
+  ~50%）：bench 75.5ms、整曲 7.45s，两尺寸均倒退——注意力第 3 次结构实验
+  证伪，确认该内核在当前工具链下已处局部最优，停止微调。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
