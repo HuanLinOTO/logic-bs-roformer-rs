@@ -1770,6 +1770,183 @@ mod gpu_kernels {
         }
     }
 
+    /// Pack a row-major f32 activation into f16x2 words with the same device
+    /// rounding the fused GEMM loaders used, so the async GEMM path is
+    /// bit-compatible with the previous inline conversion.
+    #[kernel]
+    pub fn pack_h16(x: &[f32], mut out: DisjointSlice<u32>, cols: u32) {
+        let idx = thread::index_1d();
+        let g0 = idx.get();
+        let cols = cols as usize;
+        let half = cols / 2;
+        if let Some(o) = out.get_mut(idx) {
+            let wp = g0 % half;
+            let row = g0 / half;
+            let base = row * cols + wp * 2;
+            // SAFETY: idx < out.len() implies row/wp are in range; base+1 is
+            // in bounds because cols is even and the source is rows*cols.
+            unsafe {
+                let v0 = *x.as_ptr().add(base);
+                let v1 = *x.as_ptr().add(base + 1);
+                *o = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+            }
+        }
+    }
+
+    /// cp.async double-buffered FP16 tensor-core GEMM, 128x64 tile / 256
+    /// threads. Operands are pre-packed f16x2 words; global->shared copies
+    /// overlap the MMA phase, removing the load-then-sync serialization that
+    /// capped the fp32-loading variants at ~15 TFLOP/s.
+    #[kernel]
+    pub fn gemm_f16_async(
+        m: u32, n: u32, k: u32,
+        x: &[u32], w: &[u32], bias: &[f32],
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut SA: SharedArray<u32, { 2 * 128 * 32 }, 16> = SharedArray::UNINIT;
+        static mut SB: SharedArray<u32, { 2 * 64 * 32 }, 16> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let warp_id = tid / 32;
+        let group = lane / 4;
+        let tig = lane % 4;
+        let block_row_base = thread::blockIdx_y() as usize * 128;
+        let row_base = block_row_base + warp_id * 16;
+        let col_base = thread::blockIdx_x() as usize * 64;
+        let (m_size, n_size, k_size) = (m as usize, n as usize, k as usize);
+        let half_k = k_size / 2;
+        let mut acc = [[0.0f32; 4]; 8];
+        // Raw pointers (never &mut on statics): SharedArray is repr(transparent)
+        // over [u32; N], so the cast is the data base.
+        // SAFETY: addresses of block-local statics; no references formed.
+        let sa0: *mut u32 = std::ptr::addr_of_mut!(SA) as *mut u32;
+        let sb0: *mut u32 = std::ptr::addr_of_mut!(SB) as *mut u32;
+
+        // Prologue: issue K-tile 0 into buffer 0.
+        // SAFETY: chunk destinations are 16 B aligned words inside SA/SB;
+        // sources are 16 B aligned (half_k and q4*4 are word multiples of 4).
+        unsafe {
+            let sa = sa0;
+            let sb = sb0;
+            for i in 0..4usize {
+                let c = tid + i * 256;
+                let r = c / 8;
+                let q4 = c % 8;
+                let xr = block_row_base + r;
+                let dst = sa.add(r * 32 + q4 * 4);
+                if xr < m_size {
+                    let src = x.as_ptr().add(xr * half_k + q4 * 4);
+                    cuda_device::async_copy::cp_async_cg_16(dst, src);
+                } else {
+                    cuda_device::async_copy::cp_async_cg_zfill_16(dst, x.as_ptr() as *const u8, 0);
+                }
+            }
+            for i in 0..2usize {
+                let c = tid + i * 256;
+                let col = c / 8;
+                let q4 = c % 8;
+                let bc = col_base + col;
+                let dst = sb.add(col * 32 + q4 * 4);
+                if bc < n_size {
+                    let src = w.as_ptr().add(bc * half_k + q4 * 4);
+                    cuda_device::async_copy::cp_async_cg_16(dst, src);
+                } else {
+                    cuda_device::async_copy::cp_async_cg_zfill_16(dst, w.as_ptr() as *const u8, 0);
+                }
+            }
+            cuda_device::async_copy::cp_async_commit_group();
+        }
+
+        let num_k = k_size.div_ceil(64);
+        let mut ks = 0usize;
+        while ks < num_k {
+            // Issue K-tile ks+1 into the other buffer (or an empty group).
+            // SAFETY: same alignment guarantees as the prologue.
+            unsafe {
+                if ks + 1 < num_k {
+                    let kb2 = (ks + 1) * 64;
+                    let sa = sa0.add(((ks + 1) % 2) * 4096);
+                    let sb = sb0.add(((ks + 1) % 2) * 2048);
+                    for i in 0..4usize {
+                        let c = tid + i * 256;
+                        let r = c / 8;
+                        let q4 = c % 8;
+                        let xr = block_row_base + r;
+                        let dst = sa.add(r * 32 + q4 * 4);
+                        if xr < m_size {
+                            let src = x.as_ptr().add(xr * half_k + kb2 / 2 + q4 * 4);
+                            cuda_device::async_copy::cp_async_cg_16(dst, src);
+                        } else {
+                            cuda_device::async_copy::cp_async_cg_zfill_16(dst, x.as_ptr() as *const u8, 0);
+                        }
+                    }
+                    for i in 0..2usize {
+                        let c = tid + i * 256;
+                        let col = c / 8;
+                        let q4 = c % 8;
+                        let bc = col_base + col;
+                        let dst = sb.add(col * 32 + q4 * 4);
+                        if bc < n_size {
+                            let src = w.as_ptr().add(bc * half_k + kb2 / 2 + q4 * 4);
+                            cuda_device::async_copy::cp_async_cg_16(dst, src);
+                        } else {
+                            cuda_device::async_copy::cp_async_cg_zfill_16(dst, w.as_ptr() as *const u8, 0);
+                        }
+                    }
+                }
+                cuda_device::async_copy::cp_async_commit_group();
+                cuda_device::async_copy::cp_async_wait_group(1);
+            }
+            thread::sync_threads();
+
+            // MMA phase from buffer ks%2.
+            let base = (ks % 2) * 4096;
+            let bbase = (ks % 2) * 2048;
+            for kk in 0..4usize {
+                let word = kk * 8;
+                let mut a = [0u32; 4];
+                // SAFETY: rows < 128, words < 32 inside SA.
+                unsafe {
+                    let s = (sa0 as *const u32).add(base);
+                    let r0 = warp_id * 16 + group;
+                    let r1 = r0 + 8;
+                    a[0] = *s.add(r0 * 32 + word + tig);
+                    a[1] = *s.add(r1 * 32 + word + tig);
+                    a[2] = *s.add(r0 * 32 + word + tig + 4);
+                    a[3] = *s.add(r1 * 32 + word + tig + 4);
+                }
+                for nt in 0..8usize {
+                    let mut b = [0u32; 2];
+                    // SAFETY: cols < 64, words < 32 inside SB.
+                    unsafe {
+                        let s2 = (sb0 as *const u32).add(bbase);
+                        let cw = (nt * 8 + group) * 32 + word;
+                        b[0] = *s2.add(cw + tig);
+                        b[1] = *s2.add(cw + tig + 4);
+                    }
+                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
+                }
+            }
+            thread::sync_threads();
+            ks += 1;
+        }
+
+        let out_ptr = y.as_mut_ptr();
+        for nt in 0..8usize {
+            for j in 0..4usize {
+                let r = row_base + group + if j >= 2 { 8 } else { 0 };
+                let cc = col_base + nt * 8 + tig * 2 + (j & 1);
+                if r < m_size && cc < n_size {
+                    // SAFETY: bounds checked; y has m*n elements.
+                    unsafe {
+                        *out_ptr.add(r * n_size + cc) = acc[nt][j] + bias[cc];
+                    }
+                }
+            }
+        }
+    }
+
     /// FP16 tensor-core GEMM, 128x64 tile / 256 threads. Inputs are fp32 in
     /// global memory; cooperative loads pack adjacent K values into f16x2.
     /// Accumulation stays f32, so accuracy is close to PyTorch's autocast path.
@@ -4186,9 +4363,57 @@ fn fft_roundtrip_test(device: usize) {
 // End-to-end single-chunk forward (Phase 3)
 // ---------------------------------------------------------------------------
 
+/// f32 -> f16 bits (round to nearest even), no external crates.
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xFF) as i32;
+    let mant = b & 0x7F_FFFF;
+    if exp == 0xFF {
+        return sign | 0x7C00 | if mant != 0 { 1 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1F {
+        return sign | 0x7C00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = mant | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rem = m & ((1 << shift) - 1);
+        let halfway = 1u32 << (shift - 1);
+        let mut hm = half as u16;
+        if rem > halfway || (rem == halfway && (half & 1) == 1) {
+            hm += 1;
+        }
+        return sign | hm;
+    }
+    let mut hm = ((e as u32) << 10) | (mant >> 13);
+    let rem = mant & 0x1FFF;
+    if rem > 0x1000 || (rem == 0x1000 && (hm & 1) == 1) {
+        hm += 1;
+    }
+    sign | hm as u16
+}
+
+/// Pack an even-length f32 slice into f16x2 words (little half = first).
+fn pack_f16x2(v: &[f32]) -> Vec<u32> {
+    assert!(v.len() % 2 == 0);
+    v.chunks(2)
+        .map(|c| (f32_to_f16_bits(c[0]) as u32) | ((f32_to_f16_bits(c[1]) as u32) << 16))
+        .collect()
+}
+
 struct GpuWeights {
     // transformer per layer per axis: qkv_w, gates_w, gates_b, out_w (shared biases shared once)
     qkv_w: Vec<DeviceBuffer<f32>>,      // [24] (1536*256)
+    qkv_w_h: Vec<DeviceBuffer<u32>>,    // [24] packed f16x2
+    out_w_h: Vec<DeviceBuffer<u32>>,    // [24] packed f16x2
+    ff_w1_h: Vec<DeviceBuffer<u32>>,    // [24] packed f16x2
+    ff_w2_h: Vec<DeviceBuffer<u32>>,    // [24] packed f16x2
     gates_w: Vec<DeviceBuffer<f32>>,    // [24] (8*256)
     gates_b: Vec<DeviceBuffer<f32>>,    // [24] (8)
     out_w: Vec<DeviceBuffer<f32>>,      // [24] (256*512)
@@ -4214,6 +4439,7 @@ struct GpuWeights {
 
 struct E2eScratch {
     h: DeviceBuffer<f32>,          // (M, 256)
+    h16: DeviceBuffer<u32>,        // (M, 128) packed f16x2
     qkv: DeviceBuffer<f32>,        // (M, 1536)
     qkv_rope: DeviceBuffer<f32>,   // (M, 1536)
     qkv_attn: DeviceBuffer<f32>,   // time: [3*496, T, 64]; freq: [3*9208, 62, 64]
@@ -4261,6 +4487,18 @@ fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights:
             ff_b2.push(up(&ff.b2)?);
         }
     }
+    let mut qkv_w_h = Vec::new();
+    let mut out_w_h = Vec::new();
+    let mut ff_w1_h = Vec::new();
+    let mut ff_w2_h = Vec::new();
+    for layer in &w.layers {
+        for (attn, ff) in [layer.time.clone(), layer.freq.clone()] {
+            qkv_w_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&attn.to_qkv_w)).map_err(|e| e.to_string())?);
+            out_w_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&attn.to_out_w)).map_err(|e| e.to_string())?);
+            ff_w1_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&ff.w1)).map_err(|e| e.to_string())?);
+            ff_w2_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&ff.w2)).map_err(|e| e.to_string())?);
+        }
+    }
     let mut mask_w1 = Vec::new();
     let mut mask_b1 = Vec::new();
     let mut mask_w2 = Vec::new();
@@ -4282,6 +4520,10 @@ fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights:
         ff_b1,
         ff_w2,
         ff_b2,
+        qkv_w_h,
+        out_w_h,
+        ff_w1_h,
+        ff_w2_h,
         shared_qkv_bias: up(&w.shared_qkv_bias)?,
         shared_out_bias: up(&w.shared_out_bias)?,
         final_norm: up(&w.final_norm_gamma)?,
@@ -4319,7 +4561,9 @@ unsafe fn transformer_step(
         km.rmsnorm_gates(stream, launch1((m * 32) as u32), x, &gw.norm_gamma[idx], &gw.gates_w[idx], &gw.gates_b[idx], &mut scratch.h, &mut scratch.gates, m as u32, 256)
     }.map_err(|e| e.to_string())?;
 
-    // 2. QKV GEMM (M,256 -> 1536) with shared bias
+    // 2. QKV GEMM (M,256 -> 1536) with shared bias. The float4-loading
+    // variant wins: cp.async pipelining measured identical kernel time
+    // (L1TEX shared-read bound, not global-load bound) plus pack overhead.
     // SAFETY: 2-D tile grid over m x 1536.
     unsafe {
         km.gemm_f16_128x64(stream, tile_cfg_tf32_64(m, 1536), m as u32, 1536, 256, &scratch.h, &gw.qkv_w[idx], &gw.shared_qkv_bias, &mut scratch.qkv)
@@ -4602,6 +4846,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     let z = |n: usize| DeviceBuffer::<f32>::zeroed(&stream, n).unwrap();
     let mut scr = E2eScratch {
         h: z(m * 256),
+        h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
         qkv: z(m * 1536),
         qkv_rope: z(m * 1536),
         qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64), // max of both axes' layouts
@@ -5285,6 +5530,7 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize) {
         x: z(m * 256),
         scr: E2eScratch {
             h: z(m * 256),
+            h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
             qkv: z(m * 1536),
             qkv_rope: z(m * 1536),
             qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64),

@@ -72,6 +72,11 @@ STFT/GLU/mask/FFT 等        ~1.4 ms
 
 ### 失败的变体（勿重复）
 
+- **cp.async 流水线 GEMM（gemm_f16_async + pack_h16 + f16 权重）**：内核
+  764 µs/launch，与 float4-f32 版（765 µs）完全相同 —— 全局加载延迟根本
+  不是瓶颈；ncu 的 "L1TEX 91%" 主体是 mma fragment 的 shared 读流量，
+  cp.async 无法减少它。已回退调用（内核保留作参考）。
+
 - flash v2/v3/v4（128 行 tile + 256 线程 + SVt 转置/寄存器预载 B）：
   124/150/122 ms。ncu：L1TEX 56–86%、DRAM 80%、occupancy 32%（shared
   限制 2 block/SM）。多维寄存器数组 w[4][8] 触发 local memory spill。
@@ -98,11 +103,11 @@ mask 两级   8.3 ms / ~90 GFLOP ≈ 11 TFLOP/s
 
 ### 下一步（按收益排序）
 
-1. **cp.async 流水线 + f16 预转换操作数**（唯一没试对的 GEMM 路线）：
-   权重上传时转 f16、rmsnorm/PV/GELU 产出 f16 激活，GEMM 内核用
-   `cuda_device::async_copy::cp_async_cg_16` 双缓冲 global→shared，
-   彻底消除转换与 L1TEX 串行。cuBLAS 同形状可达 ~50-65 TFLOP/s，GEMM
-   57 ms → ~20 ms，总体可到 ~65 ms（1.8x）。注意保持寄存器数组 1D。
+1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
+   标量读（cp.async 流水线已验证：内核时间与 f32 版完全相同，全局加载
+   不是瓶颈）。需要 128x128+ 大 tile（B 复用翻倍）但嵌套累加数组会
+   spill —— 出路是全展开手写寄存器命名（无循环索引）或 warp-specialized
+   producer/consumer 结构；或等 cuda-oxide 支持 ldmatrix 高效布局。
 2. 时间轴注意力：QK 单块全行（shared fp16 P 33.8KB）+ 块内 softmax +
    PV 读 fp16 P，消除 softmax_stats 的 10.5 ms 与一半 P 流量。
 3. mask GEMM 同样接 cp.async 路线。
