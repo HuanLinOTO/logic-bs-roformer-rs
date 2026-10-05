@@ -356,6 +356,22 @@ mod gpu_kernels {
     /// pack without any layout change. Same math as `rmsnorm`.
     #[kernel]
     pub fn rmsnorm_h16(x: &[f32], gamma: &[f32], mut out: DisjointSlice<u32>, rows: u32, dim: u32) {
+        // Stage gamma into shared: one L2 read per block instead of one per
+        // warp (dim is always 256 at both call sites). Runs before the early
+        // return so every warp of the block joins the barrier.
+        static mut SGA: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let sga0 = std::ptr::addr_of_mut!(SGA) as *const f32;
+        let sga0w = sga0 as *mut f32;
+        if dim == 256 {
+            unsafe {
+                let nt_ = thread::threadIdx_x() as usize;
+                let bdim = thread::blockDim_x() as usize;
+                for i in (nt_..256).step_by(bdim) {
+                    *sga0w.add(i) = gamma[i];
+                }
+            }
+            thread::sync_threads();
+        }
         let gid = thread::index_1d();
         let g0 = gid.get();
         let lane = warp::lane_id() as usize;
@@ -385,11 +401,11 @@ mod gpu_kernels {
         let scale = (dim as f32).sqrt() / denom;
         let out_ptr = out.as_mut_ptr();
         for k in 0..per_lane {
-            let i = base + k * 32 + lane;
             // Left-associated exactly like rmsnorm: (v * scale) * gamma.
             // A different association perturbs the last f32 ulp and flips
             // some f16 quantization boundaries downstream.
-            vals[k] = vals[k] * scale * gamma[i % dim];
+            let gm = if dim == 256 { unsafe { *sga0.add(k * 32 + lane) } } else { gamma[(base + k * 32 + lane) % dim] };
+            vals[k] = vals[k] * scale * gm;
         }
         for k in 0..per_lane {
             // Shuffle must be warp-converged: both lanes execute it, only
@@ -470,6 +486,30 @@ mod gpu_kernels {
         mut out: DisjointSlice<u32>, mut gates: DisjointSlice<f32>,
         rows: u32, dim: u32,
     ) {
+        // Stage gamma + the 8x256 gate_w into shared: gate_w used to be read
+        // once per warp (8KB x rows warps = ~132MB of L2 traffic per launch,
+        // which was the bandwidth ceiling of this kernel). dim is always 256
+        // at the call site. Runs before the early return so the whole block
+        // joins the barrier.
+        static mut SGA: SharedArray<f32, 256> = SharedArray::UNINIT;
+        static mut SGW: SharedArray<f32, { 8 * 256 }> = SharedArray::UNINIT;
+        let sga0 = std::ptr::addr_of_mut!(SGA) as *const f32;
+        let sga0w = sga0 as *mut f32;
+        let sgw0 = std::ptr::addr_of_mut!(SGW) as *const f32;
+        let sgw0w = sgw0 as *mut f32;
+        if dim == 256 {
+            unsafe {
+                let nt_ = thread::threadIdx_x() as usize;
+                let bdim = thread::blockDim_x() as usize;
+                for i in (nt_..256).step_by(bdim) {
+                    *sga0w.add(i) = gamma[i];
+                }
+                for i in (nt_..2048).step_by(bdim) {
+                    *sgw0w.add(i) = gate_w[i];
+                }
+            }
+            thread::sync_threads();
+        }
         let gid = thread::index_1d();
         let g0 = gid.get();
         let lane = warp::lane_id() as usize;
@@ -496,8 +536,8 @@ mod gpu_kernels {
         let denom = if norm > 1e-12 { norm } else { 1e-12 };
         let scale = (dim as f32).sqrt() / denom;
         for k in 0..per_lane {
-            let i = base + k * 32 + lane;
-            vals[k] *= scale * gamma[i % dim];
+            let gm = if dim == 256 { unsafe { *sga0.add(k * 32 + lane) } } else { gamma[(base + k * 32 + lane) % dim] };
+            vals[k] *= scale * gm;
         }
         let out_ptr = out.as_mut_ptr();
         for k in 0..per_lane {
@@ -517,7 +557,8 @@ mod gpu_kernels {
             let wbase = g * dim;
             let mut dot = 0.0f32;
             for k in 0..per_lane {
-                dot += vals[k] * gate_w[wbase + k * 32 + lane];
+                let gw = if dim == 256 { unsafe { *sgw0.add(g * 256 + k * 32 + lane) } } else { gate_w[wbase + k * 32 + lane] };
+                dot += vals[k] * gw;
             }
             dot = warp::reduce_sum_f32(dot);
             if lane == g {
