@@ -192,6 +192,22 @@ ncu（32 距离 flash）：时间轴 2.54 ms/launch，L2 82.9%、DRAM 70.7%
   持久 272、双组/块），**64 行 / 128 线程 / 1 组每块为最终形态**。
 - 现状：**99.1 ms / RTF 0.0330 / SNR 80.87（1.22×）**。
 
+### 第 29 轮：全链 f16 激活存储（重大）
+
+三步递进，每步独立验证（SNR 80.99 全程）：
+
+1. **qkv16**：QKV GEMM epilogue 直出 f16x2 词（hout 内核），flash 的
+   Q/K/V gather 改读词（unpack+RoPE+pack 在寄存器）。99.1 → **97.5 ms**。
+2. **scaled16**：flash epilogue 打包输出（33→16.5 MB/launch），out-proj
+   换 gemm_f16_resid_a16（A/W 全 f16x2 词拷贝，无转换）。97.5 → **95.2**。
+3. **ff1_16**：GELU epilogue 打包（66→33 MB/launch），ff2 同 a16。
+   95.2 → **91.9 ms（1.315×，RTF 0.0306）**。
+
+要点：激活的 f16 量化点与原先"加载时转换"相同（数值等价，除 scaled/ff1
+下游即 mma）；写流减半对 DRAM 带宽墙的 flash 与读流减半对 GEMM 加载相
+均净收益；GEMM 的 mma/LDS 相不变（gemm_f16_async 早已暗示 GEMM 墙不在
+加载侧，收益主要来自 flash 与 epilogue）。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
