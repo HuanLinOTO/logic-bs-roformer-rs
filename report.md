@@ -8,19 +8,24 @@
 
 | 指标 | PyTorch 2.14.1（fp32） | 本实现 | 加速比 |
 |---|---|---|---|
-| wall（10 次均值） | 120.8 ms | **67.3–67.7 ms** | **1.80×** |
-| RTF | 0.0403 | **0.0245** | — |
+| wall（10 次均值） | 120.8 ms | **58.2 ms** | **2.07×** |
+| RTF | 0.0403 | **0.0194** | — |
 | 六 stem SNR（vs fp32 参考） | —（参考本身） | **80.99 dB** | 验收线 ≥60 dB |
 
 ### 真实歌曲端到端（Hanser《Cyberangel》，3:00，14 chunk demix）
 
 | 指标 | pymss | 本实现 |
 |---|---|---|
-| 整曲 wall | 9.7 s | **6.57 s（1.48×）**，GPU 前向 **0.47 vs 0.69 s/chunk（1.47×）**，14 chunk 全异步流水零空转 |
+| 整曲 wall | 9.7 s | **5.53 s（1.75×）**，GPU 前向 **0.395 vs 0.69 s/chunk（1.75×）**，14 chunk 全异步流水零空转 |
 | 逐 stem SNR（vs pymss fp32） | — | bass 59.2 / drums 69.6 / other 62.2 / vocals 69.3 / guitar 64.3 dB，能量加权 **63.6 dB** |
 
-最终每前向 kernel 分布：注意力 33.0ms（44%）、residual GEMM 12.1、QKV 11.1、
-FF1+GELU 9.0、mask 两级 4.9、RMSNorm 2.9、STFT/FFT/杂项 1.4。
+最终每前向 kernel 分布（nsys，58.3ms 口径）：时间轴 flash 19.7ms（34%）、
+residual GEMM 10.9、QKV 8.4、频率轴 flash 7.6、FF1+GELU 6.3、
+RMSNorm 6.4、mask 两级 3.1、rope 0.65、glu/apply 0.7、STFT/杂项 1.5。
+
+第二轮优化（ldmatrix 系列，第 40-43 轮）在保持**六 stem 与基线
+逐字节一致**的前提下：bench 67.3 → 58.2ms（1.80×→**2.07×**），
+整曲 6.57 → **5.53s（1.48×→1.75×）**。
 
 ## 二、加速手段（四类）
 
@@ -47,9 +52,26 @@ FF1+GELU 9.0、mask 两级 4.9、RMSNorm 2.9、STFT/FFT/杂项 1.4。
 - f16x2 词打包贯穿全链；float4/词块加载；2 的幂行距（非 2 幂有 ~5× 编译惩罚）
 - fold 布局（(t,f) 折叠 token）使注意力 gather 保持 warp 内合并
 
-### 4. 调度（无损）
+### 4. ldmatrix warp 协作 fragment 加载（无损，第二轮核心）
 
-批量单 launch 替代逐 (b,h) 循环；权重/scratch 预分配；C2R plan 复用；warm 计时口径。
+- **工具链翻案**：cuda-device/wmma.rs 一直提供 ldmatrix_x1/x2/x4(.trans)，
+  "cuda-oxide 无 ldmatrix"是误记；由此打开第二轮优化。
+- 5 个热路径 GEMM + 双轴 flash 的 mma fragment 读全部换 ldmatrix：
+  A 用 x4（16×16），B 用 x4（[n][k] 行主 = B 转置存储，non-trans 分布
+  恰为 mma B fragment），PV 的 V 用 x2_trans（[key][d] = B 直存）。
+  GEMM 每 mma 组 20 条标量 LDS → 5 条 ldmatrix；flash 每 kt 迭代
+  80 LDS → 13 条。
+- shared swizzle 同步升级为 **16B chunk 级 XOR**（(c4^(row&7))*4，
+  与 cp.async 兼容、ldmatrix 行头 16B 对齐、8 行×4 词铺满 32 bank）。
+- ncu 依据：改造前 resid GEMM 42 条 warp 指令/mma、每 scheduler 每
+  21 cycle 一条（纯延迟受限）；改造后单 launch resid 1.0ms→204µs、
+  QKV 925→433µs、FF1 750→321µs。
+
+### 5. 调度（无损）
+
+批量单 launch 替代逐 (b,h) 循环；权重/scratch 预分配；C2R plan 复用；warm 计时口径；
+rmsnorm 的 gamma/8×256 gate_w 每 block staging 进 shared（gate_w 的
+每 warp 8KB 重读曾造成 ~132MB/launch 的 L2 流量）。
 
 ## 三、里程碑时间线
 
@@ -63,7 +85,12 @@ FF1+GELU 9.0、mask 两级 4.9、RMSNorm 2.9、STFT/FFT/杂项 1.4。
   └─ 全链 f16 激活存储（3 步）            91.9   (1.32×)
   └─ h16 链 + mask hidden f16            88.9   (1.36×)
   └─ flash 词级 swizzle                  87.0   (1.39×)
-  └─ GEMM 词级 swizzle                   73.5   (1.64×) ✅
+  └─ GEMM 词级 swizzle                   73.5   (1.64×)
+  └─ GPU OLA + 全异步整曲流水             整曲 6.57s
+  └─ cp.async 双缓冲时间轴 flash          67.3   (1.80×)
+  └─ GEMM ldmatrix x4 + chunk swizzle    63.1
+  └─ flash 双轴 ldmatrix                  58.7
+  └─ tc/rmsnorm 收尾                      58.2   (2.07×) ✅ 整曲 5.53s (1.75×)
 ```
 
 ## 四、正确性验证体系
@@ -89,7 +116,9 @@ FF1+GELU 9.0、mask 两级 4.9、RMSNorm 2.9、STFT/FFT/杂项 1.4。
 | pre2/glu 链 f16 | 零提速，SNR −3.7dB | pre-GLU 激活的 f16 往返直接进频谱掩码 |
 | 双流并发（探测实测） | +3.8%（67.3→64.7ms） | 共驻块争抢 LDS/LSU；投入产出比不足，不投入 |
 | K/V 注意力主序预重排（RoPE 前移） | 时间轴 25.8→33.2ms，整曲 7.02→8.41s | 折叠布局聚合访问本就是顺序扫描；逐 grp 连续反而打散 DRAM 页局部性 |
-| cuBLAS / cuBLASLt | 不可用 | 与 cuda-oxide 上下文/流冲突（719 错误） |
+| 128×128/512thr 大 tile QKV（warp 4×4 各 32×32，acc 无 spill） | 64.54ms（+5.8ms） | A 流量减半 < 512 线程 barrier + A-ldmatrix 翻倍；ldm/mma 5/8→6/8 |
+| cargo-oxide --unchecked-indexing | 66.75ms（+3.7ms） | 去掉 predicated 边界检查反而打乱寄存器分配/调度 |
+| cuBLAS / cuBLASLt | 未集成（留作天花板参照） | 719 冲突实为 context/stream 绑定可修；microbench：resid 形状 42.8 TFLOPS（我方 20× 差距），工具链内自有手段已试尽 |
 
 工具链两条硬约束：**非 2 幂行距惩罚**、**嵌套寄存器数组必 spill**。
 
@@ -97,17 +126,17 @@ FF1+GELU 9.0、mask 两级 4.9、RMSNorm 2.9、STFT/FFT/杂项 1.4。
 
 | 组件 | PyTorch | 本实现 |
 |---|---|---|
-| GEMM 合计 | 58.5ms（cuBLAS SGEMM ~17 TFLOP/s） | 37ms（f16 ~15→swizzle 后 ~25 TFLOP/s） |
-| 注意力 | 24.6ms（fmha fp32，2.56 TFLOP/s） | 33.0ms（flash f16，含 RoPE+门控融合） |
+| GEMM 合计 | 58.5ms（cuBLAS SGEMM ~17 TFLOP/s） | ~28.7ms（ldmatrix f16；cuBLASLt f16 同形状 42-57 TFLOP/s 为参照上限） |
+| 注意力 | 24.6ms（fmha fp32，2.56 TFLOP/s） | ~27.3ms（双轴 flash ldmatrix，含 RoPE+门控融合；L2 带宽墙） |
 | elementwise | ~36ms | ~4ms（全部融合进 epilogue） |
 
-GEMM 已超 cuBLAS fp32；注意力绝对值仍高 8ms 但融合了 RoPE/门控/重组，
-有效吞吐口径不同。
+GEMM 已超 cuBLAS fp32 一倍；距 cuBLASLt f16 还有 ~2×（需 warp-spec
+producer/consumer，工具链暂无 async barrier）。
 
 ## 七、产物
 
-- 代码：`src/main.rs`（全部 CUDA 内核 + host 编排），提交至 `07b7ca4`
-- 文档：`README.md`、`docs/BENCHMARK.md`（31 轮完整实验日志）
+- 代码：`src/main.rs`（全部 CUDA 内核 + host 编排），main 分支（ldmatrix 系列至 `0fe398e`）
+- 文档：`README.md`、`docs/BENCHMARK.md`（43 轮完整实验日志）
 - 工具：`tools/bench_ref.py`（PyTorch 基线）、`lbrr --bench/--separate/--forward-only`、
   `tools/separate_ref.py`（pymss 分离）、`tools/download_file.js`（分块下载）
 - 本地 stem：`separated_local/cyberangel_{vocals,other}.mp3`
