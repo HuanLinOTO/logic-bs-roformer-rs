@@ -208,6 +208,15 @@ ncu（32 距离 flash）：时间轴 2.54 ms/launch，L2 82.9%、DRAM 70.7%
 均净收益；GEMM 的 mma/LDS 相不变（gemm_f16_async 早已暗示 GEMM 墙不在
 加载侧，收益主要来自 flash 与 epilogue）。
 
+### 第 30 轮：h16 链 + mask hidden_t f16
+
+1. **rmsnorm_gates_h16**：归一化输出经 shuffle_xor 配对打包成 f16x2 词
+   （偶 lane 取奇邻居值；shuffle 必须在分支外全收敛执行——首版在
+   if 内 shuffle 导致 SNR 0.32，已修复）。QKV GEMM（hout）A 改纯词拷贝。
+   91.9 → **89.3 ms**。
+2. **mask hidden_t f16**：gemm1 tanh epilogue 打包（394→197 MB 写流），
+   gemm2 A 词拷贝（读流减半）。89.3 → **88.9 ms（1.360×，RTF 0.0296）**。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
