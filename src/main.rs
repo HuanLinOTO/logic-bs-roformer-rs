@@ -3718,7 +3718,7 @@ mod gpu_kernels {
     pub fn mask_gemm1_f16(
         t_rows: u32, group_base: u32,
         x: &[f32], w: &[f32], bias: &[f32],
-        mut y: DisjointSlice<f32>,
+        mut y: DisjointSlice<u32>,
     ) {
         // Packed f16 shared tiles. SA is row-major with adjacent K pairs;
         // SB is column-major with adjacent K pairs, matching the MMA fragments
@@ -3743,7 +3743,7 @@ mod gpu_kernels {
         let x_off = band * m_size * 256;
         let w_off = band * 1024 * 256;
         let bias_off = band * 1024;
-        let y_off = out_group * m_size * 1024;
+        let y_off = out_group * m_size * 512; // word stride (f16x2)
         let mut acc = [[0.0f32; 4]; 8];
 
         // K tiles of 64 with float4 loads: 4x fewer barriers and load
@@ -3816,16 +3816,31 @@ mod gpu_kernels {
             thread::sync_threads();
         }
 
+        // tanh epilogue packed to f16x2 words (adjacent columns share a
+        // lane-row), halving the 394 MB hidden stream.
         let out_ptr = y.as_mut_ptr();
+        let half_n = n_size / 2;
         for nt in 0..8usize {
-            for j in 0..4usize {
-                let r = row_base + group + if j >= 2 { 8 } else { 0 };
-                let cc = col_base + nt * 8 + tig * 2 + (j & 1);
-                if r < m_size && cc < n_size {
-                    // SAFETY: bounds checked; y has m*n elements.
-                    unsafe {
-                        *out_ptr.add(y_off + r * n_size + cc) = (acc[nt][j] + bias[bias_off + cc]).tanh();
-                    }
+            let cw = (col_base + nt * 8 + tig * 2) / 2;
+            let r_lo = row_base + group;
+            let r_hi = r_lo + 8;
+            let (b0, b1) = (bias[bias_off + col_base + nt * 8 + tig * 2], bias[bias_off + col_base + nt * 8 + tig * 2 + 1]);
+            if r_lo < m_size && cw < half_n {
+                // SAFETY: bounds checked; y has groups*m*half_n words.
+                unsafe {
+                    *out_ptr.add(y_off + r_lo * half_n + cw) = cuda_device::convert::cvt_f16x2_f32(
+                        (acc[nt][0] + b0).tanh(),
+                        (acc[nt][1] + b1).tanh(),
+                    );
+                }
+            }
+            if r_hi < m_size && cw < half_n {
+                // SAFETY: bounds checked.
+                unsafe {
+                    *out_ptr.add(y_off + r_hi * half_n + cw) = cuda_device::convert::cvt_f16x2_f32(
+                        (acc[nt][2] + b0).tanh(),
+                        (acc[nt][3] + b1).tanh(),
+                    );
                 }
             }
         }
@@ -3838,7 +3853,7 @@ mod gpu_kernels {
     pub fn mask_gemm2_f16(
         t_rows: u32, group_base: u32, out_width: u32,
         band_off: &[u32],
-        x: &[f32], w: &[f32], bias: &[f32],
+        x: &[u32], w: &[f32], bias: &[f32],
         mut y: DisjointSlice<f32>,
     ) {
         // Packed f16 shared tiles. SA is row-major with adjacent K pairs;
@@ -3865,7 +3880,7 @@ mod gpu_kernels {
             return;
         }
         let out_group = group_base as usize + band;
-        let x_off = out_group * m_size * 1024;
+        let x_off = out_group * m_size * 512; // word stride (f16x2)
         let w_off = (2 * band_off[band] as usize) * 1024;
         let bias_off = 2 * band_off[band] as usize;
         let out_width = out_width as usize;
@@ -3877,21 +3892,20 @@ mod gpu_kernels {
         for ks in 0..num_k {
             let k_base = ks * 64;
             unsafe {
-                for i in 0..8usize {
+                // A: f16x2 words from hidden_t, 4 four-word chunks/thread.
+                for i in 0..4usize {
                     let idx = tid + i * 256;
-                    let r = idx / 16;
-                    let q4 = idx % 16;
+                    let r = idx / 8;
+                    let c4 = idx % 8;
                     let xr = block_row_base + r;
-                    let k0 = k_base + q4 * 4;
-                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-                    if xr < m_size && k0 + 3 < k_size {
-                        // SAFETY: k0 % 4 == 0 gives 16 B alignment.
-                        let src = x.as_ptr().add(x_off + xr * k_size + k0);
-                        let v: [f32; 4] = *(src as *const [f32; 4]);
-                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    // SAFETY: 16 B aligned words in SA; source row stride 512.
+                    let dst = (std::ptr::addr_of_mut!(SA) as *mut u32).add(r * 32 + c4 * 4);
+                    if xr < m_size {
+                        let src = x.as_ptr().add(x_off + xr * 512 + k_base / 2 + c4 * 4);
+                        *(dst as *mut [u32; 4]) = *(src as *const [u32; 4]);
+                    } else {
+                        *(dst as *mut [u32; 4]) = [0; 4];
                     }
-                    SA[r * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SA[r * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
                 for i in 0..4usize {
                     let idx = tid + i * 256;
@@ -5656,9 +5670,8 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     // glu_all: (stem, band, t, dim_in) padded to max_dim.
     let max_dim = 2 * 129 * 2; // 516
     let mut glu_all = DeviceBuffer::<f32>::zeroed(&stream, 6 * bands * t_frames * max_dim).unwrap();
-    let hidden_sz = 6 * bands * t_frames * 1024;
-    let mut hidden = DeviceBuffer::<f32>::zeroed(&stream, hidden_sz).unwrap();
-    let mut hidden_t = DeviceBuffer::<f32>::zeroed(&stream, hidden_sz).unwrap();
+    let hidden_words = 6 * bands * t_frames * 512;
+    let mut hidden_t = DeviceBuffer::<u32>::zeroed(&stream, hidden_words).unwrap();
     // GEMM2 output rows are padded to 2*max_dim so GLU can read both halves.
     let pre_width = 2 * max_dim;
     let mut pre2_all = DeviceBuffer::<f32>::zeroed(&stream, 6 * bands * t_frames * pre_width).unwrap();
@@ -5823,7 +5836,7 @@ struct BenchBufs {
     x_final: DeviceBuffer<f32>,
     xb: DeviceBuffer<f32>,
     glu_all: DeviceBuffer<f32>,
-    hidden_t: DeviceBuffer<f32>,
+    hidden_t: DeviceBuffer<u32>,   // packed f16x2
     pre2_all: DeviceBuffer<f32>,
     c2r_in: DeviceBuffer<f32>,
     pcm: DeviceBuffer<f32>,
@@ -6019,7 +6032,7 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize) {
         x_final: z(m * 256),
         xb: z(m * 256),
         glu_all: z(6 * bands * t_frames * 516),
-        hidden_t: z(6 * bands * t_frames * 1024),
+        hidden_t: DeviceBuffer::<u32>::zeroed(&stream, 6 * bands * t_frames * 512).unwrap(),
         pre2_all: z(6 * bands * t_frames * 2 * 516),
         c2r_in: z(12 * t_frames * stft::FREQ_BINS * 2),
         pcm: z(12 * t_frames * 2048),
