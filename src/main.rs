@@ -8,6 +8,7 @@
 mod audio;
 mod config;
 mod cublas;
+mod cublaslt;
 mod cufft;
 mod kernels;
 mod npz;
@@ -5587,9 +5588,14 @@ struct GpuWeights {
     ff_gamma: Vec<DeviceBuffer<f32>>,   // [24]
     ff_w1: Vec<DeviceBuffer<f32>>,      // [24] (1024*256)
     ff_b1: Vec<DeviceBuffer<f32>>,      // [24]
+    // f16-packed FF1 bias for the cuBLASLt GELU_BIAS path.
+    ff_b1_h: Vec<DeviceBuffer<u32>>,    // [24]
     ff_w2: Vec<DeviceBuffer<f32>>,      // [24] (256*1024)
     ff_b2: Vec<DeviceBuffer<f32>>,      // [24]
     shared_qkv_bias: DeviceBuffer<f32>,
+    // f16-packed copy for the cuBLASLt QKV path (its f16-D epilogue requires
+    // an f16 bias vector).
+    shared_qkv_bias_h: DeviceBuffer<u32>,
     shared_out_bias: DeviceBuffer<f32>,
     final_norm: DeviceBuffer<f32>,
     band_gamma: DeviceBuffer<f32>,
@@ -5631,6 +5637,12 @@ struct E2eScratch {
     zero_bias_64: DeviceBuffer<f32>,
     attn_max: DeviceBuffer<f32>,
     attn_scale: DeviceBuffer<f32>,
+    // cuBLASLt accelerator (lazily created on first transformer step; on any
+    // load failure the hand-written kernels keep running — see lt_ready).
+    lt: Option<cublaslt::CublasLt>,
+    lt_ws: Option<DeviceBuffer<u8>>,
+    lt_dummy: Option<DeviceBuffer<u8>>,
+    lt_dead: bool,
 }
 
 fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights::ModelWeights) -> Result<GpuWeights, String> {
@@ -5663,12 +5675,14 @@ fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights:
     let mut out_w_h = Vec::new();
     let mut ff_w1_h = Vec::new();
     let mut ff_w2_h = Vec::new();
+    let mut ff_b1_h = Vec::new();
     for layer in &w.layers {
         for (attn, ff) in [layer.time.clone(), layer.freq.clone()] {
             qkv_w_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&attn.to_qkv_w)).map_err(|e| e.to_string())?);
             out_w_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&attn.to_out_w)).map_err(|e| e.to_string())?);
             ff_w1_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&ff.w1)).map_err(|e| e.to_string())?);
             ff_w2_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&ff.w2)).map_err(|e| e.to_string())?);
+            ff_b1_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&ff.b1)).map_err(|e| e.to_string())?);
         }
     }
     let mut mask_w1 = Vec::new();
@@ -5698,12 +5712,14 @@ fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights:
         ff_w2,
         ff_b2,
         qkv_w_h,
+        ff_b1_h,
         mask_w1_h,
         mask_w2_h,
         out_w_h,
         ff_w1_h,
         ff_w2_h,
         shared_qkv_bias: up(&w.shared_qkv_bias)?,
+        shared_qkv_bias_h: DeviceBuffer::from_host(stream, &pack_f16x2(&w.shared_qkv_bias)).map_err(|e| e.to_string())?,
         shared_out_bias: up(&w.shared_out_bias)?,
         final_norm: up(&w.final_norm_gamma)?,
         band_gamma: up(&w.band_gamma.concat())?,
@@ -5716,6 +5732,48 @@ fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights:
     })
 }
 
+
+/// Lazily create the cuBLASLt handle + workspace inside `scratch`. On
+/// unavailability (LBRR_NO_LT set, alloc or dlopen failure) the callers keep
+/// the hand-written kernels; failure is sticky so a broken lib never wedges
+/// the pipeline.
+fn lt_ready(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, scratch: &mut E2eScratch, m: usize) {
+    if scratch.lt_dead || scratch.lt.is_some() || std::env::var_os("LBRR_NO_LT").is_some() {
+        return;
+    }
+    let ws_size = 32usize << 20;
+    let ws = match DeviceBuffer::<u8>::zeroed(stream, ws_size) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[lt] workspace alloc failed: {e}; using hand-written GEMMs");
+            scratch.lt_dead = true;
+            return;
+        }
+    };
+    // Autotune scratch: covers the largest matrix role (qkv D = m*1536 f16
+    // = m*3072 bytes) plus slack.
+    let dummy_size = m * 3072 + (1 << 20);
+    let dummy = match DeviceBuffer::<u8>::zeroed(stream, dummy_size) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[lt] dummy alloc failed: {e}; using hand-written GEMMs");
+            scratch.lt_dead = true;
+            return;
+        }
+    };
+    match cublaslt::CublasLt::load(ctx, ws.cu_deviceptr() as u64, ws_size, dummy.cu_deviceptr() as u64, dummy_size) {
+        Ok(lt) => {
+            eprintln!("[lt] cuBLASLt handle ready");
+            scratch.lt_ws = Some(ws);
+            scratch.lt_dummy = Some(dummy);
+            scratch.lt = Some(lt);
+        }
+        Err(e) => {
+            eprintln!("[lt] load failed: {e}; using hand-written GEMMs");
+            scratch.lt_dead = true;
+        }
+    }
+}
 
 /// One full transformer layer step on the folded token tensor x (M, 256).
 /// axis 0 = time (seq=T rows per f), 1 = freq (seq=62 rows per t).
@@ -5733,6 +5791,7 @@ unsafe fn transformer_step(
 ) -> Result<(), String> {
     let m = t_frames * bands; // 71342
     let idx = layer_idx * 2 + axis;
+    lt_ready(_ctx, stream, scratch, m);
     let launch1 = |n: u32| cuda_core::simt::LaunchConfig::for_num_elems(n);
     // 1. pre-attention RMSNorm
     // SAFETY: one warp per row over m rows.
@@ -5740,13 +5799,20 @@ unsafe fn transformer_step(
         km.rmsnorm_gates_h16(stream, launch1((m * 32) as u32), x, &gw.norm_gamma[idx], &gw.gates_w[idx], &gw.gates_b[idx], &mut scratch.h16, &mut scratch.gates, m as u32, 256)
     }.map_err(|e| e.to_string())?;
 
-    // 2. QKV GEMM (M,256 -> 1536) with shared bias. The float4-loading
-    // variant wins: cp.async pipelining measured identical kernel time
-    // (L1TEX shared-read bound, not global-load bound) plus pack overhead.
-    // SAFETY: 2-D tile grid over m x 1536.
-    unsafe {
-        km.gemm_f16_128x64_hout(stream, tile_cfg_tf32_64(m, 1536), m as u32, 1536, 256, &scratch.h16, &gw.qkv_w_h[idx], &gw.shared_qkv_bias, &mut scratch.qkv16)
-    }.map_err(|e| e.to_string())?;
+    // 2. QKV GEMM (M,256 -> 1536) with shared bias. cuBLASLt hosts it
+    // (f16 out + f32-bias epilogue matches the packed row-major layout);
+    // the hand-written hout kernel stays as the fallback path.
+    if let Some(lt) = scratch.lt.as_mut() {
+        lt.matmul_f16out(stream.cu_stream() as usize, m as u64, 1536, 256,
+            gw.qkv_w_h[idx].cu_deviceptr(), scratch.h16.cu_deviceptr(),
+            gw.shared_qkv_bias_h.cu_deviceptr(), scratch.qkv16.cu_deviceptr(), false)
+            .map_err(|e| e.to_string())?;
+    } else {
+        // SAFETY: 2-D tile grid over m x 1536.
+        unsafe {
+            km.gemm_f16_128x64_hout(stream, tile_cfg_tf32_64(m, 1536), m as u32, 1536, 256, &scratch.h16, &gw.qkv_w_h[idx], &gw.shared_qkv_bias, &mut scratch.qkv16)
+        }.map_err(|e| e.to_string())?;
+    }
 
     // RoPE and attention-major reordering are fused into the raw-QKV
     // QK/PV attention kernels below.
@@ -5772,26 +5838,46 @@ unsafe fn transformer_step(
                 .map_err(|e| e.to_string())?;
         }
     }
-    // 7. gate application was fused into attn_v_to_flat; out proj reads scaled.
-    // SAFETY: 2-D tile grid over m x 256.
-    unsafe {
-        km.gemm_f16_resid_a16(stream, tile_cfg_tf32_64(m, 256), m as u32, 256, 512, &scratch.scaled16, &gw.out_w_h[idx], &gw.shared_out_bias, x, &mut scratch.attn_out)
-    }.map_err(|e| e.to_string())?;
+    // 7. gate application was fused into attn_v_to_flat; out proj reads
+    // scaled. cuBLASLt hosts it: f32 out + bias epilogue + residual via
+    // beta·C (C = x residual buffer, D = attn_out, C≠D).
+    if let Some(lt) = scratch.lt.as_mut() {
+        lt.matmul_resid(stream.cu_stream() as usize, m as u64, 256, 512,
+            gw.out_w_h[idx].cu_deviceptr(), scratch.scaled16.cu_deviceptr(),
+            gw.shared_out_bias.cu_deviceptr(), x.cu_deviceptr(), scratch.attn_out.cu_deviceptr())
+            .map_err(|e| e.to_string())?;
+    } else {
+        // SAFETY: 2-D tile grid over m x 256.
+        unsafe {
+            km.gemm_f16_resid_a16(stream, tile_cfg_tf32_64(m, 256), m as u32, 256, 512, &scratch.scaled16, &gw.out_w_h[idx], &gw.shared_out_bias, x, &mut scratch.attn_out)
+        }.map_err(|e| e.to_string())?;
+    }
     // Residual addition is fused into the out-projection epilogue.
     // 8. FF: norm -> w1+gelu -> w2 -> residual
     // SAFETY: one warp per row.
     unsafe {
         km.rmsnorm_h16(stream, launch1((m * 32) as u32), &scratch.attn_out, &gw.ff_gamma[idx], &mut scratch.h16, m as u32, 256)
     }.map_err(|e| e.to_string())?;
+    // FF1 stays on the erf-form hand-written kernel: the cuBLASLt
+    // GELU_BIAS epilogue (tanh form) measured only ~0.2 ms faster per iter
+    // but dropped the golden SNR by 0.5 dB — rejected on that trade.
     // SAFETY: 2-D tile grid over m x 1024.
     unsafe {
         km.gemm_f16_gelu_a16w(stream, tile_cfg_tf32_64(m, 1024), m as u32, 1024, 256, &scratch.h16, &gw.ff_w1_h[idx], &gw.ff_b1[idx], &mut scratch.ff1_16)
     }.map_err(|e| e.to_string())?;
-    // GELU is fused into the FF1 tensor-core epilogue.
-    // SAFETY: 2-D tile grid over m x 256.
-    unsafe {
-        km.gemm_f16_resid_a16(stream, tile_cfg_tf32_64(m, 256), m as u32, 256, 1024, &scratch.ff1_16, &gw.ff_w2_h[idx], &gw.ff_b2[idx], &scratch.attn_out, x)
-    }.map_err(|e| e.to_string())?;
+    // GELU is fused into the FF1 tensor-core epilogue. cuBLASLt FF2:
+    // f32 out + bias + residual via beta·C (C = attn_out, D = x).
+    if let Some(lt) = scratch.lt.as_mut() {
+        lt.matmul_resid(stream.cu_stream() as usize, m as u64, 256, 1024,
+            gw.ff_w2_h[idx].cu_deviceptr(), scratch.ff1_16.cu_deviceptr(),
+            gw.ff_b2[idx].cu_deviceptr(), scratch.attn_out.cu_deviceptr(), x.cu_deviceptr())
+            .map_err(|e| e.to_string())?;
+    } else {
+        // SAFETY: 2-D tile grid over m x 256.
+        unsafe {
+            km.gemm_f16_resid_a16(stream, tile_cfg_tf32_64(m, 256), m as u32, 256, 1024, &scratch.ff1_16, &gw.ff_w2_h[idx], &gw.ff_b2[idx], &scratch.attn_out, x)
+        }.map_err(|e| e.to_string())?;
+    }
     // Residual addition is fused into the FF2 epilogue.
     Ok(())
 }
@@ -6043,6 +6129,10 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         zero_bias_64: z(64),
         attn_max: z(m * 8),
         attn_scale: z(m * 8),
+        lt: None,
+        lt_ws: None,
+        lt_dummy: None,
+        lt_dead: false,
     };
 
     // staged references for bisection
@@ -6753,6 +6843,10 @@ k16r: DeviceBuffer::<u32>::zeroed(st, m * 256).unwrap(),
             zero_bias_64: zt(64),
             attn_max: zt(m * 8),
             attn_scale: zt(m * 8),
+            lt: None,
+            lt_ws: None,
+            lt_dummy: None,
+            lt_dead: false,
         },
         x_final: zt(m * 256),
         xb: zt(m * 256),
@@ -7070,6 +7164,10 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             zero_bias_64: z(64),
             attn_max: z(m * 8),
             attn_scale: z(m * 8),
+            lt: None,
+            lt_ws: None,
+            lt_dummy: None,
+            lt_dead: false,
         },
         x_final: z(m * 256),
         xb: z(m * 256),
@@ -7259,6 +7357,10 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             zero_bias_64: z(64),
             attn_max: z(m * 8),
             attn_scale: z(m * 8),
+            lt: None,
+            lt_ws: None,
+            lt_dummy: None,
+            lt_dead: false,
         },
         x_final: z(m * 256),
         xb: z(m * 256),
