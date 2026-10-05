@@ -109,6 +109,20 @@ gelu FF1   14.5 ms / 202 GFLOP = 13.9 TFLOP/s
 mask 两级   8.3 ms / ~90 GFLOP ≈ 11 TFLOP/s
 ```
 
+### 第 24 轮（2026-10-05 晚）补充
+
+1. **行距惩罚的再发现与量化**：33/9 字填充使全部 f16 内核统一变慢 5-7×
+   （gemm 765→3850 µs、QK 677→3974 µs、mask1 822→5843 µs），SNR 不变。
+   非 2 次幂行距在当前 cuda-oxide 代码生成下有系统性惩罚；bank 冲突路径
+   （padding/XOR swizzle）两轮证伪，彻底关闭。
+2. **flash 内核回退到 32 字行距后**：频率轴 0.90→~0.79 ms/launch；时间轴
+   flash 从 3.34（33 距离）降到 ~2.6 ms/launch，**追平旧三段链**（此前
+   "时间轴 flash 更慢"的结论部分是 33 距离惩罚造成的）。现已双轴统一
+   flash：单一代码路径，softmax_stats 与 p_big 流量彻底消失，
+   wall 107.5 ms（RTF 0.0358），SNR 80.87 dB。
+3. 当前分布（每前向）：注意力 38.6 ms（35%）、三 GEMM 57 ms（52%）、
+   mask 8.3、rmsnorm 3.3、misc 1.5。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
