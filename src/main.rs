@@ -2160,6 +2160,105 @@ mod gpu_kernels {
         }
     }
 
+    /// Residual GEMM with f16x2-word operands (activation + weight), f32
+    /// epilogue. Same tile geometry as gemm_f16_residual_128x64; the A/B
+    /// loaders copy four-word chunks without any conversion.
+    #[kernel]
+    pub fn gemm_f16_resid_a16(
+        m: u32, n: u32, k: u32,
+        x: &[u32], w: &[u32], bias: &[f32], resid: &[f32],
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut SA: SharedArray<u32, { 128 * 32 }> = SharedArray::UNINIT;
+        static mut SB: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let warp_id = tid / 32;
+        let group = lane / 4;
+        let tig = lane % 4;
+        let block_row_base = thread::blockIdx_y() as usize * 128;
+        let row_base = block_row_base + warp_id * 16;
+        let col_base = thread::blockIdx_x() as usize * 64;
+        let (m_size, n_size, k_size) = (m as usize, n as usize, k as usize);
+        let half_k = k_size / 2;
+        let mut acc = [[0.0f32; 4]; 8];
+        let num_k = k_size.div_ceil(64);
+        for ks in 0..num_k {
+            let k_base = ks * 64;
+            unsafe {
+                // A: 128 rows x 8 four-word chunks, 4 per thread.
+                for i in 0..4usize {
+                    let idx = tid + i * 256;
+                    let r = idx / 8;
+                    let c4 = idx % 8;
+                    let xr = block_row_base + r;
+                    // SAFETY: destinations are 16 B aligned words in SA;
+                    // sources are 16 B aligned (half_k is a multiple of 4).
+                    let dst = (std::ptr::addr_of_mut!(SA) as *mut u32).add(r * 32 + c4 * 4);
+                    if xr < m_size {
+                        let src = x.as_ptr().add(xr * half_k + k_base / 2 + c4 * 4);
+                        *(dst as *mut [u32; 4]) = *(src as *const [u32; 4]);
+                    } else {
+                        *(dst as *mut [u32; 4]) = [0; 4];
+                    }
+                }
+                // B: 64 columns x 8 chunks, 2 per thread.
+                for i in 0..2usize {
+                    let idx = tid + i * 256;
+                    let col = idx / 8;
+                    let c4 = idx % 8;
+                    let bc = col_base + col;
+                    // SAFETY: same alignment argument as A.
+                    let dst = (std::ptr::addr_of_mut!(SB) as *mut u32).add(col * 32 + c4 * 4);
+                    if bc < n_size {
+                        let src = w.as_ptr().add(bc * half_k + k_base / 2 + c4 * 4);
+                        *(dst as *mut [u32; 4]) = *(src as *const [u32; 4]);
+                    } else {
+                        *(dst as *mut [u32; 4]) = [0; 4];
+                    }
+                }
+            }
+            thread::sync_threads();
+            for kk in 0..4usize {
+                let word = kk * 8;
+                let mut a = [0u32; 4];
+                // SAFETY: rows < 128, words < 32 inside SA.
+                unsafe {
+                    let r0 = warp_id * 16 + group;
+                    let r1 = r0 + 8;
+                    a[0] = SA[r0 * 32 + word + tig];
+                    a[1] = SA[r1 * 32 + word + tig];
+                    a[2] = SA[r0 * 32 + word + tig + 4];
+                    a[3] = SA[r1 * 32 + word + tig + 4];
+                }
+                for nt in 0..8usize {
+                    let mut b = [0u32; 2];
+                    // SAFETY: cols < 64, words < 32 inside SB.
+                    unsafe {
+                        let col_word = (nt * 8 + group) * 32 + word;
+                        b[0] = SB[col_word + tig];
+                        b[1] = SB[col_word + tig + 4];
+                    }
+                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
+                }
+            }
+            thread::sync_threads();
+        }
+        let out_ptr = y.as_mut_ptr();
+        for nt in 0..8usize {
+            for j in 0..4usize {
+                let r = row_base + group + if j >= 2 { 8 } else { 0 };
+                let cc = col_base + nt * 8 + tig * 2 + (j & 1);
+                if r < m_size && cc < n_size {
+                    // SAFETY: bounds checked; y has m*n elements.
+                    unsafe {
+                        *out_ptr.add(r * n_size + cc) = acc[nt][j] + bias[cc] + resid[r * n_size + cc];
+                    }
+                }
+            }
+        }
+    }
+
     /// FP16 tensor-core GEMM with residual addition fused into the epilogue.
     /// FP16 tensor-core GEMM, 128x64 tile / 256 threads. Inputs are fp32 in
     /// global memory; cooperative loads pack adjacent K values into f16x2.
@@ -2790,7 +2889,7 @@ mod gpu_kernels {
     pub fn attn_flash_tc(
         qkv: &[u32], cos: &[f32], sin: &[f32], gates: &[f32],
         bands: u32, axis: u32, seq: u32,
-        mut y: DisjointSlice<f32>,
+        mut y: DisjointSlice<u32>,
         mut dbg_m: DisjointSlice<f32>, mut dbg_l: DisjointSlice<f32>,
     ) {
         // 32-word rows (power of two): non-pow2 strides trigger a ~5x
@@ -3006,22 +3105,26 @@ mod gpu_kernels {
             l += warp::shuffle_xor_f32_sync(0xffffffff, l, 2);
             l_i[half] = l;
         }
+        // Epilogue packs pairs into f16x2 words (adjacent columns live on
+        // one lane-row), halving the 33 MB/launch output stream.
         let out_ptr = y.as_mut_ptr();
         for nt in 0..8usize {
-            for j in 0..4usize {
-                let half = j / 2;
+            for half in 0..2usize {
                 let row = row_base + if half == 0 { r0 } else { r1 };
                 if row < n_size {
-                    let cc = nt * 8 + tig * 2 + (j & 1);
                     let token = token_of(row);
                     let g = gates[token * 8 + head];
                     let sig = 1.0 / (1.0 + (-g).exp());
                     let inv = if l_i[half] > 0.0 { 1.0 / l_i[half] } else { 0.0 };
-                    // SAFETY: token < M (row < seq), cc < 64; y is M*512.
+                    let w0 = nt * 8 + tig * 2;
+                    // SAFETY: token < M, w0 < 64; y is M*256 words.
                     unsafe {
-                        *out_ptr.add(token * 512 + head * 64 + cc) = acc_pv[nt][j] * inv * sig;
+                        *out_ptr.add(token * 256 + head * 32 + w0 / 2) = cuda_device::convert::cvt_f16x2_f32(
+                            acc_pv[nt][half * 2] * inv * sig,
+                            acc_pv[nt][half * 2 + 1] * inv * sig,
+                        );
                     }
-                    if cc == 0 && (j & 1) == 0 {
+                    if w0 == 0 {
                         let dm = dbg_m.as_mut_ptr();
                         let dl = dbg_l.as_mut_ptr();
                         // SAFETY: grp*n_size+row < BH*seq <= buffer size.
@@ -4554,6 +4657,31 @@ fn pack_f16x2(v: &[f32]) -> Vec<u32> {
         .collect()
 }
 
+/// f16 bits -> f32 (exact), the DIAG-side inverse of cvt_f16x2_f32.
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) as u32) << 31;
+    let exp = ((h >> 10) & 0x1F) as i32;
+    let mant = (h & 0x3FF) as u32;
+    if exp == 0 {
+        if mant == 0 {
+            return f32::from_bits(sign);
+        }
+        // subnormal f16 -> normalized f32
+        let mut e = -1i32;
+        let mut m = mant;
+        while m & 0x400 == 0 {
+            m <<= 1;
+            e -= 1;
+        }
+        m &= 0x3FF;
+        return f32::from_bits(sign | (((127 - 15 + e) as u32) << 23) | (m << 13));
+    }
+    if exp == 0x1F {
+        return f32::from_bits(sign | 0x7F80_0000 | ((mant != 0) as u32) << 22);
+    }
+    f32::from_bits(sign | (((exp - 15 + 127) as u32) << 23) | (mant << 13))
+}
+
 struct GpuWeights {
     // transformer per layer per axis: qkv_w, gates_w, gates_b, out_w (shared biases shared once)
     qkv_w: Vec<DeviceBuffer<f32>>,      // [24] (1536*256)
@@ -4594,6 +4722,7 @@ struct E2eScratch {
     v_flat: DeviceBuffer<f32>,     // (M, 512)
     gates: DeviceBuffer<f32>,      // (M, 8)
     scaled: DeviceBuffer<f32>,     // (M, 512)
+    scaled16: DeviceBuffer<u32>,   // (M, 256) packed f16x2 attention output
     oproj: DeviceBuffer<f32>,      // (M, 256)
     attn_out: DeviceBuffer<f32>,   // (M, 256)
     ffpre: DeviceBuffer<f32>,      // (M, 1024)
@@ -4728,13 +4857,13 @@ unsafe fn transformer_step(
         // EXPERIMENT: both axes on the (now power-of-two-stride) flash kernel.
         // SAFETY: one 128-thread block per (BH group, 64-row query tile).
         unsafe {
-            km.attn_flash_tc(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, n_len.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], &scratch.gates, bands as u32, axis as u32, seq as u32, &mut scratch.scaled, &mut scratch.attn_max, &mut scratch.attn_scale)
+            km.attn_flash_tc(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, n_len.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], &scratch.gates, bands as u32, axis as u32, seq as u32, &mut scratch.scaled16, &mut scratch.attn_max, &mut scratch.attn_scale)
         }.map_err(|e| e.to_string())?;
     }
     // 7. gate application was fused into attn_v_to_flat; out proj reads scaled.
     // SAFETY: 2-D tile grid over m x 256.
     unsafe {
-        km.gemm_f16_residual_128x64(stream, tile_cfg_tf32_64(m, 256), m as u32, 256, 512, &scratch.scaled, &gw.out_w[idx], &gw.shared_out_bias, x, &mut scratch.attn_out)
+        km.gemm_f16_resid_a16(stream, tile_cfg_tf32_64(m, 256), m as u32, 256, 512, &scratch.scaled16, &gw.out_w_h[idx], &gw.shared_out_bias, x, &mut scratch.attn_out)
     }.map_err(|e| e.to_string())?;
     // Residual addition is fused into the out-projection epilogue.
     // 8. FF: norm -> w1+gelu -> w2 -> residual
@@ -4980,6 +5109,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
         h: z(m * 256),
         h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
         qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
+        scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         qkv: z(m * 1536),
         qkv_rope: z(m * 1536),
         qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64), // max of both axes' layouts
@@ -5181,7 +5311,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
         // SAFETY: tile grid over m x 1536.
         unsafe { km.gemm_f16_128x64(&stream, tile_cfg_tf32_64(m, 1536), m as u32, 1536, 256, &h0, &gw.qkv_w[0], &gw.shared_qkv_bias, &mut qkv0) }.unwrap();
         let mut s_old = DeviceBuffer::<f32>::zeroed(&stream, m * 512).unwrap();
-        let mut s_new = DeviceBuffer::<f32>::zeroed(&stream, m * 512).unwrap();
+        let mut s_new = DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap();
         let mut a_max = DeviceBuffer::<f32>::zeroed(&stream, m * 8).unwrap();
         let mut a_scale = DeviceBuffer::<f32>::zeroed(&stream, m * 8).unwrap();
         let bh_t = bands * 8;
@@ -5256,7 +5386,15 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
             }
         }
         let ov = s_old.to_host_vec(&stream).unwrap();
-        let nv = s_new.to_host_vec(&stream).unwrap();
+        let nv_words = s_new.to_host_vec(&stream).unwrap();
+        let nv: Vec<f32> = nv_words
+            .iter()
+            .flat_map(|&wd| {
+                let lo = f16_bits_to_f32((wd & 0xFFFF) as u16);
+                let hi = f16_bits_to_f32((wd >> 16) as u16);
+                [lo, hi]
+            })
+            .collect();
         let (mut me, mut dn, mut bad) = (0.0f32, 0.0f32, 0usize);
         let mut bad_by_tile = [0usize; 5];
         let mut bad_by_head = [0usize; 8];
@@ -5670,6 +5808,7 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize) {
             h: z(m * 256),
             h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
         qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
+        scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             qkv: z(m * 1536),
             qkv_rope: z(m * 1536),
             qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64),
