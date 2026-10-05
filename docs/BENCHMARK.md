@@ -217,6 +217,17 @@ ncu（32 距离 flash）：时间轴 2.54 ms/launch，L2 82.9%、DRAM 70.7%
 2. **mask hidden_t f16**：gemm1 tanh epilogue 打包（394→197 MB 写流），
    gemm2 A 词拷贝（读流减半）。89.3 → **88.9 ms（1.360×，RTF 0.0296）**。
 
+### 第 31 轮：flash XOR swizzle（净收益）+ GEMM swizzle 证伪
+
+- ncu：flash 的 shared 访问 80% 是 bank 冲突浪费（58.9M wavefronts 中
+  46.8M excessive）。
+- **词级 XOR swizzle**（w' = w ^ (row & 7)，纯 pow2 运算，行距保持 32）：
+  flash 88.9 → **87.0 ms（1.388×）**。
+- **GEMM chunk 级 swizzle**（c4' = c4 ^ (row&7)，保留 STS.128 块写）：
+  **360 ms**——复杂移位/异或地址表达式同样触发代码生成惩罚（与非 2 次幂
+  行距同源的 ~4× 惩罚）。GEMM 的冲突优化第三次证伪（33 距离、词级
+  swizzle 的复杂形态、chunk swizzle），仅 flash 的简单 XOR 形式可用。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
