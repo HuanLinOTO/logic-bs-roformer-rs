@@ -37,6 +37,8 @@ struct Args {
     attn_test: bool,
     gateff_test: bool,
     e2e_test: bool,
+    separate: bool,
+    forward_only: bool,
     reorder_test: bool,
     bench: bool,
     iters: usize,
@@ -68,6 +70,8 @@ fn parse_args() -> Result<Args, String> {
             "--attn-test" => args.attn_test = true,
             "--gateff-test" => args.gateff_test = true,
             "--e2e-test" => args.e2e_test = true,
+            "--separate" => args.separate = true,
+            "--forward-only" => args.forward_only = true,
             "--reorder-test" => args.reorder_test = true,
             "--bench" => args.bench = true,
             "--iters" => args.iters = need("--iters")?.parse().map_err(|_| "bad --iters")?,
@@ -113,6 +117,20 @@ fn main() {
 
     if args.e2e_test {
         e2e_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        return;
+    }
+
+    if args.forward_only {
+        let input = args.input.clone().expect("--input required");
+        let outdir = args.outdir.clone().unwrap_or_else(|| PathBuf::from("separated"));
+        forward_only(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), &input, &outdir);
+        return;
+    }
+
+    if args.separate {
+        let input = args.input.clone().expect("--input required for --separate");
+        let outdir = args.outdir.clone().unwrap_or_else(|| PathBuf::from("separated"));
+        separate(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), &input, &outdir);
         return;
     }
 
@@ -3329,12 +3347,19 @@ mod gpu_kernels {
                         );
                     }
                     if w0 == 0 {
-                        let dm = dbg_m.as_mut_ptr();
-                        let dl = dbg_l.as_mut_ptr();
-                        // SAFETY: grp*n_size+row < BH*seq <= buffer size.
-                        unsafe {
-                            *dm.add(grp * n_size + row) = m_i[half];
-                            *dl.add(grp * n_size + row) = l_i[half];
+                        // Diagnostic-only write: the freq axis indexes by
+                        // grp*62+row which can exceed the caller's buffer at
+                        // large T (T=259 fits exactly, T=1151 overflows by
+                        // ~200 words and corrupts adjacent allocations).
+                        let di = grp * n_size + row;
+                        if di < dbg_m.len() && di < dbg_l.len() {
+                            let dm = dbg_m.as_mut_ptr();
+                            let dl = dbg_l.as_mut_ptr();
+                            // SAFETY: bounds checked above.
+                            unsafe {
+                                *dm.add(di) = m_i[half];
+                                *dl.add(di) = l_i[half];
+                            }
                         }
                     }
                 }
@@ -5881,6 +5906,7 @@ unsafe fn bench_forward(
     len: usize,
     t_frames: usize,
     bands: usize,
+    trunk_dump: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let m = t_frames * bands;
     let max_dim = 516usize;
@@ -5909,10 +5935,43 @@ unsafe fn bench_forward(
         km.bandsplit_gemm_f16(stream, LaunchConfig { grid_dim: (4, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
             &b.offs_dev, &b.dims_dev, &b.bsnorm, &gw.band_w, &gw.band_b, &mut b.x, t_frames as u32, bands as u32, max_dim as u32)
     }.map_err(|e| e.to_string())?;
+    if trunk_dump.is_some() {
+        {
+            let v = b.spec_dev.to_host_vec(&stream).unwrap();
+            let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+            std::fs::write("x_spec.bin", bytes).unwrap();
+            println!("dump x_spec.bin ({} floats)", v.len());
+        }
+        {
+            let v = b.frames_dev.to_host_vec(&stream).unwrap();
+            let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+            std::fs::write("x_frames.bin", bytes).unwrap();
+            println!("dump x_frames.bin ({} floats)", v.len());
+        }
+        {
+            let v = b.xin_dev.to_host_vec(&stream).unwrap();
+            let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+            std::fs::write("x_xin.bin", bytes).unwrap();
+            println!("dump x_xin.bin ({} floats)", v.len());
+        }
+        let v = b.x.to_host_vec(&stream).unwrap();
+        let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        std::fs::write("x_bs.bin", bytes).unwrap();
+        println!("layer dump x_bs.bin ({} floats)", v.len());
+    }
     // 4. trunk
     for layer in 0..12usize {
         for axis in 0..2usize {
             unsafe { transformer_step(km, ctx, stream, gw, layer, axis, &mut b.x, t_frames, bands, &mut b.scr)?; }
+            if let Some(_) = trunk_dump {
+                if (layer == 0) || (layer == 1 && axis == 1) || (layer == 11 && axis == 1) {
+                    let v = b.x.to_host_vec(&stream).unwrap();
+                    let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+                    let name = format!("x_L{}{}.bin", layer, axis);
+                    std::fs::write(&name, bytes).unwrap();
+                    println!("layer dump {} ({} floats)", name, v.len());
+                }
+            }
         }
     }
     // 5. final norm
@@ -5920,6 +5979,13 @@ unsafe fn bench_forward(
     unsafe {
         km.rmsnorm(stream, elems(m * 32), &b.x, &gw.final_norm, &mut b.x_final, m as u32, 256)
     }.map_err(|e| e.to_string())?;
+    if let Some(p) = trunk_dump {
+        let v = b.x_final.to_host_vec(&stream).unwrap();
+        // SAFETY: raw little-endian f32 bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        std::fs::write(p, bytes).expect("trunk dump");
+        println!("trunk dumped: {} floats -> {}", v.len(), p.display());
+    }
     // 6. band-major transpose
     // SAFETY: elementwise transpose.
     unsafe {
@@ -5945,6 +6011,24 @@ unsafe fn bench_forward(
     unsafe {
         km.glu_scatter(stream, elems(b.glu_all.len()), &b.pre2_all, &b.offs_dev, &mut b.glu_all, t_frames as u32, bands as u32, max_dim as u32)
     }.map_err(|e| e.to_string())?;
+    if trunk_dump.is_some() {
+        {
+            let v = b.hidden_t.to_host_vec(&stream).unwrap();
+            let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+            std::fs::write("x_hidden.bin", bytes).unwrap();
+            println!("dump x_hidden.bin ({} words)", v.len());
+        }
+        {
+            let v = b.xb.to_host_vec(&stream).unwrap();
+            let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+            std::fs::write("x_xb.bin", bytes).unwrap();
+            println!("dump x_xb.bin ({} floats)", v.len());
+        }
+        let v = b.glu_all.to_host_vec(&stream).unwrap();
+        let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        std::fs::write("x_glu.bin", bytes).unwrap();
+        println!("dump x_glu.bin ({} floats)", v.len());
+    }
     // 8. mask apply + ISTFT
     // SAFETY: elementwise over 12*T*1025*2.
     unsafe {
@@ -6068,14 +6152,14 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize) {
 
     // warmup
     for _ in 0..3 {
-        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands).expect("forward"); }
+        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands, None).expect("forward"); }
     }
     stream.synchronize().expect("warmup sync");
 
     // timed aggregate loop: single sync around all iters (same as bench_ref.py)
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
-        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands).expect("forward"); }
+        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands, None).expect("forward"); }
     }
     stream.synchronize().expect("timed sync");
     let agg = t0.elapsed().as_secs_f64() / iters as f64;
@@ -6086,7 +6170,7 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize) {
     for _ in 0..iters {
         stream.synchronize().expect("sync");
         let i0 = std::time::Instant::now();
-        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands).expect("forward"); }
+        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands, None).expect("forward"); }
         stream.synchronize().expect("sync");
         per.push(i0.elapsed().as_secs_f64() * 1000.0);
     }
@@ -6131,6 +6215,384 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize) {
     }
     let snr = 10.0 * (sig / (noise + 1e-30)).log10();
     println!("BENCH final SNR vs ref_output: {snr:.2} dB");
+}
+
+// ---------------------------------------------------------------------------
+// Full-song separation: chunked overlap-add demix identical to the pymss
+// reference path (chunk 588800 / step 559360 / border 29440, linear fade),
+// writing six stereo stems as 32-bit float WAVs.
+// ---------------------------------------------------------------------------
+
+fn reflect_pad(x: &[f32], len: usize, left: usize, right: usize) -> Vec<f32> {
+    // numpy 'reflect' on an interleaved stereo signal: mirror each channel
+    // along the time axis WITHOUT repeating the border sample. All indices
+    // here are interleaved (frame, channel) pairs, so the mirror maps a
+    // frame index while preserving the channel bit.
+    let padded = len + left + right;
+    let mut out = vec![0.0f32; padded];
+    let n = len / 2; // per-channel sample count
+    let l = left / 2;
+    let r = right / 2;
+    // left: frame i takes source frame (l - i)
+    for i in 0..l {
+        for ch in 0..2usize {
+            out[i * 2 + ch] = x[(l - i) * 2 + ch];
+        }
+    }
+    out[left..left + len].copy_from_slice(x);
+    // right: frame k past the end takes source frame (n - 2 - k)
+    for k in 0..r {
+        let src = n.saturating_sub(2 + k);
+        for ch in 0..2usize {
+            out[(left + len) + k * 2 + ch] = x[src * 2 + ch];
+        }
+    }
+    out
+}
+
+fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path, outdir: &std::path::Path) {
+    let wav = audio::read_wav(input).expect("read wav");
+    assert_eq!(wav.channels, 2, "stereo input required");
+    let len = wav.samples.len() / 2;
+    println!("separate: {} Hz, {} s ({} samples)", wav.sample_rate, len as f64 / wav.sample_rate as f64, len);
+
+    let cfg = config::ModelConfig::parse(&std::fs::read_to_string(model_dir.join("logic_bs_roformer.yaml")).unwrap()).unwrap();
+    let bands = cfg.num_bands();
+    let t_frames = stft::num_frames(588800); // 1151
+    let m = t_frames * bands;
+    println!("chunk: T={t_frames} bands={bands} M={m}");
+
+    const C: usize = 588800;
+    const STEP: usize = 559360;
+    const BORDER: usize = 29440;
+
+    // reflect pad and fade window (numpy linspace endpoint semantics)
+    let xp = reflect_pad(&wav.samples, len * 2, BORDER * 2, BORDER * 4); // interleaved: per-channel counts doubled
+    let xp_len = xp.len() / 2;
+    let out_len = xp_len - 2 * BORDER; // matches xp.shape[-1] - 2*border in samples
+    let mut fade = vec![0.0f32; C];
+    for i in 0..BORDER {
+        fade[i] = i as f32 / BORDER as f32;
+        fade[C - 1 - i] = i as f32 / BORDER as f32;
+    }
+    for v in fade.iter_mut().take(C).skip(BORDER).take(C - 2 * BORDER) {
+        *v = 1.0;
+    }
+    let starts: Vec<usize> = {
+        let mut v = Vec::new();
+        let mut s = 0usize;
+        while s + C <= xp_len {
+            v.push(s);
+            s += STEP;
+        }
+        v
+    };
+    println!("chunks: {} (padded {} -> out {})", starts.len(), xp_len, out_len);
+
+    let ctx = CudaContext::new(device).expect("ctx");
+    let stream = ctx.default_stream();
+    let km = gpu_kernels::load(&ctx).expect("kernels");
+
+    let t0 = std::time::Instant::now();
+    let st = weights::SafeTensors::open(&model_dir.join("model.safetensors")).unwrap();
+    let w = weights::ModelWeights::load(&st, &cfg).unwrap();
+    let gw = upload_weights(&ctx, &stream, &w).expect("weights upload");
+    println!("weights load+upload: {:?}", t0.elapsed());
+
+    let fft = std::sync::Arc::new(cufft::Cufft::load().expect("cufft"));
+    let sp = stft::Stft::new(fft.clone(), t_frames).expect("stft plan");
+    let c2r_plan = {
+        let r: &cufft::Cufft = &fft;
+        unsafe {
+            let s: &'static cufft::Cufft = std::mem::transmute(r);
+            s.plan(2048, t_frames, false).expect("c2r plan")
+        }
+    };
+
+    let freqs: Vec<usize> = cfg.freqs_per_bands.clone();
+    let dims: Vec<u32> = freqs.iter().map(|f| (2 * f * 2) as u32).collect();
+    let mut offs = vec![0u32; bands + 1];
+    let mut f0 = vec![0u32; bands];
+    for i in 0..bands {
+        offs[i + 1] = offs[i] + dims[i];
+        f0[i] = freqs[..i].iter().sum::<usize>() as u32;
+    }
+    let offs_dev = DeviceBuffer::from_host(&stream, &offs).unwrap();
+    let dims_dev = DeviceBuffer::from_host(&stream, &dims).unwrap();
+    let f0_dev = DeviceBuffer::from_host(&stream, &f0).unwrap();
+
+    let cos_t: Vec<f32> = (0..t_frames).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).cos())).collect();
+    let sin_t: Vec<f32> = (0..t_frames).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).sin())).collect();
+    let cos_f: Vec<f32> = (0..bands).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).cos())).collect();
+    let sin_f: Vec<f32> = (0..bands).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).sin())).collect();
+
+    let z = |n: usize| DeviceBuffer::<f32>::zeroed(&stream, n).unwrap();
+    let mut bufs = BenchBufs {
+        x_dev: z(C * 2),
+        win_dev: DeviceBuffer::from_host(&stream, sp.window()).unwrap(),
+        frames_dev: z(2 * t_frames * stft::N_FFT),
+        spec_dev: z(2 * t_frames * stft::FREQ_BINS * 2),
+        xin_dev: z(t_frames * 4100),
+        bsnorm: z(bands * t_frames * 516),
+        x: z(m * 256),
+        scr: E2eScratch {
+            h: z(m * 256),
+            h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
+            qkv: z(m * 1536),
+            qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
+            scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
+            qkv_rope: z(m * 1536),
+            qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64),
+            v_flat: z(m * 512),
+            gates: z(m * 8),
+            scaled: z(m * 512),
+            oproj: z(m * 256),
+            attn_out: z(m * 256),
+            ffpre: z(m * 1024),
+            ff1: z(m * 1024),
+            ff1_16: DeviceBuffer::<u32>::zeroed(&stream, m * 512).unwrap(),
+            ff2: z(m * 256),
+            p_big: z(62 * 8 * t_frames * t_frames),
+            attn_out_long: z(496 * t_frames * 64),
+            cos: [DeviceBuffer::from_host(&stream, &cos_t).unwrap(), DeviceBuffer::from_host(&stream, &cos_f).unwrap()],
+            sin: [DeviceBuffer::from_host(&stream, &sin_t).unwrap(), DeviceBuffer::from_host(&stream, &sin_f).unwrap()],
+            zero_bias_t: z(t_frames),
+            zero_bias_64: z(64),
+            attn_max: z(m * 8),
+            attn_scale: z(m * 8),
+        },
+        x_final: z(m * 256),
+        xb: z(m * 256),
+        glu_all: z(6 * bands * t_frames * 516),
+        hidden_t: DeviceBuffer::<u32>::zeroed(&stream, 6 * bands * t_frames * 512).unwrap(),
+        pre2_all: z(6 * bands * t_frames * 2 * 516),
+        c2r_in: z(12 * t_frames * stft::FREQ_BINS * 2),
+        pcm: z(12 * t_frames * 2048),
+        offs_dev,
+        dims_dev,
+        f0_dev,
+    };
+    let _ = &mut bufs;
+
+    let mut result = vec![0.0f32; 6 * 2 * out_len];
+    let mut demix_counter = vec![0.0f32; out_len];
+    let win = sp.window();
+    // Per-chunk ISTFT window-energy counter: identical for every chunk (same
+    // frame layout), so computed once. The final normalization divides by
+    // istft_counter * demix_counter, exactly reproducing the reference
+    // (per-chunk istft normalize, then fade-weighted demix average).
+    // ISTFT window-energy counter over PADDED chunk coordinates (the C2R
+    // frames cover [0, C + 2048); the demix coordinate is pos - 1024).
+    let mut istft_counter = vec![0.0f32; C + 2048];
+    for t in 0..t_frames {
+        for n in 0..2048usize {
+            let pos = t * stft::HOP + n;
+            if pos < C + 2048 {
+                istft_counter[pos] += win[n] * win[n];
+            }
+        }
+    }
+    // Precomputed reciprocals turn the per-sample divide into a multiply.
+    let istft_inv: Vec<f32> = istft_counter.iter().map(|&c| if c > 1e-8 { 1.0 / c } else { 0.0 }).collect();
+
+    let mut upload_buf = vec![0u8; 0];
+    let _ = &mut upload_buf;
+    let total_t0 = std::time::Instant::now();
+    for (ci, &s) in starts.iter().enumerate() {
+        let chunk_t0 = std::time::Instant::now();
+        // copy chunk into x_dev (re-create the device buffer per chunk; the
+        // old one drops after the forward reads it)
+        let xi: Vec<f32> = {
+            let base = s * 2;
+            xp[base..base + C * 2].to_vec()
+        };
+        let new_x = DeviceBuffer::from_host(&stream, &xi).unwrap();
+        let old_x = std::mem::replace(&mut bufs.x_dev, new_x);
+        drop(old_x);
+        let trunk_path = if ci == 0 { Some(std::path::PathBuf::from("trunk0.bin")) } else { None };
+        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, C, t_frames, bands, trunk_path.as_deref()).expect("forward"); }
+        stream.synchronize().expect("sync");
+        let frames_out = bufs.pcm.to_host_vec(&stream).unwrap();
+        // per-chunk fade with the reference's first/last border overrides
+        let mut wfade = fade.clone();
+        if ci == 0 {
+            for v in wfade.iter_mut().take(BORDER) { *v = 1.0; }
+        }
+        if ci + 1 == starts.len() {
+            for v in wfade.iter_mut().rev().take(BORDER) { *v = 1.0; }
+        }
+        let take = (out_len - s).min(C);
+        for t in 0..t_frames {
+            let base_frame = t * stft::HOP;
+            for n in 0..2048usize {
+                let pos = base_frame + n;
+                // padded -> demix coordinate (center-pad trim)
+                let j = pos as isize - 1024;
+                if j >= 0 && (j as usize) < take {
+                    let ju = j as usize;
+                    // Normalize by this chunk's ISTFT window energy AT
+                    // ACCUMULATION TIME (the counter is chunk-relative, so a
+                    // later absolute-index division would be wrong).
+                    let ic = istft_inv[pos];
+                    if ic > 0.0 {
+                        let wgain = win[n] * (1.0 / 2048.0) * wfade[ju] * ic;
+                        for sc in 0..12usize {
+                            result[sc * out_len + s + ju] += frames_out[(sc * t_frames + t) * 2048 + n] * wgain;
+                        }
+                    }
+                }
+            }
+        }
+        for pos in 0..take {
+            demix_counter[s + pos] += wfade[pos] * wfade[pos];
+        }
+        println!("chunk {}/{} done in {:?}", ci + 1, starts.len(), chunk_t0.elapsed());
+    }
+    println!("demix total: {:?} (RTF {:.4})", total_t0.elapsed(), total_t0.elapsed().as_secs_f64() / (len as f64 / 44100.0));
+
+    std::fs::create_dir_all(outdir).unwrap();
+    let names: Vec<String> = cfg.instruments.clone();
+    for s_idx in 0..6usize {
+        let name = names.get(s_idx).map(|s| s.as_str()).unwrap_or("stem");
+        // interleaved stereo, normalized by counter
+        let mut out_samples = vec![0.0f32; out_len * 2];
+        for ch in 0..2usize {
+            for i in 0..out_len {
+                let c = demix_counter[i];
+                let v = if c > 1e-8 { result[(s_idx * 2 + ch) * out_len + i] / c } else { 0.0 };
+                out_samples[i * 2 + ch] = v;
+            }
+        }
+        let path = outdir.join(format!("{s_idx}_{name}.wav"));
+        audio::write_wav_f32(&path, &audio::WavData { sample_rate: wav.sample_rate, channels: 2, samples: out_samples }).expect("write stem");
+        println!("wrote {}", path.display());
+    }
+}
+
+// Single-input forward: no reflect padding, no chunk loop. Apples-to-apples
+// against a bare pymss model() call on the same file.
+fn forward_only(device: usize, model_dir: &std::path::Path, input: &std::path::Path, outdir: &std::path::Path) {
+    let wav = audio::read_wav(input).expect("read wav");
+    assert_eq!(wav.channels, 2, "stereo input required");
+    let len = wav.samples.len() / 2;
+    let cfg = config::ModelConfig::parse(&std::fs::read_to_string(model_dir.join("logic_bs_roformer.yaml")).unwrap()).unwrap();
+    let bands = cfg.num_bands();
+    let t_frames = stft::num_frames(len);
+    let m = t_frames * bands;
+    println!("forward-only: {len} samples, T={t_frames}, M={m}");
+    let ctx = CudaContext::new(device).expect("ctx");
+    let stream = ctx.default_stream();
+    let km = gpu_kernels::load(&ctx).expect("kernels");
+    let st = weights::SafeTensors::open(&model_dir.join("model.safetensors")).unwrap();
+    let w = weights::ModelWeights::load(&st, &cfg).unwrap();
+    let gw = upload_weights(&ctx, &stream, &w).expect("weights");
+    let fft = std::sync::Arc::new(cufft::Cufft::load().expect("cufft"));
+    let sp = stft::Stft::new(fft.clone(), t_frames).expect("stft");
+    let c2r_plan = {
+        let r: &cufft::Cufft = &fft;
+        unsafe {
+            let s: &'static cufft::Cufft = std::mem::transmute(r);
+            s.plan(2048, t_frames, false).expect("c2r plan")
+        }
+    };
+    let freqs: Vec<usize> = cfg.freqs_per_bands.clone();
+    let dims: Vec<u32> = freqs.iter().map(|f| (2 * f * 2) as u32).collect();
+    let mut offs = vec![0u32; bands + 1];
+    let mut f0 = vec![0u32; bands];
+    for i in 0..bands {
+        offs[i + 1] = offs[i] + dims[i];
+        f0[i] = freqs[..i].iter().sum::<usize>() as u32;
+    }
+    let offs_dev = DeviceBuffer::from_host(&stream, &offs).unwrap();
+    let dims_dev = DeviceBuffer::from_host(&stream, &dims).unwrap();
+    let f0_dev = DeviceBuffer::from_host(&stream, &f0).unwrap();
+    let cos_t: Vec<f32> = (0..t_frames).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).cos())).collect();
+    let sin_t: Vec<f32> = (0..t_frames).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).sin())).collect();
+    let cos_f: Vec<f32> = (0..bands).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).cos())).collect();
+    let sin_f: Vec<f32> = (0..bands).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).sin())).collect();
+    let z = |n: usize| DeviceBuffer::<f32>::zeroed(&stream, n).unwrap();
+    let mut bufs = BenchBufs {
+        x_dev: DeviceBuffer::from_host(&stream, &wav.samples).unwrap(),
+        win_dev: DeviceBuffer::from_host(&stream, sp.window()).unwrap(),
+        frames_dev: z(2 * t_frames * stft::N_FFT),
+        spec_dev: z(2 * t_frames * stft::FREQ_BINS * 2),
+        xin_dev: z(t_frames * 4100),
+        bsnorm: z(bands * t_frames * 516),
+        x: z(m * 256),
+        scr: E2eScratch {
+            h: z(m * 256),
+            h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
+            qkv: z(m * 1536),
+            qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
+            scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
+            qkv_rope: z(m * 1536),
+            qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64),
+            v_flat: z(m * 512),
+            gates: z(m * 8),
+            scaled: z(m * 512),
+            oproj: z(m * 256),
+            attn_out: z(m * 256),
+            ffpre: z(m * 1024),
+            ff1: z(m * 1024),
+            ff1_16: DeviceBuffer::<u32>::zeroed(&stream, m * 512).unwrap(),
+            ff2: z(m * 256),
+            p_big: z(62 * 8 * t_frames * t_frames),
+            attn_out_long: z(496 * t_frames * 64),
+            cos: [DeviceBuffer::from_host(&stream, &cos_t).unwrap(), DeviceBuffer::from_host(&stream, &cos_f).unwrap()],
+            sin: [DeviceBuffer::from_host(&stream, &sin_t).unwrap(), DeviceBuffer::from_host(&stream, &sin_f).unwrap()],
+            zero_bias_t: z(t_frames),
+            zero_bias_64: z(64),
+            attn_max: z(m * 8),
+            attn_scale: z(m * 8),
+        },
+        x_final: z(m * 256),
+        xb: z(m * 256),
+        glu_all: z(6 * bands * t_frames * 516),
+        hidden_t: DeviceBuffer::<u32>::zeroed(&stream, 6 * bands * t_frames * 512).unwrap(),
+        pre2_all: z(6 * bands * t_frames * 2 * 516),
+        c2r_in: z(12 * t_frames * stft::FREQ_BINS * 2),
+        pcm: z(12 * t_frames * 2048),
+        offs_dev,
+        dims_dev,
+        f0_dev,
+    };
+    let t0 = std::time::Instant::now();
+    unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands, Some(std::path::Path::new("trunk0.bin"))).expect("forward"); }
+    stream.synchronize().expect("sync");
+    println!("forward wall: {:?}", t0.elapsed());
+    let frames_out = bufs.pcm.to_host_vec(&stream).unwrap();
+    // host ISTFT identical to the e2e path (center pad trim)
+    let win = sp.window();
+    let padded = len + 2 * 1024;
+    let mut result = vec![0.0f32; 6 * 2 * padded];
+    let mut counter = vec![0.0f32; padded];
+    for t in 0..t_frames {
+        for n in 0..2048usize {
+            let pos = t * stft::HOP + n;
+            if pos < padded {
+                counter[pos] += win[n] * win[n];
+                for sc in 0..12usize {
+                    result[sc * padded + pos] += frames_out[(sc * t_frames + t) * 2048 + n] * win[n] * (1.0 / 2048.0);
+                }
+            }
+        }
+    }
+    std::fs::create_dir_all(outdir).unwrap();
+    let names: Vec<String> = cfg.instruments.clone();
+    for s_idx in 0..6usize {
+        let name = names.get(s_idx).map(|s| s.as_str()).unwrap_or("stem");
+        let mut out_samples = vec![0.0f32; len * 2];
+        for ch in 0..2usize {
+            for i in 0..len {
+                let c = counter[1024 + i];
+                let v = if c > 1e-8 { result[(s_idx * 2 + ch) * padded + 1024 + i] / c } else { 0.0 };
+                out_samples[i * 2 + ch] = v;
+            }
+        }
+        let path = outdir.join(format!("{s_idx}_{name}.wav"));
+        audio::write_wav_f32(&path, &audio::WavData { sample_rate: wav.sample_rate, channels: 2, samples: out_samples }).expect("write stem");
+        println!("wrote {}", path.display());
+    }
 }
 
 fn self_test(device: usize) {
