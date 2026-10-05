@@ -9,6 +9,7 @@ mod audio;
 mod config;
 mod cublas;
 mod cublaslt;
+mod cudnn;
 mod cufft;
 mod kernels;
 mod npz;
@@ -3387,6 +3388,56 @@ mod gpu_kernels {
             }
         }
     }
+    /// Pre-apply RoPE to the Q block of the folded qkv16 tensor, in place.
+    /// The cudnn SDPA path needs fully rotated Q/K as plain tensor inputs;
+    /// rotation math is identical to rope_k16 (no attention scale here —
+    /// cudnn applies attn_scale=0.125 itself).
+    #[kernel]
+    pub fn rope_q16_inplace(
+        mut qkv: DisjointSlice<u32>, cos: &[f32], sin: &[f32],
+        bands: u32, axis: u32,
+    ) {
+        let idx = thread::index_1d();
+        let g0 = idx.get();
+        let bands_ = bands as usize;
+        // launch grid is m*256 threads; qkv.len() is m*768 words.
+        if g0 * 3 < qkv.len() {
+            let token = g0 / 256;
+            let rem = g0 % 256;
+            let w = rem % 32;
+            let pos = if axis == 0 { token / bands_ } else { token % bands_ };
+            let c = cos[pos * 32 + w];
+            let sn = sin[pos * 32 + w];
+            // SAFETY: token*768+rem < m*768 = qkv.len(); one thread per word.
+            unsafe {
+                let v = qkv.as_mut_ptr().add(token * 768 + rem);
+                let (even, odd) = cuda_device::convert::cvt_f32x2_f16x2(*v);
+                *v = cuda_device::convert::cvt_f16x2_f32(even * c - odd * sn, odd * c + even * sn);
+            }
+        }
+    }
+    /// Multiply the cudnn SDPA output by the per-(token, head) sigmoid gate,
+    /// in place. The hand-written flash kernels fold this into their
+    /// epilogue; on the cudnn path it runs as this cheap elementwise pass.
+    #[kernel]
+    pub fn sdpa_gate(
+        mut y: DisjointSlice<u32>, gates: &[f32],
+    ) {
+        let idx = thread::index_1d();
+        let g0 = idx.get();
+        if g0 < y.len() {
+            let token = g0 / 256;
+            let head = (g0 % 256) / 32;
+            let g = gates[token * 8 + head];
+            let sig = 1.0 / (1.0 + (-g).exp());
+            // SAFETY: g0 < y.len(); one thread per word.
+            unsafe {
+                let v = y.as_mut_ptr().add(g0);
+                let (a, b) = cuda_device::convert::cvt_f32x2_f16x2(*v);
+                *v = cuda_device::convert::cvt_f16x2_f32(a * sig, b * sig);
+            }
+        }
+    }
     /// Tensor-core flash attention for one axis. One 256-thread block owns a
     /// 128-row query tile of one (batch, head) group and iterates every 64-key
     /// tile with an online softmax in registers. RoPE is fused into the Q/K
@@ -5643,6 +5694,10 @@ struct E2eScratch {
     lt_ws: Option<DeviceBuffer<u8>>,
     lt_dummy: Option<DeviceBuffer<u8>>,
     lt_dead: bool,
+    // cudnn fused SDPA accelerator (lazily created; on any load failure the
+    // hand-written flash kernels keep running — see cudnn_ready).
+    cudnn: Option<cudnn::CudnnSdpa>,
+    cudnn_dead: bool,
 }
 
 fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights::ModelWeights) -> Result<GpuWeights, String> {
@@ -5733,6 +5788,25 @@ fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights:
 }
 
 
+
+/// Lazily create the cudnn SDPA accelerator inside `scratch`. On
+/// unavailability (LBRR_NO_CUDNN set, dlopen failure) the callers keep the
+/// hand-written flash kernels; failure is sticky.
+fn cudnn_ready(ctx: &Arc<CudaContext>, scratch: &mut E2eScratch) {
+    if scratch.cudnn_dead || scratch.cudnn.is_some() || std::env::var_os("LBRR_NO_CUDNN").is_some() {
+        return;
+    }
+    match cudnn::CudnnSdpa::load(ctx) {
+        Ok(c) => {
+            eprintln!("[cudnn] fused SDPA ready");
+            scratch.cudnn = Some(c);
+        }
+        Err(e) => {
+            eprintln!("[cudnn] load failed: {e}; using hand-written flash kernels");
+            scratch.cudnn_dead = true;
+        }
+    }
+}
 /// Lazily create the cuBLASLt handle + workspace inside `scratch`. On
 /// unavailability (LBRR_NO_LT set, alloc or dlopen failure) the callers keep
 /// the hand-written kernels; failure is sticky so a broken lib never wedges
@@ -5792,6 +5866,7 @@ unsafe fn transformer_step(
     let m = t_frames * bands; // 71342
     let idx = layer_idx * 2 + axis;
     lt_ready(_ctx, stream, scratch, m);
+    cudnn_ready(_ctx, scratch);
     let launch1 = |n: u32| cuda_core::simt::LaunchConfig::for_num_elems(n);
     // 1. pre-attention RMSNorm
     // SAFETY: one warp per row over m rows.
@@ -5822,10 +5897,32 @@ unsafe fn transformer_step(
     // uses 2-pass materialized with the batched kernels below.
     {
         let seq = if axis == 0 { t_frames } else { bands };
-        // Time axis: cp.async double-buffered flash (K pre-roped by rope_k16,
-        // attacking the measured 65% L1TEX-scoreboard stall). Freq axis keeps
-        // the synchronous kernel (n=62, a single tile, nothing to pipeline).
-        if axis == 0 {
+        // cudnn fused flash attention: Q/K pre-roped into plain tensors, O
+        // written straight into the folded scaled16 layout, gates applied by
+        // a cheap elementwise epilogue (62 TFLOPs vs ~15 hand-written on the
+        // song shapes; output verified bit-exact against torch cudnn sdpa).
+        if let Some(cd) = scratch.cudnn.as_mut() {
+            // SAFETY: one thread per K word; m*256 words.
+            km.rope_k16(stream, launch1((m * 256) as u32), &scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], &mut scratch.k16r, bands as u32, axis as u32)
+                .map_err(|e| e.to_string())?;
+            // SAFETY: one thread per Q word; m*256 words (in place).
+            km.rope_q16_inplace(stream, launch1((m * 256) as u32), &mut scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], bands as u32, axis as u32)
+                .map_err(|e| e.to_string())?;
+            let base = scratch.qkv16.cu_deviceptr() as u64;
+            // NOTE: pass t_frames as the "seq" arg — sdpa() derives
+            // (b, s) = (bands, t) for the time axis and (t, bands) for the
+            // freq axis from it.
+            cd.sdpa(stream.cu_stream() as usize, axis, bands as i64, t_frames as i64,
+                base, scratch.k16r.cu_deviceptr() as u64, base + 2048,
+                scratch.scaled16.cu_deviceptr() as u64)
+                .map_err(|e| e.to_string())?;
+            // SAFETY: one thread per output word; m*256 words.
+            km.sdpa_gate(stream, launch1((m * 256) as u32), &mut scratch.scaled16, &scratch.gates)
+                .map_err(|e| e.to_string())?;
+        } else if axis == 0 {
+            // Time axis: cp.async double-buffered flash (K pre-roped by rope_k16,
+            // attacking the measured 65% L1TEX-scoreboard stall). Freq axis keeps
+            // the synchronous kernel (n=62, a single tile, nothing to pipeline).
             // SAFETY: one thread per output word; m*256 words.
             km.rope_k16(stream, launch1((m * 256) as u32), &scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], &mut scratch.k16r, bands as u32, axis as u32)
                 .map_err(|e| e.to_string())?;
@@ -6132,7 +6229,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         lt: None,
         lt_ws: None,
         lt_dummy: None,
-        lt_dead: false,
+        lt_dead: false, cudnn: None, cudnn_dead: false,
     };
 
     // staged references for bisection
@@ -6846,7 +6943,7 @@ k16r: DeviceBuffer::<u32>::zeroed(st, m * 256).unwrap(),
             lt: None,
             lt_ws: None,
             lt_dummy: None,
-            lt_dead: false,
+            lt_dead: false, cudnn: None, cudnn_dead: false,
         },
         x_final: zt(m * 256),
         xb: zt(m * 256),
@@ -7167,7 +7264,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             lt: None,
             lt_ws: None,
             lt_dummy: None,
-            lt_dead: false,
+            lt_dead: false, cudnn: None, cudnn_dead: false,
         },
         x_final: z(m * 256),
         xb: z(m * 256),
@@ -7264,14 +7361,18 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
 
     std::fs::create_dir_all(outdir).unwrap();
     let names: Vec<String> = cfg.instruments.clone();
+    // The OLA accumulators live in reflect-padded xp coordinates: xp holds
+    // BORDER left-pad samples before the source. Read [BORDER, BORDER+len)
+    // so stems align with the input (was [0, out_len) — a +29440-sample
+    // shift caught by cross-correlation against the source).
     for s_idx in 0..6usize {
         let name = names.get(s_idx).map(|s| s.as_str()).unwrap_or("stem");
         // interleaved stereo, normalized by counter
-        let mut out_samples = vec![0.0f32; out_len * 2];
+        let mut out_samples = vec![0.0f32; len * 2];
         for ch in 0..2usize {
-            for i in 0..out_len {
-                let c = demix_counter[i];
-                let v = if c > 1e-8 { result[(s_idx * 2 + ch) * out_len + i] / c } else { 0.0 };
+            for i in 0..len {
+                let c = demix_counter[BORDER + i];
+                let v = if c > 1e-8 { result[(s_idx * 2 + ch) * out_len + BORDER + i] / c } else { 0.0 };
                 out_samples[i * 2 + ch] = v;
             }
         }
@@ -7360,7 +7461,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             lt: None,
             lt_ws: None,
             lt_dummy: None,
-            lt_dead: false,
+            lt_dead: false, cudnn: None, cudnn_dead: false,
         },
         x_final: z(m * 256),
         xb: z(m * 256),
