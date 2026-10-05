@@ -335,6 +335,21 @@ ncu（T=1151 时间轴 flash，25.8ms/launch）：L2 吞吐 85.3%（墙）、DRA
 bench 67.7→74.4ms、整曲 6.58→7.92s，倒退更甚。Q 寄存器化的散列全局
 加载 + 寄存器压力在两种基线上均负收益，彻底关闭该方向。
 
+### 第 37 轮：宽 tile 第三次证伪 + pre2 f16 证伪（精度代价 3.7dB）
+
+1. **attn_flash_async_wide**（128 行 × cp.async，针对 ncu 显示的 L2 108%
+   墙，K/V L2 请求减半 + 占用率 16.7%→33%）：bench 67.7→81.8ms、整曲
+   6.58→7.85s。宽 tile 家族第三次证伪（sync-wide、async-wide 各败因不同
+   但结论一致：该 mma/softmax 体结构在 64 行/128 线程处就是最优）。
+2. **pre2 f16x2**（gemm2 epilogue 打包 + glu_scatter 解码，流减半）：
+   提速为零（mask 链本就不受带宽限制），黄金 SNR 80.99→**77.30（-3.7dB）**
+   ——GLU 前激活的 f16 往返直接进频谱掩码，精度代价远超收益。教训：
+   **pre-GLU 激活必须保 f32 存储**。
+
+ncu 补充（async 版）：L2 吞吐 108.7%（墙）、DRAM 52.6%、占用率 2 块/SM。
+注意力在当前结构下已连续六轮无法再压，GEMM 受 LDS-fragment 墙与寄存器
+约束也已到顶。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
