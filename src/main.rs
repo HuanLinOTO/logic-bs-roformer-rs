@@ -3117,7 +3117,9 @@ mod gpu_kernels {
                     v0 = (even * c - odd * sn) * 0.125;
                     v1 = (odd * c + even * sn) * 0.125;
                 }
-                SQ[r * 32 + w] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                // XOR swizzle spreads the 8 group-lanes across banks
+                // while keeping the row stride a power of two.
+                SQ[r * 32 + (w ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
             }
         }
 
@@ -3148,7 +3150,7 @@ mod gpu_kernels {
                         v0 = even * c - odd * sn;
                         v1 = odd * c + even * sn;
                     }
-                    SK[k * 32 + w] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SK[k * 32 + (w ^ (k & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
                 }
                 for i in 0..16usize {
                     let idx = tid + i * 128;
@@ -3156,7 +3158,7 @@ mod gpu_kernels {
                     let w = idx % 32;
                     let key = kt + k;
                     // SAFETY: word index into qkv16; V starts at word 512.
-                    SV[k * 32 + w] = if key < n_size {
+                    SV[k * 32 + (w ^ (k & 7))] = if key < n_size {
                         unsafe { *qkv.as_ptr().add(token_of(key) * 768 + 512 + head * 32 + w) }
                     } else {
                         0
@@ -3175,18 +3177,20 @@ mod gpu_kernels {
                 let mut a = [0u32; 4];
                 // SAFETY: r0/r1 < 128, word index 8j+tig(+4) < 32.
                 unsafe {
-                    a[0] = SQ[r0 * 32 + 8 * j + tig];
-                    a[1] = SQ[r1 * 32 + 8 * j + tig];
-                    a[2] = SQ[r0 * 32 + 8 * j + tig + 4];
-                    a[3] = SQ[r1 * 32 + 8 * j + tig + 4];
+                    let wq = 8 * j + tig;
+                    a[0] = SQ[r0 * 32 + (wq ^ (r0 & 7))];
+                    a[1] = SQ[r1 * 32 + (wq ^ (r1 & 7))];
+                    a[2] = SQ[r0 * 32 + ((wq + 4) ^ (r0 & 7))];
+                    a[3] = SQ[r1 * 32 + ((wq + 4) ^ (r1 & 7))];
                 }
                 for nt in 0..8usize {
                     let mut bb = [0u32; 2];
                     // SAFETY: key row nt*8+group < 64, word < 32.
                     unsafe {
-                        let kw = (nt * 8 + group) * 32 + 8 * j;
-                        bb[0] = SK[kw + tig];
-                        bb[1] = SK[kw + tig + 4];
+                        let row = nt * 8 + group;
+                        let wb = 8 * j + tig;
+                        bb[0] = SK[row * 32 + (wb ^ (row & 7))];
+                        bb[1] = SK[row * 32 + ((wb + 4) ^ (row & 7))];
                     }
                     acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, bb) };
                 }
@@ -3262,11 +3266,11 @@ mod gpu_kernels {
                         let n = nt * 8 + group;
                         let nw = n / 2;
                         let hi_half = n % 2 == 1;
-                        let kr = (16 * kf + 2 * tig) * 32 + nw;
-                        let w0 = SV[kr];
-                        let w1 = SV[kr + 32];
-                        let w2 = SV[kr + 8 * 32];
-                        let w3 = SV[kr + 9 * 32];
+                        let krow = 16 * kf + 2 * tig;
+                        let w0 = SV[krow * 32 + (nw ^ (krow & 7))];
+                        let w1 = SV[(krow + 1) * 32 + (nw ^ ((krow + 1) & 7))];
+                        let w2 = SV[(krow + 8) * 32 + (nw ^ ((krow + 8) & 7))];
+                        let w3 = SV[(krow + 9) * 32 + (nw ^ ((krow + 9) & 7))];
                         if hi_half {
                             bb[0] = (w0 >> 16) | ((w1 >> 16) << 16);
                             bb[1] = (w2 >> 16) | ((w3 >> 16) << 16);
