@@ -3403,7 +3403,7 @@ mod gpu_kernels {
                 }
                 // XOR swizzle spreads the 8 group-lanes across banks
                 // while keeping the row stride a power of two.
-                SQ[r * 32 + (w ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                SQ[r * 32 + (((w >> 2) ^ (r & 7)) << 2) + (w & 3)] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
             }
         }
 
@@ -3434,7 +3434,7 @@ mod gpu_kernels {
                         v0 = even * c - odd * sn;
                         v1 = odd * c + even * sn;
                     }
-                    SK[k * 32 + (w ^ (k & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SK[k * 32 + (((w >> 2) ^ (k & 7)) << 2) + (w & 3)] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
                 }
                 for i in 0..16usize {
                     let idx = tid + i * 128;
@@ -3442,7 +3442,7 @@ mod gpu_kernels {
                     let w = idx % 32;
                     let key = kt + k;
                     // SAFETY: word index into qkv16; V starts at word 512.
-                    SV[k * 32 + (w ^ (k & 7))] = if key < n_size {
+                    SV[k * 32 + (((w >> 2) ^ (k & 7)) << 2) + (w & 3)] = if key < n_size {
                         unsafe { *qkv.as_ptr().add(token_of(key) * 768 + 512 + head * 32 + w) }
                     } else {
                         0
@@ -3458,25 +3458,28 @@ mod gpu_kernels {
                 acc[nt] = [0.0f32; 4];
             }
             for j in 0..4usize {
-                let mut a = [0u32; 4];
-                // SAFETY: r0/r1 < 128, word index 8j+tig(+4) < 32.
+                // SAFETY: ldmatrix lane addresses are 16B-aligned chunk heads
+                // inside SQ/SK (rows < 64, chunks < 8).
                 unsafe {
-                    let wq = 8 * j + tig;
-                    a[0] = SQ[r0 * 32 + (wq ^ (r0 & 7))];
-                    a[1] = SQ[r1 * 32 + (wq ^ (r1 & 7))];
-                    a[2] = SQ[r0 * 32 + ((wq + 4) ^ (r0 & 7))];
-                    a[3] = SQ[r1 * 32 + ((wq + 4) ^ (r1 & 7))];
-                }
-                for nt in 0..8usize {
-                    let mut bb = [0u32; 2];
-                    // SAFETY: key row nt*8+group < 64, word < 32.
-                    unsafe {
-                        let row = nt * 8 + group;
-                        let wb = 8 * j + tig;
-                        bb[0] = SK[row * 32 + (wb ^ (row & 7))];
-                        bb[1] = SK[row * 32 + ((wb + 4) ^ (row & 7))];
+                    let sq0 = std::ptr::addr_of_mut!(SQ) as *const u32;
+                    let sk0 = std::ptr::addr_of_mut!(SK) as *const u32;
+                    // A 16x16 q x d tile via x4, matching mma A {a0..a3}.
+                    let arow = warp_id * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+                    let akh = if lane >= 16 { 1 } else { 0 };
+                    let a: [u32; 4] = wmma::ldmatrix_x4(
+                        sq0.add(arow * 32 + (((2 * j + akh) ^ (arow & 7)) * 4)),
+                    );
+                    for jj in 0..4usize {
+                        // B: two key tiles per x4; SK is [key][d] row-major =
+                        // B-transposed storage, non-trans matches mma B.
+                        let krow = 16 * jj + (lane & 7) + if lane >= 16 { 8 } else { 0 };
+                        let bkh = if ((lane >> 3) & 1) == 1 { 1 } else { 0 };
+                        let bb: [u32; 4] = wmma::ldmatrix_x4(
+                            sk0.add(krow * 32 + (((2 * j + bkh) ^ (krow & 7)) * 4)),
+                        );
+                        acc[jj * 2] = wmma::mma_m16n8k16_f32_f16(acc[jj * 2], a, [bb[0], bb[1]]);
+                        acc[jj * 2 + 1] = wmma::mma_m16n8k16_f32_f16(acc[jj * 2 + 1], a, [bb[2], bb[3]]);
                     }
-                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, bb) };
                 }
             }
 
@@ -3528,8 +3531,6 @@ mod gpu_kernels {
             // B fragments come from row-major SV via register preloads: each
             // lane needs 4 key rows x 8 dim words per kf, loaded once and
             // repacked with integer half selects (no shared reads per mma).
-            let g2 = group / 2;
-            let hi_half = group % 2 == 1;
             for kf in 0..4usize {
                 let mut a = [0u32; 4];
                 // C tiles 2kf / 2kf+1 hold this A fragment's key columns.
@@ -3541,29 +3542,18 @@ mod gpu_kernels {
                     a[3] = cuda_device::convert::cvt_f16x2_f32(acc[2 * kf + 1][2], acc[2 * kf + 1][3]);
                 }
                 for nt in 0..8usize {
-                    let mut bb = [0u32; 2];
-                    // b packs V[k][n], V[k+1][n] for k = 16kf+2tig (b1 +8):
-                    // integer half-word selects from row-major SV, no
-                    // shared-memory transpose pass needed.
-                    // SAFETY: key rows < 64, word < 32 inside SV.
+                    // SAFETY: SV rows < 64, 16B-aligned chunk head. V is
+                    // [key][d] row-major (B stored directly), so the trans
+                    // fragment matches mma B: lanes 0-7 -> key rows kf*16..+8,
+                    // lanes 8-15 -> +8..+16, all at d chunk nt.
                     unsafe {
-                        let n = nt * 8 + group;
-                        let nw = n / 2;
-                        let hi_half = n % 2 == 1;
-                        let krow = 16 * kf + 2 * tig;
-                        let w0 = SV[krow * 32 + (nw ^ (krow & 7))];
-                        let w1 = SV[(krow + 1) * 32 + (nw ^ ((krow + 1) & 7))];
-                        let w2 = SV[(krow + 8) * 32 + (nw ^ ((krow + 8) & 7))];
-                        let w3 = SV[(krow + 9) * 32 + (nw ^ ((krow + 9) & 7))];
-                        if hi_half {
-                            bb[0] = (w0 >> 16) | ((w1 >> 16) << 16);
-                            bb[1] = (w2 >> 16) | ((w3 >> 16) << 16);
-                        } else {
-                            bb[0] = (w0 & 0xFFFF) | ((w1 & 0xFFFF) << 16);
-                            bb[1] = (w2 & 0xFFFF) | ((w3 & 0xFFFF) << 16);
-                        }
+                        let sv0 = std::ptr::addr_of_mut!(SV) as *const u32;
+                        let vrow = 16 * kf + (lane & 15);
+                        let bb = wmma::ldmatrix_x2_trans(
+                            sv0.add(vrow * 32 + ((nt ^ (vrow & 7)) * 4)),
+                        );
+                        acc_pv[nt] = wmma::mma_m16n8k16_f32_f16(acc_pv[nt], a, bb);
                     }
-                    acc_pv[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc_pv[nt], a, bb) };
                 }
             }
             thread::sync_threads();
