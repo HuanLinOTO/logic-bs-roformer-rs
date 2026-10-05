@@ -72,6 +72,14 @@ STFT/GLU/mask/FFT 等        ~1.4 ms
 
 ### 失败的变体（勿重复）
 
+- **33/9 字行填充（bank 冲突修复，第二轮重试）**：ncu 定位 fragment 读
+  8-way bank 冲突（shared wavefronts 64% 峰值、54 MB excessive/launch），
+  给全部 f16 GEMM/QK/PV 内核行距 32→33、8→9 后**所有内核统一变慢
+  5-7×**（gemm 765→3850 µs、QK 677→3974 µs），SNR 不变。结论：**该
+  工具链对非 2 次幂行距的 shared 数组访问有系统性编译惩罚**（疑为
+  向量化/寻址优化失效）。第一轮的 33 字填充、XOR swizzle、ldmatrix
+  结论一致 —— bank 冲突路径已两次证伪，彻底关闭。
+
 - **cp.async 流水线 GEMM（gemm_f16_async + pack_h16 + f16 权重）**：内核
   764 µs/launch，与 float4-f32 版（765 µs）完全相同 —— 全局加载延迟根本
   不是瓶颈；ncu 的 "L1TEX 91%" 主体是 mma fragment 的 shared 读流量，
