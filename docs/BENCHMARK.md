@@ -350,6 +350,21 @@ ncu 补充（async 版）：L2 吞吐 108.7%（墙）、DRAM 52.6%、占用率 2
 注意力在当前结构下已连续六轮无法再压，GEMM 受 LDS-fragment 墙与寄存器
 约束也已到顶。
 
+### 第 38 轮：cp.async QKV GEMM 证伪 + 双流并发的 GO 信号
+
+1. **gemm_hout_async**（cp.async 双缓冲 + chunk-XOR swizzle + f16x2 A/W，
+   从 flash 移植的成功组合）：bench 67.7→**112.2ms** 大倒退。根因：k=256
+   只有 4 个 k-tile，双缓冲的 issue/commit/wait/双 sync 开销无法摊销
+   （flash 时间轴有 18 个 tile 所以赢）。**cp.async 只适合深 k/长序列循环**。
+   （历史上休眠的 gemm_f16_async 失败同源：无 swizzle + 浅 k。）
+2. **nsys GPU metrics（demix 全程，10kHz 采样）**：SMs Active 74.9%、
+   **SM Issue 仅 18.0%**、活跃 SM 上 **53.5% warp 槽位未分配**、Tensor
+   Active 7.8%、DRAM 读 13%/写 26%——流水线整体远未饱和，双流共驻有
+   真实空间（GO）。
+3. **--dualbench 探测已实现**（make_bench_bufs 抽取 + 双流交替计时，
+   提交 b9c96ad）：远程构建被节点离线阻塞（Komari agent 掉线，多次重试
+   未恢复），待恢复后先跑探测再决定是否投入完整双流 demix 重构。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
