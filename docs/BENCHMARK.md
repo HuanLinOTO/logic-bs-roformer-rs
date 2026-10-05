@@ -123,6 +123,19 @@ mask 两级   8.3 ms / ~90 GFLOP ≈ 11 TFLOP/s
 3. 当前分布（每前向）：注意力 38.6 ms（35%）、三 GEMM 57 ms（52%）、
    mask 8.3、rmsnorm 3.3、misc 1.5。
 
+### 第 25 轮补充（两个新证伪）
+
+1. **双行组 warp GEMM（gemm_f16_2rg）**：每 warp 32 行（accA+accB 两个
+   [[f32;4];8]），B fragment 复用翻倍、LDS/mma 0.625→0.375。正确但
+   **217 ms**（2× 慢）——64 个累加 float 超出该工具链的寄存器保持能力，
+   第四次确认 ~32-float 累加上限。
+2. **cp.async flash（v6/v6b）**：K/V 经 cp.async 双缓冲流式加载。v6 的
+   教训：cp.async 是裸字节拷贝，f32 源（64 f32/行=256B）与 f16 tile
+   （32 词=128B）布局不匹配 → 全 NaN。v6b（QKV GEMM 直出 f16x2 词，
+   cp.async 8 块×16B/行）正确（SNR 80.97，双重 f16 舍入影响 7e-4）但
+   **116.3 ms**：gather 延迟本已被 warp 级 MLP 掩盖，cp.async 逐块
+   issue 反而更贵。qkv16 基础设施保留在 git 历史中可复用。
+
 ### 下一步（按收益排序）
 
 1. **突破 GEMM 的 LDS fragment 读墙**：实测瓶颈是每 mma 约 2.5 次 shared
