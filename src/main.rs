@@ -3312,8 +3312,8 @@ mod gpu_kernels {
         // SB is column-major with adjacent K pairs, matching the MMA fragments
         // exactly, so the K-loop performs each f32->f16 conversion once during
         // the cooperative load rather than once per warp/fragment reuse.
-        static mut SA: SharedArray<u32, { 128 * 8 }> = SharedArray::UNINIT;
-        static mut SB: SharedArray<u32, { 64 * 8 }> = SharedArray::UNINIT;
+        static mut SA: SharedArray<u32, { 128 * 32 }> = SharedArray::UNINIT;
+        static mut SB: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT;
 
         let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id() as usize;
@@ -3334,56 +3334,72 @@ mod gpu_kernels {
         let y_off = out_group * m_size * 1024;
         let mut acc = [[0.0f32; 4]; 8];
 
-        let num_k = k_size.div_ceil(16);
+        // K tiles of 64 with float4 loads: 4x fewer barriers and load
+        // instructions than the original k16 scalar version.
+        let num_k = k_size.div_ceil(64);
         for ks in 0..num_k {
-            let k_base = ks * 16;
+            let k_base = ks * 64;
             unsafe {
-                // 128 rows x 8 K-pairs = 1024 assignments, 4 per thread.
+                // A: 128 rows x 16 float4, 8 per thread.
+                for i in 0..8usize {
+                    let idx = tid + i * 256;
+                    let r = idx / 16;
+                    let q4 = idx % 16;
+                    let xr = block_row_base + r;
+                    let k0 = k_base + q4 * 4;
+                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    if xr < m_size && k0 + 3 < k_size {
+                        // SAFETY: k0 % 4 == 0 gives 16 B alignment.
+                        let src = x.as_ptr().add(x_off + xr * k_size + k0);
+                        let v: [f32; 4] = *(src as *const [f32; 4]);
+                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    }
+                    SA[r * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SA[r * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                }
+                // B: 64 columns x 16 float4, 4 per thread.
                 for i in 0..4usize {
                     let idx = tid + i * 256;
-                    let r = idx / 8;
-                    let kp = idx % 8;
-                    let xr = block_row_base + r;
-                    let k0 = k_base + kp * 2;
-                    let k1 = k0 + 1;
-                    let v0 = if xr < m_size && k0 < k_size { x[x_off + xr * k_size + k0] } else { 0.0 };
-                    let v1 = if xr < m_size && k1 < k_size { x[x_off + xr * k_size + k1] } else { 0.0 };
-                    SA[r * 8 + kp] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                }
-                // 64 columns x 8 K-pairs = 512 assignments, 2 per thread.
-                for i in 0..2usize {
-                    let idx = tid + i * 256;
-                    let col = idx / 8;
-                    let kp = idx % 8;
+                    let col = idx / 16;
+                    let q4 = idx % 16;
                     let bc = col_base + col;
-                    let k0 = k_base + kp * 2;
-                    let k1 = k0 + 1;
-                    let v0 = if bc < n_size && k0 < k_size { w[w_off + bc * k_size + k0] } else { 0.0 };
-                    let v1 = if bc < n_size && k1 < k_size { w[w_off + bc * k_size + k1] } else { 0.0 };
-                    SB[col * 8 + kp] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    let k0 = k_base + q4 * 4;
+                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    if bc < n_size && k0 + 3 < k_size {
+                        // SAFETY: same 16 B alignment argument as A.
+                        let src = w.as_ptr().add(w_off + bc * k_size + k0);
+                        let v: [f32; 4] = *(src as *const [f32; 4]);
+                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    }
+                    SB[col * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SB[col * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
 
-            let mut a = [0u32; 4];
-            unsafe {
-                let r0 = warp_id * 16 + group;
-                let r1 = r0 + 8;
-                let k_word = tig;
-                let k_word_hi = tig + 4;
-                a[0] = SA[r0 * 8 + k_word];
-                a[1] = SA[r1 * 8 + k_word];
-                a[2] = SA[r0 * 8 + k_word_hi];
-                a[3] = SA[r1 * 8 + k_word_hi];
-            }
-            for nt in 0..8usize {
-                let mut b = [0u32; 2];
+            // Four K=16 MMA steps per shared-memory barrier.
+            for kk in 0..4usize {
+                let word = kk * 8;
+                let mut a = [0u32; 4];
+                // SAFETY: rows < 128, words < 32 inside SA.
                 unsafe {
-                    let col_word = (nt * 8 + group) * 8;
-                    b[0] = SB[col_word + tig];
-                    b[1] = SB[col_word + tig + 4];
+                    let r0 = warp_id * 16 + group;
+                    let r1 = r0 + 8;
+                    a[0] = SA[r0 * 32 + word + tig];
+                    a[1] = SA[r1 * 32 + word + tig];
+                    a[2] = SA[r0 * 32 + word + tig + 4];
+                    a[3] = SA[r1 * 32 + word + tig + 4];
                 }
-                acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
+                for nt in 0..8usize {
+                    let mut b = [0u32; 2];
+                    // SAFETY: cols < 64, words < 32 inside SB.
+                    unsafe {
+                        let col_word = (nt * 8 + group) * 32 + word;
+                        b[0] = SB[col_word + tig];
+                        b[1] = SB[col_word + tig + 4];
+                    }
+                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
+                }
             }
             thread::sync_threads();
         }
@@ -3417,8 +3433,8 @@ mod gpu_kernels {
         // SB is column-major with adjacent K pairs, matching the MMA fragments
         // exactly, so the K-loop performs each f32->f16 conversion once during
         // the cooperative load rather than once per warp/fragment reuse.
-        static mut SA: SharedArray<u32, { 128 * 8 }> = SharedArray::UNINIT;
-        static mut SB: SharedArray<u32, { 64 * 8 }> = SharedArray::UNINIT;
+        static mut SA: SharedArray<u32, { 128 * 32 }> = SharedArray::UNINIT;
+        static mut SB: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT;
 
         let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id() as usize;
@@ -3444,56 +3460,68 @@ mod gpu_kernels {
         let y_off = out_group * m_size * out_width;
         let mut acc = [[0.0f32; 4]; 8];
 
-        let num_k = k_size.div_ceil(16);
+        // K tiles of 64 with float4 loads (16 barriers instead of 64).
+        let num_k = k_size.div_ceil(64);
         for ks in 0..num_k {
-            let k_base = ks * 16;
+            let k_base = ks * 64;
             unsafe {
-                // 128 rows x 8 K-pairs = 1024 assignments, 4 per thread.
+                for i in 0..8usize {
+                    let idx = tid + i * 256;
+                    let r = idx / 16;
+                    let q4 = idx % 16;
+                    let xr = block_row_base + r;
+                    let k0 = k_base + q4 * 4;
+                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    if xr < m_size && k0 + 3 < k_size {
+                        // SAFETY: k0 % 4 == 0 gives 16 B alignment.
+                        let src = x.as_ptr().add(x_off + xr * k_size + k0);
+                        let v: [f32; 4] = *(src as *const [f32; 4]);
+                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    }
+                    SA[r * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SA[r * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                }
                 for i in 0..4usize {
                     let idx = tid + i * 256;
-                    let r = idx / 8;
-                    let kp = idx % 8;
-                    let xr = block_row_base + r;
-                    let k0 = k_base + kp * 2;
-                    let k1 = k0 + 1;
-                    let v0 = if xr < m_size && k0 < k_size { x[x_off + xr * k_size + k0] } else { 0.0 };
-                    let v1 = if xr < m_size && k1 < k_size { x[x_off + xr * k_size + k1] } else { 0.0 };
-                    SA[r * 8 + kp] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                }
-                // 64 columns x 8 K-pairs = 512 assignments, 2 per thread.
-                for i in 0..2usize {
-                    let idx = tid + i * 256;
-                    let col = idx / 8;
-                    let kp = idx % 8;
+                    let col = idx / 16;
+                    let q4 = idx % 16;
                     let bc = col_base + col;
-                    let k0 = k_base + kp * 2;
-                    let k1 = k0 + 1;
-                    let v0 = if bc < n_size && k0 < k_size { w[w_off + bc * k_size + k0] } else { 0.0 };
-                    let v1 = if bc < n_size && k1 < k_size { w[w_off + bc * k_size + k1] } else { 0.0 };
-                    SB[col * 8 + kp] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    let k0 = k_base + q4 * 4;
+                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    if bc < n_size && k0 + 3 < k_size {
+                        // SAFETY: same 16 B alignment argument as A.
+                        let src = w.as_ptr().add(w_off + bc * k_size + k0);
+                        let v: [f32; 4] = *(src as *const [f32; 4]);
+                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    }
+                    SB[col * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SB[col * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
             }
             thread::sync_threads();
 
-            let mut a = [0u32; 4];
-            unsafe {
-                let r0 = warp_id * 16 + group;
-                let r1 = r0 + 8;
-                let k_word = tig;
-                let k_word_hi = tig + 4;
-                a[0] = SA[r0 * 8 + k_word];
-                a[1] = SA[r1 * 8 + k_word];
-                a[2] = SA[r0 * 8 + k_word_hi];
-                a[3] = SA[r1 * 8 + k_word_hi];
-            }
-            for nt in 0..8usize {
-                let mut b = [0u32; 2];
+            for kk in 0..4usize {
+                let word = kk * 8;
+                let mut a = [0u32; 4];
+                // SAFETY: rows < 128, words < 32 inside SA.
                 unsafe {
-                    let col_word = (nt * 8 + group) * 8;
-                    b[0] = SB[col_word + tig];
-                    b[1] = SB[col_word + tig + 4];
+                    let r0 = warp_id * 16 + group;
+                    let r1 = r0 + 8;
+                    a[0] = SA[r0 * 32 + word + tig];
+                    a[1] = SA[r1 * 32 + word + tig];
+                    a[2] = SA[r0 * 32 + word + tig + 4];
+                    a[3] = SA[r1 * 32 + word + tig + 4];
                 }
-                acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
+                for nt in 0..8usize {
+                    let mut b = [0u32; 2];
+                    // SAFETY: cols < 64, words < 32 inside SB.
+                    unsafe {
+                        let col_word = (nt * 8 + group) * 32 + word;
+                        b[0] = SB[col_word + tig];
+                        b[1] = SB[col_word + tig + 4];
+                    }
+                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
+                }
             }
             thread::sync_threads();
         }
