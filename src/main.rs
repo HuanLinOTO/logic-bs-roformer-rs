@@ -1574,6 +1574,26 @@ mod gpu_kernels {
         }
     }
 
+    /// Transpose (T, 62, 256) -> (62, T, 256) with the output packed to
+    /// f16x2 words, feeding mask_gemm1's A operand at half the bytes.
+    #[kernel]
+    pub fn transpose_band_major_h16(x: &[f32], mut out: DisjointSlice<u32>, t_frames: u32, bands: u32) {
+        let idx = thread::index_1d();
+        let g0 = idx.get();
+        if g0 < out.len() {
+            let (t_f, bands_) = (t_frames as usize, bands as usize);
+            let d2 = g0 % 128;
+            let row = g0 / 128;
+            // Output is (band, t, 128 words): row = b*T + t
+            let b = row / t_f;
+            let t = row % t_f;
+            let src = (t * bands_ + b) * 256 + d2 * 2;
+            if let Some(o) = out.get_mut(idx) {
+                *o = cuda_device::convert::cvt_f16x2_f32(x[src], x[src + 1]);
+            }
+        }
+    }
+
     /// Apply the GLU'd per-band masks to the STFT spectrum, writing the
     /// C2R batch layout directly: frame (stem*2 + ch)*T + t, freq bins, c.
     /// glu layout is (stem, band, t, fi*4 + ch*2 + c) row-major.
@@ -3827,7 +3847,7 @@ mod gpu_kernels {
     #[kernel]
     pub fn mask_gemm1_f16(
         t_rows: u32, group_base: u32,
-        x: &[f32], w: &[u32], bias: &[f32],
+        x: &[u32], w: &[u32], bias: &[f32],
         mut y: DisjointSlice<u32>,
     ) {
         // Packed f16 shared tiles. SA is row-major with adjacent K pairs;
@@ -3850,7 +3870,7 @@ mod gpu_kernels {
         let k_size = 256usize;
         let band = thread::blockIdx_z() as usize;
         let out_group = group_base as usize + band;
-        let x_off = band * m_size * 256;
+        let x_off = band * m_size * (k_size / 2); // f16x2 words
         let w_off = band * 1024 * (k_size / 2); // f16x2 words
         let bias_off = band * 1024;
         let y_off = out_group * m_size * 512; // word stride (f16x2)
@@ -3862,22 +3882,25 @@ mod gpu_kernels {
         for ks in 0..num_k {
             let k_base = ks * 64;
             unsafe {
-                // A: 128 rows x 16 float4, 8 per thread.
-                for i in 0..8usize {
+                // A: pre-packed f16x2 words, 4 four-word chunks/thread.
+                for i in 0..4usize {
                     let idx = tid + i * 256;
-                    let r = idx / 16;
-                    let q4 = idx % 16;
+                    let r = idx / 8;
+                    let c4 = idx % 8;
                     let xr = block_row_base + r;
-                    let k0 = k_base + q4 * 4;
-                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-                    if xr < m_size && k0 + 3 < k_size {
-                        // SAFETY: k0 % 4 == 0 gives 16 B alignment.
-                        let src = x.as_ptr().add(x_off + xr * k_size + k0);
-                        let v: [f32; 4] = *(src as *const [f32; 4]);
-                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    // SAFETY: word index < 32 by construction; k is a
+                    // multiple of 64 so the offset never crosses rows.
+                    let vals: [u32; 4] = if xr < m_size {
+                        let src = x.as_ptr().add(x_off + xr * (k_size / 2) + k_base / 2 + c4 * 4);
+                        *(src as *const [u32; 4])
+                    } else {
+                        [0; 4]
+                    };
+                    let sa = std::ptr::addr_of_mut!(SA) as *mut u32;
+                    for q in 0..4usize {
+                        let w = c4 * 4 + q;
+                        *sa.add(r * 32 + (w ^ (r & 7))) = vals[q];
                     }
-                    SA[r * 32 + ((q4 * 2) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
-                    SA[r * 32 + ((q4 * 2 + 1) ^ (r & 7))] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
                 }
                 // B: pre-packed f16x2 words, 2 chunks per thread.
                 for i in 0..2usize {
@@ -5874,10 +5897,10 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     let _ = &ref_mid;
 
     // 5. MaskEstimator: per stem per band GEMMs
-    let mut xb = DeviceBuffer::<f32>::zeroed(&stream, m * 256).unwrap();
-    // SAFETY: elementwise transpose.
+    let mut xb16 = DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap();
+    // SAFETY: elementwise transpose, packed f16x2.
     unsafe {
-        km.transpose_band_major(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * 256) as u32), &x_final, &mut xb, t_frames as u32, bands as u32)
+        km.transpose_band_major_h16(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * 128) as u32), &x_final, &mut xb16, t_frames as u32, bands as u32)
     }.expect("transpose");
 
     // ---- MaskEstimator: grouped per-stem launches ----
@@ -5893,7 +5916,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     for s in 0..6usize {
         // SAFETY: 16 column tiles x ceil(T/128) row tiles x 62 bands.
         unsafe {
-            km.mask_gemm1_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (16, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, (s * bands) as u32, &xb, &gw.mask_w1_h[s], &gw.mask_b1[s], &mut hidden_t)
+            km.mask_gemm1_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (16, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, (s * bands) as u32, &xb16, &gw.mask_w1_h[s], &gw.mask_b1[s], &mut hidden_t)
         }.expect("grouped mask gemm1");
     }
     // Tanh is fused into the grouped mask GEMM1 epilogue.
@@ -6048,7 +6071,8 @@ struct BenchBufs {
     x: DeviceBuffer<f32>,
     scr: E2eScratch,
     x_final: DeviceBuffer<f32>,
-    xb: DeviceBuffer<f32>,
+    xb: DeviceBuffer<f32>,       // f32 band-major (diagnostic dumps only)
+    xb16: DeviceBuffer<u32>,     // packed f16x2 band-major (mask GEMM1 A)
     glu_all: DeviceBuffer<f32>,
     hidden_t: DeviceBuffer<u32>,   // packed f16x2
     pre2_all: DeviceBuffer<f32>,
@@ -6154,7 +6178,7 @@ unsafe fn bench_forward(
     // 6. band-major transpose
     // SAFETY: elementwise transpose.
     unsafe {
-        km.transpose_band_major(stream, elems(m * 256), &b.x_final, &mut b.xb, t_frames as u32, bands as u32)
+        km.transpose_band_major_h16(stream, elems(m * 128), &b.x_final, &mut b.xb16, t_frames as u32, bands as u32)
     }.map_err(|e| e.to_string())?;
     // 7. MaskEstimator grouped GEMMs
     let pre_width = 2 * max_dim;
@@ -6162,7 +6186,7 @@ unsafe fn bench_forward(
         // SAFETY: 16 column tiles x ceil(T/128) row tiles x 62 bands.
         unsafe {
             km.mask_gemm1_f16(stream, LaunchConfig { grid_dim: (16, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                t_frames as u32, (s * bands) as u32, &b.xb, &gw.mask_w1_h[s], &gw.mask_b1[s], &mut b.hidden_t)
+                t_frames as u32, (s * bands) as u32, &b.xb16, &gw.mask_w1_h[s], &gw.mask_b1[s], &mut b.hidden_t)
         }.map_err(|e| e.to_string())?;
     }
     for s in 0..6usize {
@@ -6184,6 +6208,9 @@ unsafe fn bench_forward(
             println!("dump x_hidden.bin ({} words)", v.len());
         }
         {
+            // xb (f32) is only produced on demand for this diagnostic dump.
+            // SAFETY: elementwise transpose.
+            km.transpose_band_major(stream, elems(b.xb.len()), &b.x_final, &mut b.xb, t_frames as u32, bands as u32).unwrap();
             let v = b.xb.to_host_vec(&stream).unwrap();
             let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
             std::fs::write("x_xb.bin", bytes).unwrap();
@@ -6304,6 +6331,7 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize) {
         },
         x_final: z(m * 256),
         xb: z(m * 256),
+        xb16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
         glu_all: z(6 * bands * t_frames * 516),
         hidden_t: DeviceBuffer::<u32>::zeroed(&stream, 6 * bands * t_frames * 512).unwrap(),
         pre2_all: z(6 * bands * t_frames * 2 * 516),
@@ -6520,6 +6548,7 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
         },
         x_final: z(m * 256),
         xb: z(m * 256),
+        xb16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
         glu_all: z(6 * bands * t_frames * 516),
         hidden_t: DeviceBuffer::<u32>::zeroed(&stream, 6 * bands * t_frames * 512).unwrap(),
         pre2_all: z(6 * bands * t_frames * 2 * 516),
@@ -6707,6 +6736,7 @@ fn forward_only(device: usize, model_dir: &std::path::Path, input: &std::path::P
         },
         x_final: z(m * 256),
         xb: z(m * 256),
+        xb16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
         glu_all: z(6 * bands * t_frames * 516),
         hidden_t: DeviceBuffer::<u32>::zeroed(&stream, 6 * bands * t_frames * 512).unwrap(),
         pre2_all: z(6 * bands * t_frames * 2 * 516),
