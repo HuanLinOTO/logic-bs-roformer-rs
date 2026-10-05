@@ -1947,6 +1947,106 @@ mod gpu_kernels {
         }
     }
 
+    /// QKV GEMM variant whose output is pre-packed f16x2 words (row stride
+    /// 768 words: Q 0..255, K 256..511, V 512..767) so flash attention
+    /// gathers half the bytes.
+    #[kernel]
+    pub fn gemm_f16_128x64_hout(
+        m: u32, n: u32, k: u32,
+        x: &[f32], w: &[f32], bias: &[f32],
+        mut y: DisjointSlice<u32>,
+    ) {
+        static mut SA: SharedArray<u32, { 128 * 32 }> = SharedArray::UNINIT;
+        static mut SB: SharedArray<u32, { 64 * 32 }> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let warp_id = tid / 32;
+        let group = lane / 4;
+        let tig = lane % 4;
+        let block_row_base = thread::blockIdx_y() as usize * 128;
+        let row_base = block_row_base + warp_id * 16;
+        let col_base = thread::blockIdx_x() as usize * 64;
+        let (m_size, n_size, k_size) = (m as usize, n as usize, k as usize);
+        let mut acc = [[0.0f32; 4]; 8];
+        let num_k = k_size.div_ceil(64);
+        for ks in 0..num_k {
+            let k_base = ks * 64;
+            unsafe {
+                for i in 0..8usize {
+                    let idx = tid + i * 256;
+                    let r = idx / 16;
+                    let q4 = idx % 16;
+                    let xr = block_row_base + r;
+                    let k0 = k_base + q4 * 4;
+                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    if xr < m_size && k0 + 3 < k_size {
+                        let src = x.as_ptr().add(xr * k_size + k0);
+                        let v: [f32; 4] = *(src as *const [f32; 4]);
+                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    }
+                    SA[r * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SA[r * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                }
+                for i in 0..4usize {
+                    let idx = tid + i * 256;
+                    let col = idx / 16;
+                    let q4 = idx % 16;
+                    let bc = col_base + col;
+                    let k0 = k_base + q4 * 4;
+                    let (mut v0, mut v1, mut v2, mut v3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    if bc < n_size && k0 + 3 < k_size {
+                        let src = w.as_ptr().add(bc * k_size + k0);
+                        let v: [f32; 4] = *(src as *const [f32; 4]);
+                        (v0, v1, v2, v3) = (v[0], v[1], v[2], v[3]);
+                    }
+                    SB[col * 32 + q4 * 2] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    SB[col * 32 + q4 * 2 + 1] = cuda_device::convert::cvt_f16x2_f32(v2, v3);
+                }
+            }
+            thread::sync_threads();
+            for kk in 0..4usize {
+                let word = kk * 8;
+                let mut a = [0u32; 4];
+                unsafe {
+                    let r0 = warp_id * 16 + group;
+                    let r1 = r0 + 8;
+                    a[0] = SA[r0 * 32 + word + tig];
+                    a[1] = SA[r1 * 32 + word + tig];
+                    a[2] = SA[r0 * 32 + word + tig + 4];
+                    a[3] = SA[r1 * 32 + word + tig + 4];
+                }
+                for nt in 0..8usize {
+                    let mut b = [0u32; 2];
+                    unsafe {
+                        let col_word = (nt * 8 + group) * 32 + word;
+                        b[0] = SB[col_word + tig];
+                        b[1] = SB[col_word + tig + 4];
+                    }
+                    acc[nt] = unsafe { wmma::mma_m16n8k16_f32_f16(acc[nt], a, b) };
+                }
+            }
+            thread::sync_threads();
+        }
+        let out_ptr = y.as_mut_ptr();
+        let half_n = n_size / 2;
+        for nt in 0..8usize {
+            let cw = (col_base + nt * 8 + tig * 2) / 2;
+            let r_lo = row_base + group;
+            let r_hi = r_lo + 8;
+            let (b0, b1) = (bias[col_base + nt * 8 + tig * 2], bias[col_base + nt * 8 + tig * 2 + 1]);
+            if r_lo < m_size && cw < half_n {
+                unsafe {
+                    *out_ptr.add(r_lo * half_n + cw) = cuda_device::convert::cvt_f16x2_f32(acc[nt][0] + b0, acc[nt][1] + b1);
+                }
+            }
+            if r_hi < m_size && cw < half_n {
+                unsafe {
+                    *out_ptr.add(r_hi * half_n + cw) = cuda_device::convert::cvt_f16x2_f32(acc[nt][2] + b0, acc[nt][3] + b1);
+                }
+            }
+        }
+    }
+
     /// FP16 tensor-core GEMM, 128x64 tile / 256 threads. Inputs are fp32 in
     /// global memory; cooperative loads pack adjacent K values into f16x2.
     /// Accumulation stays f32, so accuracy is close to PyTorch's autocast path.
@@ -2688,7 +2788,7 @@ mod gpu_kernels {
     /// probability tile converts to A fragments in place.
     #[kernel]
     pub fn attn_flash_tc(
-        qkv: &[f32], cos: &[f32], sin: &[f32], gates: &[f32],
+        qkv: &[u32], cos: &[f32], sin: &[f32], gates: &[f32],
         bands: u32, axis: u32, seq: u32,
         mut y: DisjointSlice<f32>,
         mut dbg_m: DisjointSlice<f32>, mut dbg_l: DisjointSlice<f32>,
@@ -2726,10 +2826,11 @@ mod gpu_kernels {
                 let xr = row_base + r;
                 let (mut v0, mut v1) = (0.0f32, 0.0f32);
                 if xr < n_size {
-                    let base = token_of(xr) * 1536 + head * 64 + w * 2;
+                    let base = token_of(xr) * 768 + head * 32 + w;
                     let c = cos[xr * 32 + w];
                     let sn = sin[xr * 32 + w];
-                    let (even, odd) = (qkv[base], qkv[base + 1]);
+                    // SAFETY: word index into qkv16 (m*768).
+                    let (even, odd) = cuda_device::convert::cvt_f32x2_f16x2(unsafe { *qkv.as_ptr().add(base) });
                     v0 = (even * c - odd * sn) * 0.125;
                     v1 = (odd * c + even * sn) * 0.125;
                 }
@@ -2756,10 +2857,11 @@ mod gpu_kernels {
                     let key = kt + k;
                     let (mut v0, mut v1) = (0.0f32, 0.0f32);
                     if key < n_size {
-                        let base = token_of(key) * 1536 + 512 + head * 64 + w * 2;
+                        let base = token_of(key) * 768 + 256 + head * 32 + w;
                         let c = cos[key * 32 + w];
                         let sn = sin[key * 32 + w];
-                        let (even, odd) = (qkv[base], qkv[base + 1]);
+                        // SAFETY: word index into qkv16.
+                        let (even, odd) = cuda_device::convert::cvt_f32x2_f16x2(unsafe { *qkv.as_ptr().add(base) });
                         v0 = even * c - odd * sn;
                         v1 = odd * c + even * sn;
                     }
@@ -2770,9 +2872,12 @@ mod gpu_kernels {
                     let k = idx / 32;
                     let w = idx % 32;
                     let key = kt + k;
-                    let v0 = if key < n_size { qkv[token_of(key) * 1536 + 1024 + head * 64 + w * 2] } else { 0.0 };
-                    let v1 = if key < n_size { qkv[token_of(key) * 1536 + 1024 + head * 64 + w * 2 + 1] } else { 0.0 };
-                    SV[k * 32 + w] = cuda_device::convert::cvt_f16x2_f32(v0, v1);
+                    // SAFETY: word index into qkv16; V starts at word 512.
+                    SV[k * 32 + w] = if key < n_size {
+                        unsafe { *qkv.as_ptr().add(token_of(key) * 768 + 512 + head * 32 + w) }
+                    } else {
+                        0
+                    };
                 }
             }
             thread::sync_threads();
@@ -4483,6 +4588,7 @@ struct E2eScratch {
     h: DeviceBuffer<f32>,          // (M, 256)
     h16: DeviceBuffer<u32>,        // (M, 128) packed f16x2
     qkv: DeviceBuffer<f32>,        // (M, 1536)
+    qkv16: DeviceBuffer<u32>,      // (M, 768) packed f16x2 (Q|K|V)
     qkv_rope: DeviceBuffer<f32>,   // (M, 1536)
     qkv_attn: DeviceBuffer<f32>,   // time: [3*496, T, 64]; freq: [3*9208, 62, 64]
     v_flat: DeviceBuffer<f32>,     // (M, 512)
@@ -4608,7 +4714,7 @@ unsafe fn transformer_step(
     // (L1TEX shared-read bound, not global-load bound) plus pack overhead.
     // SAFETY: 2-D tile grid over m x 1536.
     unsafe {
-        km.gemm_f16_128x64(stream, tile_cfg_tf32_64(m, 1536), m as u32, 1536, 256, &scratch.h, &gw.qkv_w[idx], &gw.shared_qkv_bias, &mut scratch.qkv)
+        km.gemm_f16_128x64_hout(stream, tile_cfg_tf32_64(m, 1536), m as u32, 1536, 256, &scratch.h, &gw.qkv_w[idx], &gw.shared_qkv_bias, &mut scratch.qkv16)
     }.map_err(|e| e.to_string())?;
 
     // RoPE and attention-major reordering are fused into the raw-QKV
@@ -4622,7 +4728,7 @@ unsafe fn transformer_step(
         // EXPERIMENT: both axes on the (now power-of-two-stride) flash kernel.
         // SAFETY: one 128-thread block per (BH group, 64-row query tile).
         unsafe {
-            km.attn_flash_tc(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, n_len.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &scratch.qkv, &scratch.cos[axis], &scratch.sin[axis], &scratch.gates, bands as u32, axis as u32, seq as u32, &mut scratch.scaled, &mut scratch.attn_max, &mut scratch.attn_scale)
+            km.attn_flash_tc(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, n_len.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], &scratch.gates, bands as u32, axis as u32, seq as u32, &mut scratch.scaled, &mut scratch.attn_max, &mut scratch.attn_scale)
         }.map_err(|e| e.to_string())?;
     }
     // 7. gate application was fused into attn_v_to_flat; out proj reads scaled.
@@ -4873,6 +4979,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     let mut scr = E2eScratch {
         h: z(m * 256),
         h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
+        qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
         qkv: z(m * 1536),
         qkv_rope: z(m * 1536),
         qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64), // max of both axes' layouts
@@ -5089,8 +5196,13 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
         // SAFETY: one 128-thread block per (BH group, 64-row query tile).
         let mut f_max = DeviceBuffer::<f32>::zeroed(&stream, bh_t * t_frames).unwrap();
         let mut f_l = DeviceBuffer::<f32>::zeroed(&stream, bh_t * t_frames).unwrap();
+        let qkv0h16: Vec<u32> = {
+            let v = qkv0.to_host_vec(&stream).unwrap();
+            v.chunks(2).map(|c| (f32_to_f16_bits(c[0]) as u32) | ((f32_to_f16_bits(c[1]) as u32) << 16)).collect()
+        };
+        let qkv0_16 = DeviceBuffer::from_host(&stream, &qkv0h16).unwrap();
         // SAFETY: one 128-thread block per (BH group, 64-row query tile).
-        unsafe { km.attn_flash_tc(&stream, cuda_core::simt::LaunchConfig { grid_dim: (1, t_frames.div_ceil(64) as u32, bh_t as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &qkv0, &scr.cos[0], &scr.sin[0], &g0b, bands as u32, 0, t_frames as u32, &mut s_new, &mut f_max, &mut f_l) }.unwrap();
+        unsafe { km.attn_flash_tc(&stream, cuda_core::simt::LaunchConfig { grid_dim: (1, t_frames.div_ceil(64) as u32, bh_t as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &qkv0_16, &scr.cos[0], &scr.sin[0], &g0b, bands as u32, 0, t_frames as u32, &mut s_new, &mut f_max, &mut f_l) }.unwrap();
         let qkv0h = qkv0.to_host_vec(&stream).unwrap();
         {
             let mv = a_max.to_host_vec(&stream).unwrap();
@@ -5557,6 +5669,7 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize) {
         scr: E2eScratch {
             h: z(m * 256),
             h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
+        qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
             qkv: z(m * 1536),
             qkv_rope: z(m * 1536),
             qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64),
