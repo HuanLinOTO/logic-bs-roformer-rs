@@ -56,6 +56,14 @@ jobs:
             --component rust-src --component rustc-dev --component llvm-tools
           cargo oxide build -- --release
 
+      - name: Upload lbrr binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: lbrr-linux-x64
+          path: target/release/lbrr
+          if-no-files-found: error
+          retention-days: 14
+
       - name: GPU self-test & golden SNR gate (GPU runners only)
         run: |
           if [ ! -e /dev/nvidia0 ]; then
