@@ -18,10 +18,18 @@ jobs:
     timeout-minutes: 90
     env:
       CUDA_HOME: /usr/local/cuda-13.3
+      # bootstrap (rustc-codegen-cuda, dev profile) 去掉 debuginfo：11G -> ~4G
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Free disk space (drop preinstalled toolchains)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          df -h /
 
       - name: Vendor overlay (cuda-oxide-codegen src/target)
         run: |
