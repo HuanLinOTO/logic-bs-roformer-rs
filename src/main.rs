@@ -7280,19 +7280,28 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
     const STEP: usize = 559360;
     const BORDER: usize = 29440;
 
-    // reflect pad and fade window (numpy linspace endpoint semantics)
-    let xp = reflect_pad(&wav.samples, len * 2, BORDER * 2, BORDER * 4); // interleaved: per-channel counts doubled
-    let xp_len = xp.len() / 2;
-    let out_len = xp_len - 2 * BORDER; // matches xp.shape[-1] - 2*border in samples
+    // Chunk plan must cover the whole output span [BORDER, BORDER+len): the
+    // final start is the first STEP-grid point whose window reaches the span
+    // end, and the reflect padding is widened so that chunk is full-width
+    // (pymss parity: pymss keeps every range(0, total, step) start and pads
+    // the tail frame to chunk_size). The old 'while s + C <= xp_len' grid
+    // dropped the trailing partial chunk — up to STEP - 2*BORDER samples
+    // (~11.3 s) of tail silence, and all silence below 11.3 s of input.
+    let needed = BORDER + len; // xp end of the output span (exclusive)
     let starts: Vec<usize> = {
         let mut v = Vec::new();
         let mut s = 0usize;
-        while s + C <= xp_len {
+        while s + C < needed {
             v.push(s);
             s += STEP;
         }
+        v.push(s); // last chunk: s + C >= needed, its tail fade is overridden to 1
         v
     };
+    // reflect pad and fade window (numpy linspace endpoint semantics)
+    let right_pad = starts[starts.len() - 1] + C - needed;
+    let xp = reflect_pad(&wav.samples, len * 2, BORDER * 2, right_pad * 2); // interleaved: per-channel counts doubled
+    let out_len = needed; // output span length; accumulators live in xp coords [0, needed)
     println!("demix    : {} chunks (T={t_frames}, M={m}), overlap-add border {BORDER}", starts.len());
 
     let ctx = CudaContext::new(device).expect("ctx");

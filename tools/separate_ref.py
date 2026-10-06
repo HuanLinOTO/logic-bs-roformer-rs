@@ -77,14 +77,24 @@ def main():
     C = 588800
     step = 559360
     border = 29440
-    xp = torch.nn.functional.pad(x, (border, border * 2), mode="reflect")
-    starts = list(range(0, xp.shape[-1] - C + 1, step))
+    # pymss parity: keep every step-grid start that the output span needs and
+    # widen the reflect padding so the final chunk is full-width (the old
+    # range(0, xp_len - C + 1, step) grid dropped the trailing partial chunk).
+    needed = border + x.shape[-1]
+    starts = []
+    s = 0
+    while s + C < needed:
+        starts.append(s)
+        s += step
+    starts.append(s)
+    right = starts[-1] + C - needed
+    xp = torch.nn.functional.pad(x, (border, right), mode="reflect")
     fade = torch.cat([
         torch.linspace(0, 1, border),
         torch.ones(C - border * 2),
         torch.linspace(1, 0, border),
     ]).cuda()
-    result = torch.zeros(1, 6, 2, xp.shape[-1] - border * 2, device="cuda")
+    result = torch.zeros(1, 6, 2, needed, device="cuda")
     counter = torch.zeros(1, 1, 1, result.shape[-1], device="cuda")
     t0 = time.perf_counter()
     with torch.inference_mode():
