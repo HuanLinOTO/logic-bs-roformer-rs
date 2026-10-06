@@ -73,6 +73,16 @@ wsl -d Ubuntu-22.04 -u root -- bash -lc \
 注意：cuda-oxide-codegen 的 src/target/ 目录被上游 gitignore 规则吞掉
 （不入库），只能靠文件系统同步——sync_wsl.sh 的 exclude 必须保持锚定写法。
 
+本机 cudnn fused SDPA（可选，提速 ~20%）：部署在 /opt/lbrr-cudnn/（pip wheel
+cudnn 9.10.2.21 + nvrtc 12.6.85 的 lib/include + 本机重编的
+libcudnn_sdpa_wrap.so——远程编译版需要 GLIBC 2.38，Ubuntu 22.04 只有 2.35，
+须用本机 g++ 11 重编：frontend 头在 cfe/cudnn-frontend-v1212/include）。
+LBRR_CUDNN_DIR/LBRR_NVRTC_DIR/LBRR_SDPA_WRAP 已入 profile.d。坑：frontend
+的 load_cudart_so() 要求进程可 dlopen 的 libcudart 唯一——WSL 装过 CUDA
+12.6 时 ldconfig 缓存同时有 .12/.13 会报 "Multiple libcudart"，需禁用
+ld.so.conf.d 里 12.x 的条目（988_cuda-12.conf、gds-12-6.conf）后 ldconfig。
+验证：golden SNR 80.94dB，全曲 GPU wall 6.67s(回退) -> 5.45s(cudnn)。
+
 ## 远程构建与运行（基准环境：Komari 节点 RTX 3080）
 
 ```bash
