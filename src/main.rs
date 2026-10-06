@@ -93,7 +93,7 @@ fn main() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("lbrr: {e}");
-            eprintln!("usage: lbrr --model-dir DIR --input song.wav --outdir out/ [--device N] [--bench]");
+            eprintln!("usage: lbrr --model-dir DIR --input song.[wav|mp3|flac|...] --outdir out/ [--device N] [--bench]");
             eprintln!("       lbrr --self-test | --print-config --model-dir DIR");
             std::process::exit(2);
         }
@@ -7158,17 +7158,123 @@ fn reflect_pad(x: &[f32], len: usize, left: usize, right: usize) -> Vec<f32> {
     out
 }
 
+/// Locate an ffmpeg binary: LBRR_FFMPEG env > PATH (ffmpeg / ffmpeg.exe) >
+/// (WSL only) the Windows ffmpeg found via `cmd.exe /c where ffmpeg`,
+/// translated with wslpath. Returns None when nothing is runnable.
+fn find_ffmpeg() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("LBRR_FFMPEG") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    for cand in ["ffmpeg", "ffmpeg.exe"] {
+        let ok = std::process::Command::new(cand).arg("-version")
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
+        if ok {
+            return Some(std::path::PathBuf::from(cand));
+        }
+    }
+    if cfg!(target_os = "linux") {
+        // WSL login shells do not inherit the Windows PATH, but the Windows
+        // ffmpeg is still reachable through cmd.exe — and it can only address
+        // Windows-style paths, which the caller handles via wslpath.
+        let out = std::process::Command::new("cmd.exe").args(["/c", "where", "ffmpeg"]).output().ok()?;
+        if out.status.success() {
+            if let Some(win) = String::from_utf8_lossy(&out.stdout).lines().next() {
+                let win = win.trim();
+                if !win.is_empty() {
+                    let out2 = std::process::Command::new("wslpath").arg("-u").arg(win).output().ok()?;
+                    if out2.status.success() {
+                        let p = std::path::PathBuf::from(String::from_utf8_lossy(&out2.stdout).trim());
+                        if p.is_file() {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Run ffmpeg: any container/codec, any sample rate, any channel count ->
+/// 44.1kHz stereo f32 wav at `tmp`. A Windows ffmpeg.exe found from WSL gets
+/// Windows-style paths via wslpath -w (it cannot see /mnt/... or /tmp/...).
+fn ffmpeg_convert(ffmpeg: &std::path::Path, input: &std::path::Path, tmp: &std::path::Path) -> Result<(), String> {
+    let win_exe = cfg!(target_os = "linux")
+        && ffmpeg.file_name().map(|f| f.to_string_lossy().ends_with(".exe")).unwrap_or(false);
+    let conv = |p: &std::path::Path| -> String {
+        if !win_exe {
+            return p.display().to_string();
+        }
+        std::process::Command::new("wslpath").arg("-w").arg(p).output().ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| p.display().to_string())
+    };
+    let out = std::process::Command::new(ffmpeg).args([
+        "-nostdin", "-y", "-i", &conv(input),
+        "-ar", "44100", "-ac", "2", "-c:a", "pcm_f32le", &conv(tmp),
+    ]).output().map_err(|e| format!("spawn ffmpeg: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let tail: Vec<&str> = stderr.lines().rev().take(6).collect();
+        return Err(format!("ffmpeg failed: {}", tail.iter().rev().cloned().collect::<Vec<_>>().join(" | ")));
+    }
+    Ok(())
+}
+
+/// Load the input as model-native audio (44.1kHz stereo). An already
+/// compliant wav passes through untouched (zero cost); everything else is
+/// converted through ffmpeg into a temp wav next to the input (so a Windows
+/// ffmpeg.exe reached from WSL can write it). Returns the audio plus a
+/// human-readable description of the conversion, if any.
+fn prepare_input(input: &std::path::Path) -> Result<(audio::WavData, Option<String>), String> {
+    const MODEL_SR: u32 = 44100;
+    let ext = input.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "audio".into());
+    match audio::read_wav(input) {
+        Ok(w) if w.sample_rate == MODEL_SR && w.channels == 2 => Ok((w, None)),
+        Ok(w) => {
+            let desc = format!("{ext}: {:.1}kHz/{}ch -> 44.1kHz stereo (ffmpeg)", w.sample_rate as f64 / 1000.0, w.channels);
+            prepare_via_ffmpeg(input, &desc)
+        }
+        Err(_) => {
+            let desc = format!("{ext} -> 44.1kHz stereo (ffmpeg)");
+            prepare_via_ffmpeg(input, &desc)
+        }
+    }
+}
+
+fn prepare_via_ffmpeg(input: &std::path::Path, desc: &str) -> Result<(audio::WavData, Option<String>), String> {
+    let ffmpeg = find_ffmpeg().ok_or_else(|| format!(
+        "input {} needs conversion but no ffmpeg was found; install ffmpeg or point LBRR_FFMPEG at one", input.display()))?;
+    let tmp = input.parent().unwrap_or(std::path::Path::new("."))
+        .join(format!(".lbrr_in_{}.wav", std::process::id()));
+    ffmpeg_convert(&ffmpeg, input, &tmp)?;
+    let wav = audio::read_wav(&tmp).map_err(|e| format!("ffmpeg output unreadable: {e}"));
+    let _ = std::fs::remove_file(&tmp);
+    Ok((wav?, Some(desc.to_string())))
+}
+
 fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path, outdir: &std::path::Path) {
-    let wav = audio::read_wav(input).expect("read wav");
-    assert_eq!(wav.channels, 2, "stereo input required");
+    let wall_t0 = std::time::Instant::now();
+    let (wav, conv) = match prepare_input(input) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("lbrr: input: {e}"); std::process::exit(2); }
+    };
     let len = wav.samples.len() / 2;
-    println!("separate: {} Hz, {} s ({} samples)", wav.sample_rate, len as f64 / wav.sample_rate as f64, len);
+    match conv {
+        Some(c) => println!("input    : {} [{c}]", input.display()),
+        None => println!("input    : {} [44.1kHz stereo, {:.1}s]", input.display(), len as f64 / 44100.0),
+    }
 
     let cfg = config::ModelConfig::parse(&std::fs::read_to_string(model_dir.join("logic_bs_roformer.yaml")).unwrap()).unwrap();
     let bands = cfg.num_bands();
     let t_frames = stft::num_frames(588800); // 1151
     let m = t_frames * bands;
-    println!("chunk: T={t_frames} bands={bands} M={m}");
+    println!("model    : dim={} depth={} bands={} stems=[{}]", cfg.dim, cfg.depth, bands, cfg.instruments.join(" "));
 
     const C: usize = 588800;
     const STEP: usize = 559360;
@@ -7187,7 +7293,7 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
         }
         v
     };
-    println!("chunks: {} (padded {} -> out {})", starts.len(), xp_len, out_len);
+    println!("demix    : {} chunks (T={t_frames}, M={m}), overlap-add border {BORDER}", starts.len());
 
     let ctx = CudaContext::new(device).expect("ctx");
     let stream = ctx.default_stream();
@@ -7197,7 +7303,7 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
     let st = weights::SafeTensors::open(&model_dir.join("model.safetensors")).unwrap();
     let w = weights::ModelWeights::load(&st, &cfg).unwrap();
     let gw = upload_weights(&ctx, &stream, &w).expect("weights upload");
-    println!("weights load+upload: {:?}", t0.elapsed());
+    println!("weights  : load+upload {:.2}s", t0.elapsed().as_secs_f64());
 
     let fft = std::sync::Arc::new(cufft::Cufft::load().expect("cufft"));
     let sp = stft::Stft::new(fft.clone(), t_frames).expect("stft plan");
@@ -7279,6 +7385,9 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         f0_dev,
     };
     let _ = &mut bufs;
+    cudnn_ready(&ctx, &mut bufs.scr);
+    let attn_engine = if bufs.scr.cudnn.is_some() { "cudnn fused SDPA" } else { "hand-written flash (cudnn unavailable)" };
+    println!("engine   : cuBLASLt GEMMs + {attn_engine}");
 
     // Per-chunk ISTFT window-energy counter: identical for every chunk (same
     // frame layout), so computed once and uploaded once. The GPU OLA kernel
@@ -7320,10 +7429,12 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
     }
     stream.synchronize().unwrap();
 
+    use std::io::IsTerminal as _;
+    let tty = std::io::stdout().is_terminal();
+    let bar_w = 20usize;
     let total_t0 = std::time::Instant::now();
     let mut slot = 0usize;
     for (ci, &s) in starts.iter().enumerate() {
-        let chunk_t0 = std::time::Instant::now();
         // 1. wait out the previous H2D from this pinned slot
         evs[slot].synchronize().expect("stager event");
         // 2. stage the chunk into pinned memory (~1 ms host memcpy)
@@ -7348,7 +7459,15 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         }
         std::mem::swap(&mut bufs.x_dev, &mut x_spare);
         slot ^= 1;
-        println!("chunk {}/{} enqueued in {:?}", ci + 1, starts.len(), chunk_t0.elapsed());
+        if tty {
+            let done = ci + 1;
+            let filled = done * bar_w / starts.len();
+            print!("\r           [{}{}] {}/{} {:.1}s",
+                "#".repeat(filled), " ".repeat(bar_w - filled),
+                done, starts.len(), total_t0.elapsed().as_secs_f64());
+            use std::io::Write as _;
+            std::io::stdout().flush().ok();
+        }
     }
     stream.synchronize().expect("final sync");
     let gpu_wall = total_t0.elapsed();
@@ -7356,8 +7475,10 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
     let dl_t0 = std::time::Instant::now();
     let result = result_dev.to_host_vec(&stream).unwrap();
     let demix_counter = counter_dev.to_host_vec(&stream).unwrap();
-    println!("demix: GPU wall {gpu_wall:?}, download {:?}, RTF {:.4}",
-        dl_t0.elapsed(), gpu_wall.as_secs_f64() / (len as f64 / 44100.0));
+    let dl_ms = dl_t0.elapsed().as_secs_f64() * 1000.0;
+    if tty { println!(); }
+    println!("gpu      : wall {:.2}s, download {:.0}ms, RTF {:.4}",
+        gpu_wall.as_secs_f64(), dl_ms, gpu_wall.as_secs_f64() / (len as f64 / 44100.0));
 
     std::fs::create_dir_all(outdir).unwrap();
     let names: Vec<String> = cfg.instruments.clone();
@@ -7365,6 +7486,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
     // BORDER left-pad samples before the source. Read [BORDER, BORDER+len)
     // so stems align with the input (was [0, out_len) — a +29440-sample
     // shift caught by cross-correlation against the source).
+    let mut wrote_bytes = 0u64;
     for s_idx in 0..6usize {
         let name = names.get(s_idx).map(|s| s.as_str()).unwrap_or("stem");
         // interleaved stereo, normalized by counter
@@ -7378,8 +7500,11 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         }
         let path = outdir.join(format!("{s_idx}_{name}.wav"));
         audio::write_wav_f32(&path, &audio::WavData { sample_rate: wav.sample_rate, channels: 2, samples: out_samples }).expect("write stem");
-        println!("wrote {}", path.display());
+        wrote_bytes += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     }
+    println!("output   : {} stems -> {}/ ({}, {:.1} MB total)",
+        names.len(), outdir.display(), names.join(", "), wrote_bytes as f64 / 1e6);
+    println!("total    : {:.1}s wall", wall_t0.elapsed().as_secs_f64());
 }
 
 // Single-input forward: no reflect padding, no chunk loop. Apples-to-apples
