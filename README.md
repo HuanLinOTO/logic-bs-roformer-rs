@@ -45,7 +45,36 @@ BS-RoFormer 六 stem 音源分离模型的纯 Rust + cuda-oxide 推理实现，
 - **rmsnorm_gates**：RMSNorm 与 8 头门控投影融合（lane-major 合并访问）。
 - **mask_gemm1/2 + glu_scatter**：逐 stem 分组 MaskEstimator。
 
-## 远程构建与运行（唯一测试环境：Komari 节点 RTX 3080）
+## 本机（Windows + WSL）构建
+
+Windows 原生 MSVC 无法编译：cuda-rust 的 rustc_codegen_cuda 后端 DLL 需要
+导出 ~10 万个符号（上游 Windows 适配的转发 thunk），超过 PE 导出表 65535
+硬上限（link.exe LNK1189 / lld-link 同报 too many exported symbols），
+已双链接器实测证伪。本机编译走 WSL：
+
+```bash
+# 一次性环境：WSL Ubuntu-22.04 + rustup nightly-2026-08-28 +
+#   CUDA 13.3 toolkit（.cn ubuntu2204 apt 源，cuda-toolkit-13-3）
+#   + llvm-14（libclang，bindgen 用）
+
+# 同步源码到 ext4 并构建（rsync exclude 已修复为锚定 /target，
+# 不再误删 cuda-oxide-codegen/src/target/ 源码目录）
+wsl -d Ubuntu-22.04 -u root -- bash -c \
+  'bash /mnt/d/Projects/logic-bs-roformer-rs/scripts/sync_wsl.sh && \
+   cd /root/work/lbrr && \
+   PATH=/root/.cargo/bin:/usr/local/cuda-13.3/bin:$PATH \
+   RUSTUP_TOOLCHAIN=nightly-2026-08-28 \
+   LIBCLANG_PATH=/usr/lib/llvm-14/lib \
+   CUDA_HOME=/usr/local/cuda-13.3 \
+   CARGO_TARGET_DIR=/root/work/target-lbrr \
+   cargo oxide build -- --release'
+# 产物: /root/work/target-lbrr/release/lbrr（GPU 直通可用）
+```
+
+注意：cuda-oxide-codegen 的 src/target/ 目录被上游 gitignore 规则吞掉
+（不入库），只能靠文件系统同步——sync_wsl.sh 的 exclude 必须保持锚定写法。
+
+## 远程构建与运行（基准环境：Komari 节点 RTX 3080）
 
 ```bash
 # 上传源码（MD5 校验的可靠通道）

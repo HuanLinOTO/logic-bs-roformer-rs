@@ -13,7 +13,7 @@ rsync -a --delete \
 
 mkdir -p $DST/vendor
 rsync -a \
-  --exclude '.git' --exclude 'target' --exclude 'target-oxide' \
+  --exclude '.git' --exclude '/target' --exclude '/target-oxide' \
   $SRC/vendor/cuda-rust/ $DST/vendor/cuda-rust/
 
 echo "sync done -> $DST"
