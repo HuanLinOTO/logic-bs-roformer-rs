@@ -57,17 +57,16 @@ Windows 原生 MSVC 无法编译：cuda-rust 的 rustc_codegen_cuda 后端 DLL �
 #   CUDA 13.3 toolkit（.cn ubuntu2204 apt 源，cuda-toolkit-13-3）
 #   + llvm-14（libclang，bindgen 用）
 
+# 环境已持久化到 WSL /etc/profile.d/99-rust-cuda.sh（PATH 含
+# /root/.cargo/bin 与 /usr/local/cuda-13.3/bin、CUDA_HOME、LIBCLANG_PATH、
+# CARGO_TARGET_DIR），登录 shell（bash -l）自动生效，无需手动 export。
+# rustup 工具链由 rust-toolchain.toml 钉定 nightly-2026-08-28。
+
 # 同步源码到 ext4 并构建（rsync exclude 已修复为锚定 /target，
 # 不再误删 cuda-oxide-codegen/src/target/ 源码目录）
-wsl -d Ubuntu-22.04 -u root -- bash -c \
+wsl -d Ubuntu-22.04 -u root -- bash -lc \
   'bash /mnt/d/Projects/logic-bs-roformer-rs/scripts/sync_wsl.sh && \
-   cd /root/work/lbrr && \
-   PATH=/root/.cargo/bin:/usr/local/cuda-13.3/bin:$PATH \
-   RUSTUP_TOOLCHAIN=nightly-2026-08-28 \
-   LIBCLANG_PATH=/usr/lib/llvm-14/lib \
-   CUDA_HOME=/usr/local/cuda-13.3 \
-   CARGO_TARGET_DIR=/root/work/target-lbrr \
-   cargo oxide build -- --release'
+   cd /root/work/lbrr && cargo oxide build -- --release'
 # 产物: /root/work/target-lbrr/release/lbrr（GPU 直通可用）
 ```
 
