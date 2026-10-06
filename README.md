@@ -68,6 +68,11 @@ powershell scripts\lbrr.ps1 --separate --input song.wav --outdir out
 本机实测（4060 Ti / CUDA 13.4 / stable 1.99）：整曲 cyberangel.wav 180.5s
 GPU wall **4.64s**（RTF 0.0257），golden SNR **80.96 dB**，8s 短输入无静音尾。
 
+**依赖落盘约定**：Rust 工具链与全部构建依赖一律 D 盘（`CARGO_HOME=D:cargo`、
+`RUSTUP_HOME=D:ustup`，已设为用户级环境变量；cuDNN/cfe/shim 在
+`D:Projectslbrr-win-libs`）。禁止任何依赖安装到 C 盘；build_win.ps1
+内置守卫，CARGO_HOME/RUSTUP_HOME 落 C 盘时直接报错。
+
 **WSL 构建（备用的 Linux 路径）**：
 
 ```bash

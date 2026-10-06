@@ -11,6 +11,13 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path $PSScriptRoot -Parent
 Set-Location $repo
 
+# --- 依赖落盘约定：Rust 工具链/缓存一律 D 盘，禁止写 C 盘 ---
+if (Test-Path "D:\cargo\bin")   { $env:CARGO_HOME  = "D:\cargo"; $env:PATH = "D:\cargo\bin;$env:PATH" }
+if (Test-Path "D:\rustup")      { $env:RUSTUP_HOME = "D:\rustup" }
+if ($env:CARGO_HOME -like "C:*" -or $env:RUSTUP_HOME -like "C:*") {
+    throw "CARGO_HOME/RUSTUP_HOME 指向 C 盘（$env:CARGO_HOME / $env:RUSTUP_HOME），违反依赖不落 C 盘的约定"
+}
+
 # --- CUDA 环境 ---
 $cudaHome = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\$CudaVersion"
 if (-not (Test-Path $cudaHome)) { throw "CUDA Toolkit not found: $cudaHome" }
