@@ -1,19 +1,23 @@
 name: build-and-test
 
-# 自托管 runner（labels: self-hosted, cuda）：需要 CUDA 13.x toolkit +
-# rustup nightly-2026-08-28 + g++（llvm-14 libclang）。模型权重不入 git，
-# 可预置到 runner 的 /opt/lbrr-assets/，有则 SNR 门槛生效，无则跳过。
+# GitHub 托管 runner（ubuntu-24.04，无 GPU）：验证 fresh checkout 可编译。
+# GPU 步骤（self-test / SNR 门槛）为探测式：将来接到带 GPU 的 runner
+# 自动生效。为省配额只跑最新一次（cancel-in-progress）。
 on:
   push:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
-    runs-on: [self-hosted, cuda]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     env:
       CUDA_HOME: /usr/local/cuda-13.3
-      LIBCLANG_PATH: /usr/lib/llvm-14/lib
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,27 +29,35 @@ jobs:
           cp -r vendor-overlay/cuda-oxide-codegen/src/target \
                 vendor/cuda-rust/cuda-oxide/crates/cuda-oxide-codegen/src/
 
-      - name: Seed assets (optional, enables SNR gate)
+      - name: Install CUDA 13.3 toolkit (network repo)
         run: |
-          if [ -d /opt/lbrr-assets ]; then
-            mkdir -p assets
-            cp -rn /opt/lbrr-assets/. assets/
-            echo "seeded: $(ls assets | tr '\n' ' ')"
-          else
-            echo "no /opt/lbrr-assets, SNR gate will be skipped"
-          fi
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cuda-toolkit-13-3 > /dev/null
+          "$CUDA_HOME/bin/nvcc" --version | tail -2
+
+      - name: Install libclang (bindgen)
+        run: sudo apt-get install -y -qq libclang-dev > /dev/null
 
       - name: Build (cargo oxide, release)
         run: |
-          export PATH="/root/.cargo/bin:${CUDA_HOME}/bin:${PATH}"
+          export PATH="$HOME/.cargo/bin:${CUDA_HOME}/bin:${PATH}"
+          export LIBCLANG_PATH=/usr/lib/llvm-18/lib
+          rustup toolchain install nightly-2026-08-28 --profile minimal \
+            --component rust-src --component rustc-dev --component llvm-tools
           cargo oxide build -- --release
 
-      - name: GPU self-test
-        run: ./target/release/lbrr --self-test
-
-      - name: Golden SNR gate (>=60dB)
-        if: hashFiles('assets/model.safetensors') != ''
+      - name: GPU self-test & golden SNR gate (GPU runners only)
         run: |
-          ./target/release/lbrr --bench --iters 1 --model-dir assets | tee bench.log
-          snr=$(grep -oP 'BENCH final SNR vs ref_output: \K[0-9.]+' bench.log)
-          test -n "$snr" && awk -v s="$snr" 'BEGIN { if (s+0 < 60) { printf "FAIL: SNR %s < 60\n", s; exit 1 } else printf "PASS: SNR %s >= 60\n", s }'
+          if [ ! -e /dev/nvidia0 ]; then
+            echo 'no GPU on this runner — skipping GPU validation'
+            exit 0
+          fi
+          ./target/release/lbrr --self-test
+          if [ -d /opt/lbrr-assets ]; then
+            mkdir -p assets && cp -rn /opt/lbrr-assets/. assets/
+            ./target/release/lbrr --bench --iters 1 --model-dir assets | tee bench.log
+            snr=$(grep -oP 'BENCH final SNR vs ref_output: \K[0-9.]+' bench.log)
+            test -n "$snr" && awk -v s="$snr" 'BEGIN { if (s+0 < 60) { printf "FAIL: SNR %s < 60\n", s; exit 1 } else printf "PASS: SNR %s >= 60\n", s }'
+          fi
