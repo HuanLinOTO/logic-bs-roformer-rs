@@ -30,11 +30,6 @@ pub fn num_frames(len: usize) -> usize {
     len / HOP + 1
 }
 
-/// Signal length from the npz x array shape (2, len).
-pub fn stft_len(shape: &std::collections::BTreeMap<String, Vec<usize>>) -> usize {
-    shape.get("x").map(|s| s[1]).unwrap_or(0)
-}
-
 impl Stft {
     /// Plan for exactly 2*frames forward transforms (both channels).
     pub fn new(fft: Arc<Cufft>, frames: usize) -> Result<Self, String> {

@@ -6,7 +6,7 @@
 
 - **底层库**：NVIDIA 官方 [cuda-rust](https://github.com/NVIDIA/cuda-rust)（cuda-oxide：纯 Rust 单源 CUDA kernel，`#[kernel]` → rustc 后端 → NVVM → PTX）
 - **专门算子**：针对该模型的固定形状（62 频带、dim 256、12 层双轴 transformer、6 stems）手写融合 kernel，目标是超过 PyTorch fp32 通用路径
-- **双机验证**：本机 RTX 4060 Ti 16G（sm_89，经 WSL2）+ <REMOTE_NODE_NAME>（RTX 3080 20G，sm_86，Debian 13）
+- **双机验证**：本机 RTX 4060 Ti 16G（sm_89，经 WSL2）+ 远程节点 <REMOTE_NODE_NAME>（RTX 3080 20G，sm_86，Debian 13）
 - **数值正确性**：与 PyTorch 参考实现逐算子对拍 + 端到端对拍
 
 ### 成功标准（验收）
@@ -26,11 +26,11 @@
 - uv + PyTorch 2.6.0+cu124 参考环境就绪：`.venv2`（`D:\Projects\.model-research`），已跑通参考推理
 - 权重/YAML/参考输出已下载：`D:\Projects\.model-research\{logic_bs_roformer.ckpt, logic_bs_roformer.yaml, ref_output.npz, state_dict_shapes.json}`
 
-### 远程"<REMOTE_NODE_NAME>"（Komari 节点 `<REMOTE_NODE_NAME>`，uuid <KOMARI_NODE_ID>）
+### 远程测试节点（Komari 节点 <REMOTE_NODE_NAME>，uuid <KOMARI_NODE_ID>）
 - Debian 13，64 核 E5，62G RAM，RTX 3080 **20G**（sm_86），driver 595.91，CUDA **13.3** 完整 toolkit（/usr/local/cuda-13.3）
 - rustc 1.98.0 stable + rustup；**nightly-2026-08-28 已装**；已补装 libclang-dev、libcurand-dev-13-3
 - **cuda-oxide 全链路已验证成功**：`cargo oxide run vecadd` 在 3080 上正确执行（cuda-rust 已 clone 在 /data/dsh/cuda-rust）
-- ⚠️ 只能通过 Komari 面板远程执行（无直连 SSH）：封装工具 `<SSH_TOOLS_DIR>/kexec.js`（登录 → POST /api/admin/task/exec → 轮询结果，root 权限）。长任务模式：`nohup cmd > log 2>&1 &` + 轮询 `cat log`
+- ⚠️ 只能通过 Komari 面板远程执行（无直连 SSH）：封装工具 `<SSH_TOOLS_DIR>/kexec.js`（登录 → 面板 exec API → 轮询结果，root 权限）。长任务模式：`nohup cmd > log 2>&1 &` + 轮询 `cat log`
 - 磁盘 /data 261G 可用；miniconda3 在 /data/dsh/miniconda3（可用于远程装 torch 参考基准）
 
 ### 其他

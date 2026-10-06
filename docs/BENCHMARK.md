@@ -2,7 +2,7 @@
 
 ## 测试环境
 
-- GPU：<REMOTE_NODE_NAME>，RTX 3080 20GB（sm_86）
+- GPU：远程节点 <REMOTE_NODE_NAME>，RTX 3080 20GB（sm_86）
 - Rust/CUDA：nightly-2026-08-28 + cuda-oxide，CUDA 13.3
 - PyTorch：2.14.1+cu126
 - 输入：3 秒合成双声道音频（与 `assets/ref_output.npz` 完全一致）

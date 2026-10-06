@@ -83,6 +83,22 @@ LBRR_CUDNN_DIR/LBRR_NVRTC_DIR/LBRR_SDPA_WRAP 已入 profile.d。坑：frontend
 ld.so.conf.d 里 12.x 的条目（988_cuda-12.conf、gds-12-6.conf）后 ldconfig。
 验证：golden SNR 80.94dB，全曲 GPU wall 6.67s(回退) -> 5.45s(cudnn)。
 
+## CI
+
+本地一条命令全链验证（overlay → sync → release 构建 → GPU 自检 →
+golden SNR ≥60dB 门槛）：
+
+```bash
+wsl -d Ubuntu-22.04 -u root -- bash -lc \
+  'bash /mnt/d/Projects/logic-bs-roformer-rs/scripts/ci.sh'
+```
+
+`.github/workflows/ci.yml` 提供等价的 self-hosted workflow（标签
+`self-hosted, cuda`；runner 需预置 CUDA 13.x、nightly-2026-08-28 与
+assets/ 模型权重）。fresh checkout 缺的 `cuda-oxide-codegen/src/target/`
+（上游 gitignore 吞掉、不入库）由 `vendor-overlay/` 恢复，ci.sh 与
+workflow 均已内置该步骤。
+
 ## 远程构建与运行（基准环境：Komari 节点 RTX 3080）
 
 ```bash

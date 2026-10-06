@@ -1,0 +1,36 @@
+name: build-and-test
+
+# 自托管 runner（需要 GPU + CUDA 13.x toolkit + rustup nightly-2026-08-28，
+# 并预置 assets/：model.safetensors + logic_bs_roformer.yaml + ref_output.npz，
+# 因为 assets 不入 git）。标签: self-hosted + cuda。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: [self-hosted, cuda]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Vendor overlay (cuda-oxide-codegen src/target)
+        run: |
+          mkdir -p vendor/cuda-rust/cuda-oxide/crates/cuda-oxide-codegen/src
+          cp -r vendor-overlay/cuda-oxide-codegen/src/target \
+                vendor/cuda-rust/cuda-oxide/crates/cuda-oxide-codegen/src/
+
+      - name: Build (cargo oxide, release)
+        run: cargo oxide build -- --release
+
+      - name: GPU self-test
+        run: "${CARGO_TARGET_DIR:-target}/release/lbrr" --self-test
+
+      - name: Golden SNR gate (>=60dB)
+        if: hashFiles('assets/model.safetensors') != ''
+        run: |
+          "${CARGO_TARGET_DIR:-target}/release/lbrr" --bench --iters 1 --model-dir assets | tee bench.log
+          snr=$(grep -oP 'BENCH final SNR vs ref_output: \K[0-9.]+' bench.log)
+          test -n "$snr" && awk -v s="$snr" 'BEGIN { if (s+0 < 60) { printf "FAIL: SNR %s < 60\n", s; exit 1 } }'

@@ -1,6 +1,6 @@
 # BS-RoFormer Rust/cuda-oxide 优化报告
 
-日期：2026-10-05 · 节点：<REMOTE_NODE_NAME>RTX 3080 20GB（sm_86）· CUDA 13.3 · nightly-2026-08-28
+日期：2026-10-05 · 节点：<REMOTE_NODE_NAME>（RTX 3080 20GB，sm_86）· CUDA 13.3 · nightly-2026-08-28
 
 ## 一、结果总览
 

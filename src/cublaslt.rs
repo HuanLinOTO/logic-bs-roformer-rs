@@ -30,7 +30,6 @@ const ATTR_TRANSA: u32 = 3;
 const ATTR_TRANSB: u32 = 4;
 const ATTR_EPILOGUE: u32 = 7;
 const ATTR_BIAS_POINTER: u32 = 8;
-const ATTR_BIAS_DATA_TYPE: u32 = 26;
 const EPI_BIAS: c_int = 4;
 const EPI_GELU_BIAS: c_int = 36;
 const PREF_MAX_WORKSPACE_BYTES: u32 = 1;
