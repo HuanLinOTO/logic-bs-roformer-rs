@@ -1,8 +1,8 @@
 name: build-and-test
 
-# 自托管 runner（需要 GPU + CUDA 13.x toolkit + rustup nightly-2026-08-28，
-# 并预置 assets/：model.safetensors + logic_bs_roformer.yaml + ref_output.npz，
-# 因为 assets 不入 git）。标签: self-hosted + cuda。
+# 自托管 runner（labels: self-hosted, cuda）：需要 CUDA 13.x toolkit +
+# rustup nightly-2026-08-28 + g++（llvm-14 libclang）。模型权重不入 git，
+# 可预置到 runner 的 /opt/lbrr-assets/，有则 SNR 门槛生效，无则跳过。
 on:
   push:
   pull_request:
@@ -11,6 +11,9 @@ on:
 jobs:
   build-and-test:
     runs-on: [self-hosted, cuda]
+    env:
+      CUDA_HOME: /usr/local/cuda-13.3
+      LIBCLANG_PATH: /usr/lib/llvm-14/lib
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,15 +25,27 @@ jobs:
           cp -r vendor-overlay/cuda-oxide-codegen/src/target \
                 vendor/cuda-rust/cuda-oxide/crates/cuda-oxide-codegen/src/
 
+      - name: Seed assets (optional, enables SNR gate)
+        run: |
+          if [ -d /opt/lbrr-assets ]; then
+            mkdir -p assets
+            cp -rn /opt/lbrr-assets/. assets/
+            echo "seeded: $(ls assets | tr '\n' ' ')"
+          else
+            echo "no /opt/lbrr-assets, SNR gate will be skipped"
+          fi
+
       - name: Build (cargo oxide, release)
-        run: cargo oxide build -- --release
+        run: |
+          export PATH="/root/.cargo/bin:${CUDA_HOME}/bin:${PATH}"
+          cargo oxide build -- --release
 
       - name: GPU self-test
-        run: "${CARGO_TARGET_DIR:-target}/release/lbrr" --self-test
+        run: ./target/release/lbrr --self-test
 
       - name: Golden SNR gate (>=60dB)
         if: hashFiles('assets/model.safetensors') != ''
         run: |
-          "${CARGO_TARGET_DIR:-target}/release/lbrr" --bench --iters 1 --model-dir assets | tee bench.log
+          ./target/release/lbrr --bench --iters 1 --model-dir assets | tee bench.log
           snr=$(grep -oP 'BENCH final SNR vs ref_output: \K[0-9.]+' bench.log)
-          test -n "$snr" && awk -v s="$snr" 'BEGIN { if (s+0 < 60) { printf "FAIL: SNR %s < 60\n", s; exit 1 } }'
+          test -n "$snr" && awk -v s="$snr" 'BEGIN { if (s+0 < 60) { printf "FAIL: SNR %s < 60\n", s; exit 1 } else printf "PASS: SNR %s >= 60\n", s }'
