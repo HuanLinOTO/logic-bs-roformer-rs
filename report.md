@@ -165,7 +165,7 @@ resid 38.9T）；FF1 受 erf/tanh 数值口径约束保留手写。
 
 - 代码：`src/main.rs`（全部 CUDA 内核 + host 编排）+ `src/cublaslt.rs`（cuBLASLt dlopen
   绑定）+ `src/cudnn.rs`（cudnn fused SDPA dlopen 绑定）+ `tools/cudnn_sdpa_wrap.cpp`
-  （cudnn-frontend extern-C wrapper .so），main 分支（cudnn 集成至 `12a3f0b`；
+  （cudnn-frontend extern-C wrapper .so），main 分支（cudnn 集成至 `5b2f339`；
   LBRR_NO_LT / LBRR_NO_CUDNN=1 可分级回退手写路径）
 - 文档：`README.md`、`docs/BENCHMARK.md`（45 轮完整实验日志）
 - 工具：`tools/bench_ref.py`（PyTorch 基线）、`lbrr --bench/--separate/--forward-only`、
