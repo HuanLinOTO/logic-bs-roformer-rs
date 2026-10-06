@@ -14,17 +14,44 @@
 #include <cudnn_frontend.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
-#include <dlfcn.h>
 #include <memory>
 #include <unordered_map>
+
+#ifdef _WIN32
+// Windows port: LoadLibrary/GetProcAddress replace dlopen/dlsym. The
+// frontend resolves every cudnn symbol through cudnn_dlhandle, so there is
+// no RTLD_GLOBAL equivalent to provide — loading each DLL once is enough.
+#include <windows.h>
+static void* my_dlopen(const char* path) { return (void*)LoadLibraryA(path); }
+static void* my_dlsym(void* h, const char* name) { return (void*)GetProcAddress((HMODULE)h, name); }
+static const char* my_dlerror() {
+    static thread_local char buf[64];
+    snprintf(buf, sizeof buf, "GetLastError=%lu", (unsigned long)GetLastError());
+    return buf;
+}
+static void my_setenv_default(const char* n, const char* v) {
+    if (!getenv(n)) _putenv_s(n, v);
+}
+#else
+#include <dlfcn.h>
+static void* my_dlopen(const char* path) { return dlopen(path, RTLD_GLOBAL | RTLD_NOW); }
+static void* my_dlsym(void* h, const char* name) { return dlsym(h, name); }
+static const char* my_dlerror() { return dlerror(); }
+static void my_setenv_default(const char* n, const char* v) { setenv(n, v, 0); }
+#endif
 
 namespace fe = cudnn_frontend;
 
 // The frontend resolves every cudnn symbol through this handle when built
 // with NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING; we own the definition.
 namespace cudnn_frontend {
+#ifdef _WIN32
+HMODULE cudnn_dlhandle = nullptr;
+#else
 void* cudnn_dlhandle = nullptr;
+#endif
 }
 
 static cudnnStatus_t (*p_cudnnCreate)(cudnnHandle_t*);
@@ -40,41 +67,66 @@ struct WrapGraph {
 
 static thread_local char g_err[512] = {0};
 
+// .so exports every global symbol; a Windows DLL exports nothing unless
+// asked, so mark the extern "C" surface explicitly.
+#ifdef _WIN32
+#define WRAP_API __declspec(dllexport)
+#else
+#define WRAP_API __attribute__((visibility("default")))
+#endif
+
 extern "C" {
 
 // Load the cudnn library family from a directory into the frontend's global
 // dlhandle, then resolve the few symbols this wrapper needs directly.
-int wrap_init(const char* cudnn_lib_dir) {
+WRAP_API int wrap_init(const char* cudnn_lib_dir) {
+#ifdef _WIN32
+    // cuDNN 9 Windows wheel: one DLL per Linux sub-library, *_64_9.dll
+    // naming, plus two extras (ext, engines_tensor_ir) the Linux build
+    // ships inside libcudnn.so.9 itself.
+    static const char* children[] = {"cudnn_ops64_9.dll", "cudnn_cnn64_9.dll",
+        "cudnn_adv64_9.dll", "cudnn_graph64_9.dll", "cudnn_heuristic64_9.dll",
+        "cudnn_engines_precompiled64_9.dll", "cudnn_engines_runtime_compiled64_9.dll",
+        "cudnn_ext64_9.dll", "cudnn_engines_tensor_ir64_9.dll"};
+    static const char* main_lib = "cudnn64_9.dll";
+    static const char* cudart_lib = "cudart64_13.dll";
+#else
     static const char* children[] = {"libcudnn_ops.so.9", "libcudnn_cnn.so.9",
         "libcudnn_adv.so.9", "libcudnn_graph.so.9", "libcudnn_heuristic.so.9",
         "libcudnn_engines_precompiled.so.9", "libcudnn_engines_runtime_compiled.so.9"};
+    static const char* main_lib = "libcudnn.so.9";
+    static const char* cudart_lib = "libcudart.so.13";
+#endif
     char path[512];
     for (auto* c : children) {
         snprintf(path, sizeof path, "%s/%s", cudnn_lib_dir, c);
-        if (!dlopen(path, RTLD_GLOBAL | RTLD_NOW)) {
-            snprintf(g_err, sizeof g_err, "dlopen %s: %s", path, dlerror());
+        if (!my_dlopen(path)) {
+            snprintf(g_err, sizeof g_err, "dlopen %s: %s", path, my_dlerror());
             return -10;
         }
     }
-    snprintf(path, sizeof path, "%s/libcudnn.so.9", cudnn_lib_dir);
-    void* h = dlopen(path, RTLD_GLOBAL | RTLD_NOW);
-    if (!h) { snprintf(g_err, sizeof g_err, "dlopen %s: %s", path, dlerror()); return -11; }
+    snprintf(path, sizeof path, "%s/%s", cudnn_lib_dir, main_lib);
+    void* h = my_dlopen(path);
+    if (!h) { snprintf(g_err, sizeof g_err, "dlopen %s: %s", path, my_dlerror()); return -11; }
+#ifdef _WIN32
+    cudnn_frontend::cudnn_dlhandle = (HMODULE)h;
+#else
     cudnn_frontend::cudnn_dlhandle = h;
-    p_cudnnCreate = (cudnnStatus_t(*)(cudnnHandle_t*))dlsym(h, "cudnnCreate");
-    p_cudnnSetStream = (cudnnStatus_t(*)(cudnnHandle_t, cudaStream_t))dlsym(h, "cudnnSetStream");
-    p_cudnnDestroy = (cudnnStatus_t(*)(cudnnHandle_t))dlsym(h, "cudnnDestroy");
-    p_cudnnGetVersion = (size_t(*)())dlsym(h, "cudnnGetVersion");
+#endif
+    p_cudnnCreate = (cudnnStatus_t(*)(cudnnHandle_t*))my_dlsym(h, "cudnnCreate");
+    p_cudnnSetStream = (cudnnStatus_t(*)(cudnnHandle_t, cudaStream_t))my_dlsym(h, "cudnnSetStream");
+    p_cudnnDestroy = (cudnnStatus_t(*)(cudnnHandle_t))my_dlsym(h, "cudnnDestroy");
+    p_cudnnGetVersion = (size_t(*)())my_dlsym(h, "cudnnGetVersion");
     if (!p_cudnnCreate || !p_cudnnSetStream || !p_cudnnDestroy || !p_cudnnGetVersion) {
         snprintf(g_err, sizeof g_err, "dlsym cudnn core symbols failed");
         return -12;
     }
     // Help the frontend's own shim find a cudart it is happy with.
-    if (!getenv("CUDNN_FRONTEND_CUDART_LIB_NAME"))
-        setenv("CUDNN_FRONTEND_CUDART_LIB_NAME", "libcudart.so.13", 0);
+    my_setenv_default("CUDNN_FRONTEND_CUDART_LIB_NAME", cudart_lib);
     return 0;
 }
 
-int wrap_create(void** out) {
+WRAP_API int wrap_create(void** out) {
     cudnnHandle_t h = nullptr;
     cudnnStatus_t st = p_cudnnCreate(&h);
     if (st != CUDNN_STATUS_SUCCESS) {
@@ -85,18 +137,18 @@ int wrap_create(void** out) {
     return 0;
 }
 
-int wrap_set_stream(void* h, void* stream) {
+WRAP_API int wrap_set_stream(void* h, void* stream) {
     return (int)p_cudnnSetStream((cudnnHandle_t)h, (cudaStream_t)stream);
 }
 
-int wrap_destroy(void* h) { return (int)p_cudnnDestroy((cudnnHandle_t)h); }
+WRAP_API int wrap_destroy(void* h) { return (int)p_cudnnDestroy((cudnnHandle_t)h); }
 
-int wrap_version(void) { return (int)p_cudnnGetVersion(); }
+WRAP_API int wrap_version(void) { return (int)p_cudnnGetVersion(); }
 
-const char* wrap_last_error(void) { return g_err; }
+WRAP_API const char* wrap_last_error(void) { return g_err; }
 
 // All strides are in fp16 elements, arrays of 4 = (b, h, s, d).
-int wrap_sdpa_build(void* h,
+WRAP_API int wrap_sdpa_build(void* h,
                     int64_t b, int64_t heads, int64_t s, int64_t d,
                     const int64_t* q_str, const int64_t* k_str,
                     const int64_t* v_str, const int64_t* o_str,
@@ -151,7 +203,7 @@ int wrap_sdpa_build(void* h,
     }
 }
 
-int wrap_sdpa_exec(void* graph, void* q, void* k, void* v, void* o, void* ws) {
+WRAP_API int wrap_sdpa_exec(void* graph, void* q, void* k, void* v, void* o, void* ws) {
     try {
         auto* wg = (WrapGraph*)graph;
         std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> pack = {
@@ -169,6 +221,6 @@ int wrap_sdpa_exec(void* graph, void* q, void* k, void* v, void* o, void* ws) {
     }
 }
 
-void wrap_sdpa_free(void* graph) { delete (WrapGraph*)graph; }
+WRAP_API void wrap_sdpa_free(void* graph) { delete (WrapGraph*)graph; }
 
 } // extern "C"

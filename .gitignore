@@ -19,3 +19,10 @@
 
 # Codegraph 索引库（本地工具产物，不入库）
 .codegraph/
+
+cudnn_sdpa_wrap.obj
+*.linked.ll
+
+target-win/
+lbrr.ll
+

@@ -52,8 +52,6 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:${CUDA_HOME}/bin:${PATH}"
           export LIBCLANG_PATH=/usr/lib/llvm-18/lib
-          rustup toolchain install nightly-2026-08-28 --profile minimal \
-            --component rust-src --component rustc-dev --component llvm-tools
           cargo oxide build -- --release
 
       - name: Upload lbrr binary
@@ -77,3 +75,62 @@ jobs:
             snr=$(grep -oP 'BENCH final SNR vs ref_output: \K[0-9.]+' bench.log)
             test -n "$snr" && awk -v s="$snr" 'BEGIN { if (s+0 < 60) { printf "FAIL: SNR %s < 60\n", s; exit 1 } else printf "PASS: SNR %s >= 60\n", s }'
           fi
+  build-windows:
+    name: windows-latest MSVC no-GPU canary
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install CUDA toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.2.0"
+          method: local
+
+      - name: Configure Windows CUDA and libclang paths
+        shell: pwsh
+        run: |
+          $cudaPath = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDA_HOME=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDA_TOOLKIT_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LIB=$cudaPath\lib\x64;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INCLUDE=$cudaPath\include;$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          if (Test-Path "$cudaPath\bin\x64") {
+            "$cudaPath\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          if (Test-Path $llvmBin) {
+            "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
+            $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+
+      - name: Install libffi (cuda-bindings link)
+        shell: pwsh
+        run: vendor/cuda-rust/.github/scripts/install-libffi.ps1
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+
+      - name: Build (cargo oxide, release)
+        shell: pwsh
+        run: |
+          rustup show active-toolchain
+          cargo oxide build -- --release
+
+      - name: Upload lbrr binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: lbrr-win-x64
+          path: target/release/lbrr.exe
+          if-no-files-found: error
+          retention-days: 14

@@ -27,18 +27,32 @@ unsafe impl Sync for Cublas {}
 impl Cublas {
     pub fn load() -> Result<Cublas, String> {
         let mut candidates: Vec<String> = Vec::new();
-        for var in ["CUDA_HOME", "CUDA_PATH", "CUDA_TOOLKIT_PATH"] {
-            if let Ok(p) = std::env::var(var) {
-                for sub in ["lib64", "lib"] {
-                    for name in ["libcublas.so", "libcublas.so.12", "libcublas.so.11"] {
-                        candidates.push(format!("{p}/{sub}/{name}"));
+        if cfg!(windows) {
+            for var in ["CUDA_HOME", "CUDA_PATH", "CUDA_TOOLKIT_PATH"] {
+                if let Ok(p) = std::env::var(var) {
+                    for sub in ["bin/x64", "bin"] {
+                        for name in ["cublas64_13.dll", "cublas64_12.dll"] {
+                            candidates.push(format!("{p}/{sub}/{name}"));
+                        }
                     }
                 }
             }
+            candidates.push("cublas64_13.dll".into());
+            candidates.push("cublas64_12.dll".into());
+        } else {
+            for var in ["CUDA_HOME", "CUDA_PATH", "CUDA_TOOLKIT_PATH"] {
+                if let Ok(p) = std::env::var(var) {
+                    for sub in ["lib64", "lib"] {
+                        for name in ["libcublas.so", "libcublas.so.12", "libcublas.so.11"] {
+                            candidates.push(format!("{p}/{sub}/{name}"));
+                        }
+                    }
+                }
+            }
+            candidates.push("libcublas.so.12".into());
+            candidates.push("libcublas.so.11".into());
+            candidates.push("libcublas.so".into());
         }
-        candidates.push("libcublas.so.12".into());
-        candidates.push("libcublas.so.11".into());
-        candidates.push("libcublas.so".into());
 
         let mut last = String::new();
         for cand in &candidates {

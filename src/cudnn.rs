@@ -46,19 +46,66 @@ fn cstr_to_string(p: *const c_char) -> String {
 impl CudnnSdpa {
     pub fn load(ctx: &CudaContext) -> Result<CudnnSdpa, String> {
         let cudnn_dir = std::env::var("LBRR_CUDNN_DIR").unwrap_or_else(|_| {
-            "/data/dsh/lbrr-venv/lib/python3.12/site-packages/nvidia/cudnn/lib".into()
+            if cfg!(windows) {
+                "D:/Projects/lbrr-win-libs/cudnn/bin".into()
+            } else {
+                "/data/dsh/lbrr-venv/lib/python3.12/site-packages/nvidia/cudnn/lib".into()
+            }
         });
         let nvrtc_dir = std::env::var("LBRR_NVRTC_DIR").unwrap_or_else(|_| {
-            "/data/dsh/lbrr-venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib".into()
+            if cfg!(windows) {
+                // CUDA 13.4 ships nvrtc64_130_0.dll + builtins in bin/x64.
+                std::env::var("CUDA_HOME")
+                    .map(|h| format!("{h}/bin/x64"))
+                    .unwrap_or_default()
+            } else {
+                "/data/dsh/lbrr-venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib".into()
+            }
         });
-        let wrap_env = std::env::var("LBRR_SDPA_WRAP").unwrap_or_else(|_| "/data/dsh/libcudnn_sdpa_wrap.so".into());
-        let wrap = first_existing(&[wrap_env.clone(), "libcudnn_sdpa_wrap.so".into()])
+        let wrap_env = if cfg!(windows) {
+            std::env::var("LBRR_SDPA_WRAP")
+                .unwrap_or_else(|_| "D:/Projects/lbrr-win-libs/cudnn_sdpa_wrap.dll".into())
+        } else {
+            std::env::var("LBRR_SDPA_WRAP")
+                .unwrap_or_else(|_| "/data/dsh/libcudnn_sdpa_wrap.so".into())
+        };
+        let wrap_fallback = if cfg!(windows) { "cudnn_sdpa_wrap.dll" } else { "libcudnn_sdpa_wrap.so" };
+        let wrap = first_existing(&[wrap_env.clone(), wrap_fallback.into()])
             .ok_or_else(|| format!("sdpa wrapper not found: {}", wrap_env))?;
+        if cfg!(windows) {
+            // LoadLibrary 解析依赖 DLL 时只搜应用目录/System32/PATH，不含
+            // 目标 DLL 所在目录（Linux 由 RPATH+RTLD_GLOBAL 处理）。把 cudnn
+            // bin 目录注入进程 PATH，子库（ops→graph 等）才能互相解析。
+            let cur = std::env::var("PATH").unwrap_or_default();
+            let mut extra: Vec<&str> = Vec::new();
+            if !cur.split(';').any(|p| p.trim_end_matches('\\').eq_ignore_ascii_case(&cudnn_dir)) {
+                extra.push(&cudnn_dir);
+            }
+            // cudart/nvrtc 裸名解析也需要 toolkit bin/x64 在 PATH 上。
+            if !nvrtc_dir.is_empty()
+                && !cur.split(';').any(|p| p.trim_end_matches('\\').eq_ignore_ascii_case(&nvrtc_dir))
+            {
+                extra.push(&nvrtc_dir);
+            }
+            if !extra.is_empty() {
+                let mut full = extra.join(";");
+                full.push(';');
+                full.push_str(&cur);
+                // SAFETY: 单线程初始化路径（首次 CudnnSdpa::load），无并发读者。
+                unsafe { std::env::set_var("PATH", full) };
+            }
+        }
         // The sm86 sdpa engine runtime-compiles kernels via libnvrtc.so.12;
         // pre-register it (plus its builtins dependency) under absolute paths
         // so cudnn internal dlopen("libnvrtc.so.12") hits a loaded SONAME.
+        let nvrtc_names: &[&str] = if cfg!(windows) {
+            &["nvrtc-builtins64_134.dll", "nvrtc64_130_0.dll"]
+        } else {
+            &["libnvrtc-builtins.so.12", "libnvrtc.so.12"]
+        };
         let mut nvrtc_libs = Vec::new();
-        for cand in [format!("{}/libnvrtc-builtins.so.12", nvrtc_dir), format!("{}/libnvrtc.so.12", nvrtc_dir)] {
+        for name in nvrtc_names {
+            let cand = format!("{nvrtc_dir}/{name}");
             if std::path::Path::new(&cand).exists() {
                 match unsafe { Library::new(&cand) } {
                     Ok(l) => nvrtc_libs.push(l),

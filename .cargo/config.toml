@@ -1,4 +1,9 @@
 # 项目内 cargo 别名：通过 vendor 源码驱动 cargo-oxide，
 # 与 cuda-oxide 仓库内的官方 alias 等价，独立项目无需全局安装。
+# cuda-oxide 设备编译在 stable 上需要 -Z 选项（fork 的 cuda-oxide workspace 内部
+# 同款配置，见 vendor/cuda-rust/cuda-oxide/.cargo/config.toml；对 nightly 无害）。
+[env]
+RUSTC_BOOTSTRAP = "1"
+
 [alias]
 oxide = "run --package cargo-oxide --manifest-path vendor/cuda-rust/cuda-oxide/Cargo.toml --"

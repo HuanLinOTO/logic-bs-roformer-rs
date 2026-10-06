@@ -132,13 +132,29 @@ impl CublasLt {
     #[allow(clippy::too_many_arguments)]
     pub fn load(ctx: &CudaContext, ws: u64, ws_size: usize, dummy: u64, dummy_size: usize) -> Result<CublasLt, String> {
         let mut candidates: Vec<String> = Vec::new();
-        for var in ["CUDA_HOME", "CUDA_PATH", "CUDA_TOOLKIT_PATH"] {
-            if let Ok(p) = std::env::var(var) {
-                candidates.push(format!("{p}/lib64/libcublasLt.so"));
-                candidates.push(format!("{p}/lib/libcublasLt.so"));
+        if cfg!(windows) {
+            // CUDA 12.x/13.x on Windows: DLLs live in bin\x64 (13.x) or bin
+            // (12.x); names carry the CUDA major version.
+            for var in ["CUDA_HOME", "CUDA_PATH", "CUDA_TOOLKIT_PATH"] {
+                if let Ok(p) = std::env::var(var) {
+                    for sub in ["bin/x64", "bin"] {
+                        for name in ["cublasLt64_13.dll", "cublasLt64_12.dll"] {
+                            candidates.push(format!("{p}/{sub}/{name}"));
+                        }
+                    }
+                }
             }
+            candidates.push("cublasLt64_13.dll".into());
+            candidates.push("cublasLt64_12.dll".into());
+        } else {
+            for var in ["CUDA_HOME", "CUDA_PATH", "CUDA_TOOLKIT_PATH"] {
+                if let Ok(p) = std::env::var(var) {
+                    candidates.push(format!("{p}/lib64/libcublasLt.so"));
+                    candidates.push(format!("{p}/lib/libcublasLt.so"));
+                }
+            }
+            candidates.push("libcublasLt.so".into());
         }
-        candidates.push("libcublasLt.so".into());
         let mut last = String::new();
         let lib = loop {
             if candidates.is_empty() {
@@ -159,7 +175,8 @@ impl CublasLt {
             let mut handle: *mut c_void = std::ptr::null_mut();
             chk(create(&mut handle), "create")?;
             // cuCtxSynchronize for autotune timing (optional).
-            let (cuda_lib, sync_ctx) = match unsafe { Library::new("libcuda.so.1") } {
+            let driver_name = if cfg!(windows) { "nvcuda.dll" } else { "libcuda.so.1" };
+            let (cuda_lib, sync_ctx) = match unsafe { Library::new(driver_name) } {
                 Ok(l) => {
                     let f: Symbol<unsafe extern "C" fn() -> c_int> = match l.get(b"cuCtxSynchronize") {
                         Ok(f) => f,

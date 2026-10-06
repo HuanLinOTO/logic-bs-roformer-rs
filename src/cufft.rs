@@ -55,21 +55,38 @@ impl Cufft {
                 try_paths.push(std::path::PathBuf::from(p));
             }
         }
-        try_paths.push(std::path::PathBuf::from("/usr/local/cuda"));
+        if !cfg!(windows) {
+            try_paths.push(std::path::PathBuf::from("/usr/local/cuda"));
+        }
+        // Note: cufft's DLL suffix tracks its own major version, not the
+        // toolkit's (CUDA 12.x -> cufft64_11.dll, 13.x -> cufft64_12.dll).
         for p in &try_paths {
-            for sub in ["lib64", "lib"] {
-                // toolkit installs may ship only the versioned runtime (no
-                // dev symlink), so probe versioned names in the explicit
-                // directories too.
-                for name in ["libcufft.so", "libcufft.so.12", "libcufft.so.11", "libcufft.so.10"] {
-                    candidates.push(format!("{}/{}/{name}", p.display(), sub));
+            if cfg!(windows) {
+                for sub in ["bin/x64", "bin"] {
+                    for name in ["cufft64_12.dll", "cufft64_11.dll"] {
+                        candidates.push(format!("{}/{}/{name}", p.display(), sub));
+                    }
+                }
+            } else {
+                for sub in ["lib64", "lib"] {
+                    // toolkit installs may ship only the versioned runtime (no
+                    // dev symlink), so probe versioned names in the explicit
+                    // directories too.
+                    for name in ["libcufft.so", "libcufft.so.12", "libcufft.so.11", "libcufft.so.10"] {
+                        candidates.push(format!("{}/{}/{name}", p.display(), sub));
+                    }
                 }
             }
         }
-        candidates.push("libcufft.so.12".into());
-        candidates.push("libcufft.so.11".into());
-        candidates.push("libcufft.so.10".into());
-        candidates.push("libcufft.so".into());
+        if cfg!(windows) {
+            candidates.push("cufft64_12.dll".into());
+            candidates.push("cufft64_11.dll".into());
+        } else {
+            candidates.push("libcufft.so.12".into());
+            candidates.push("libcufft.so.11".into());
+            candidates.push("libcufft.so.10".into());
+            candidates.push("libcufft.so".into());
+        }
 
         let mut last = String::new();
         for cand in &candidates {

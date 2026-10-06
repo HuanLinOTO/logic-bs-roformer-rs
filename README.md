@@ -45,12 +45,30 @@ BS-RoFormer 六 stem 音源分离模型的纯 Rust + cuda-oxide 推理实现，
 - **rmsnorm_gates**：RMSNorm 与 8 头门控投影融合（lane-major 合并访问）。
 - **mask_gemm1/2 + glu_scatter**：逐 stem 分组 MaskEstimator。
 
-## 本机（Windows + WSL）构建
+## 本机构建
 
-Windows 原生 MSVC 无法编译：cuda-rust 的 rustc_codegen_cuda 后端 DLL 需要
-导出 ~10 万个符号（上游 Windows 适配的转发 thunk），超过 PE 导出表 65535
-硬上限（link.exe LNK1189 / lld-link 同报 too many exported symbols），
-已双链接器实测证伪。本机编译走 WSL：
+**Windows 原生（当前主路径，2026-10-07 起）**：vendor/cuda-rust 已切至
+[ansidium/cuda-rust-windows](https://github.com/ansidium/cuda-rust-windows)
+fork（基线上同源 +101 Windows 移植 commits），工具链 stable 1.99。
+历史上的 LNK1189（>65535 导出）只挡"在 Windows 上构建上游 backend"，
+fork 的 release 后端无此问题；运行时链路（dlopen + 驱动 JIT）平台中立。
+
+```powershell
+# 一次性布置运行库（cuDNN 9 DLL + cudnn-frontend 头 + 编出的 shim）
+#   详见 scripts/build_win.ps1 内的提示文本；本机布局固定在
+#   D:\Projects\lbrr-win-libs（cudnn\bin、cfe\、cudnn_sdpa_wrap.dll）
+
+# 构建（编译 shim DLL + cargo oxide build --release）
+powershell scripts\build_win.ps1
+
+# 运行（自动注入 CUDA_HOME 等环境）
+powershell scripts\lbrr.ps1 --separate --input song.wav --outdir out
+```
+
+本机实测（4060 Ti / CUDA 13.4 / stable 1.99）：整曲 cyberangel.wav 180.5s
+GPU wall **4.64s**（RTF 0.0257），golden SNR **80.96 dB**，8s 短输入无静音尾。
+
+**WSL 构建（备用的 Linux 路径）**：
 
 ```bash
 # 一次性环境：WSL Ubuntu-22.04 + rustup nightly-2026-08-28 +

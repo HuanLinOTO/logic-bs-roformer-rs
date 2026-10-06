@@ -1,3 +1,4 @@
 [submodule "vendor/cuda-rust"]
 	path = vendor/cuda-rust
-	url = https://github.com/NVIDIA/cuda-rust
+	url = https://github.com/ansidium/cuda-rust-windows
+	branch = main
