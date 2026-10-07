@@ -1,0 +1,1979 @@
+{
+  "schema_version": 1,
+  "protocol": {
+    "rounds": 5,
+    "warmup": 5,
+    "iters": 20,
+    "pipeline": "waveform",
+    "timing": "CUDA Events with resident GPU input/output",
+    "nominal_peak_tflops": 59.53536
+  },
+  "summary": {
+    "full": {
+      "b0_median_ms": 158.97293090820312,
+      "candidate_median_ms": 685.9616394042969,
+      "b0_cv": 0.005549236041533315,
+      "candidate_cv": 0.0026597577169282906,
+      "stable": true,
+      "relative_improvement": -3.314958751061818
+    },
+    "short": {
+      "b0_median_ms": 34.1657600402832,
+      "candidate_median_ms": 122.97020721435547,
+      "b0_cv": 0.0001779468232040423,
+      "candidate_cv": 0.002352105320928688,
+      "stable": true,
+      "relative_improvement": -2.5992235228886234
+    }
+  },
+  "runs": [
+    {
+      "case": "full",
+      "round": 0,
+      "label": "B0",
+      "event_ms": 157.2095947265625,
+      "host_ms": 157.19536985,
+      "process_ms": 10360.03515694756,
+      "report": "full-0-B0.json"
+    },
+    {
+      "case": "full",
+      "round": 0,
+      "label": "pytorch",
+      "event_ms": 683.5123291015625,
+      "host_ms": 682.9893984948285,
+      "process_ms": 25171.6305030277,
+      "report": "full-0-pytorch.json"
+    },
+    {
+      "case": "full",
+      "round": 1,
+      "label": "pytorch",
+      "event_ms": 684.5433349609375,
+      "host_ms": 684.8123783012852,
+      "process_ms": 24228.658088017255,
+      "report": "full-1-pytorch.json"
+    },
+    {
+      "case": "full",
+      "round": 1,
+      "label": "B0",
+      "event_ms": 158.97293090820312,
+      "host_ms": 158.98288215,
+      "process_ms": 9355.234549031593,
+      "report": "full-1-B0.json"
+    },
+    {
+      "case": "full",
+      "round": 2,
+      "label": "B0",
+      "event_ms": 158.78809356689453,
+      "host_ms": 159.005454,
+      "process_ms": 9154.215452028438,
+      "report": "full-2-B0.json"
+    },
+    {
+      "case": "full",
+      "round": 2,
+      "label": "pytorch",
+      "event_ms": 685.9616394042969,
+      "host_ms": 685.9089663950726,
+      "process_ms": 25228.18106703926,
+      "report": "full-2-pytorch.json"
+    },
+    {
+      "case": "full",
+      "round": 3,
+      "label": "pytorch",
+      "event_ms": 687.1592407226562,
+      "host_ms": 687.1587558009196,
+      "process_ms": 24362.77140805032,
+      "report": "full-3-pytorch.json"
+    },
+    {
+      "case": "full",
+      "round": 3,
+      "label": "B0",
+      "event_ms": 159.7486114501953,
+      "host_ms": 160.0769503,
+      "process_ms": 9103.852299042046,
+      "report": "full-3-B0.json"
+    },
+    {
+      "case": "full",
+      "round": 4,
+      "label": "B0",
+      "event_ms": 159.45677185058594,
+      "host_ms": 159.8943044,
+      "process_ms": 9305.388867040165,
+      "report": "full-4-B0.json"
+    },
+    {
+      "case": "full",
+      "round": 4,
+      "label": "pytorch",
+      "event_ms": 688.6447448730469,
+      "host_ms": 688.5168478998821,
+      "process_ms": 24375.078108045273,
+      "report": "full-4-pytorch.json"
+    },
+    {
+      "case": "short",
+      "round": 0,
+      "label": "B0",
+      "event_ms": 34.157569885253906,
+      "host_ms": 34.1484856,
+      "process_ms": 6193.78095807042,
+      "report": "short-0-B0.json"
+    },
+    {
+      "case": "short",
+      "round": 0,
+      "label": "pytorch",
+      "event_ms": 123.29830551147461,
+      "host_ms": 123.31426285090856,
+      "process_ms": 9157.957062940113,
+      "report": "short-0-pytorch.json"
+    },
+    {
+      "case": "short",
+      "round": 1,
+      "label": "pytorch",
+      "event_ms": 123.48774719238281,
+      "host_ms": 123.37910545174964,
+      "process_ms": 9511.800362961367,
+      "report": "short-1-pytorch.json"
+    },
+    {
+      "case": "short",
+      "round": 1,
+      "label": "B0",
+      "event_ms": 34.16524696350098,
+      "host_ms": 34.2071961,
+      "process_ms": 5589.8086910601705,
+      "report": "short-1-B0.json"
+    },
+    {
+      "case": "short",
+      "round": 2,
+      "label": "B0",
+      "event_ms": 34.1657600402832,
+      "host_ms": 34.22729225,
+      "process_ms": 6645.997473970056,
+      "report": "short-2-B0.json"
+    },
+    {
+      "case": "short",
+      "round": 2,
+      "label": "pytorch",
+      "event_ms": 122.78220748901367,
+      "host_ms": 123.01457845023833,
+      "process_ms": 9307.376437005587,
+      "report": "short-2-pytorch.json"
+    },
+    {
+      "case": "short",
+      "round": 3,
+      "label": "pytorch",
+      "event_ms": 122.97020721435547,
+      "host_ms": 122.97568244975992,
+      "process_ms": 8553.362013073638,
+      "report": "short-3-pytorch.json"
+    },
+    {
+      "case": "short",
+      "round": 3,
+      "label": "B0",
+      "event_ms": 34.1713924407959,
+      "host_ms": 34.1901872,
+      "process_ms": 6143.165681976825,
+      "report": "short-3-B0.json"
+    },
+    {
+      "case": "short",
+      "round": 4,
+      "label": "B0",
+      "event_ms": 34.17548751831055,
+      "host_ms": 34.28577355,
+      "process_ms": 6546.575994929299,
+      "report": "short-4-B0.json"
+    },
+    {
+      "case": "short",
+      "round": 4,
+      "label": "pytorch",
+      "event_ms": 122.75353622436523,
+      "host_ms": 122.91232909774408,
+      "process_ms": 11018.7009050278,
+      "report": "short-4-pytorch.json"
+    }
+  ],
+  "manifest": {
+    "schema_version": 1,
+    "sample_rate": 44100,
+    "model_sha256": "2fe1eee94606c220a9113647e486f53fc1561f413f6c4a14f49500c925ed3deb",
+    "config_sha256": "070da10aa5cedefbf7cf1f8c5812c9ab8b43af48aa0f757b23a37c4ed856a383",
+    "reference_root": "/data/dsh/logic-bs-roformer-rs",
+    "precision": "fp32",
+    "tf32": false,
+    "torch": "2.14.1+cu126",
+    "cases": {
+      "short": {
+        "reference": "short/ref_output.npz",
+        "sha256": "b379ab1a60f10a0ced91b9a3cf9cb5aac5f1dc7531ea8bc81fbe3529da1bba57",
+        "samples": 132300,
+        "T": 259,
+        "shape": [
+          1,
+          6,
+          2,
+          132300
+        ],
+        "finite": true
+      },
+      "full": {
+        "reference": "full/ref_output.npz",
+        "sha256": "76633ba967eeb5a9155835105e70aef5245d588ce680ffcb8cdcef2c4bbd3cd1",
+        "samples": 588800,
+        "T": 1151,
+        "shape": [
+          1,
+          6,
+          2,
+          588800
+        ],
+        "finite": true
+      },
+      "middle": {
+        "reference": "middle/ref_output.npz",
+        "sha256": "b6737e72944c646c16459260281f5fd21ea942626e472f37e26a58f3fe659ee1",
+        "samples": 588800,
+        "T": 1151,
+        "shape": [
+          1,
+          6,
+          2,
+          588800
+        ],
+        "finite": true
+      },
+      "end": {
+        "reference": "end/ref_output.npz",
+        "sha256": "4c4d87f603845c07d9ef649e8881d48b9fc113928e1b28989baebb3ca99c174d",
+        "samples": 588800,
+        "T": 1151,
+        "shape": [
+          1,
+          6,
+          2,
+          588800
+        ],
+        "finite": true
+      },
+      "silence": {
+        "reference": "silence/ref_output.npz",
+        "sha256": "04e19e2585cf9d81c4b68e60b08fc863fe14d2370cdacb0b37d771c43eeeb396",
+        "samples": 588800,
+        "T": 1151,
+        "shape": [
+          1,
+          6,
+          2,
+          588800
+        ],
+        "finite": true
+      },
+      "asymmetric": {
+        "reference": "asymmetric/ref_output.npz",
+        "sha256": "44f6bb38e3ecef5527db3b33dec88777051a9ad9cbd7b0c0925aad2bfc1394f2",
+        "samples": 588800,
+        "T": 1151,
+        "shape": [
+          1,
+          6,
+          2,
+          588800
+        ],
+        "finite": true
+      },
+      "impulse-left": {
+        "reference": "impulse-left/ref_output.npz",
+        "sha256": "329e7414dfe295d64bfa233bb3c24a74595a55bf944965c961da34672756f560",
+        "samples": 18944,
+        "T": 38,
+        "shape": [
+          1,
+          6,
+          2,
+          18944
+        ],
+        "finite": true
+      },
+      "impulse-right": {
+        "reference": "impulse-right/ref_output.npz",
+        "sha256": "d54c9b4638d150164ee090a7eeb986294a69d6e301184a571b1e50e4dcacc88c",
+        "samples": 18944,
+        "T": 38,
+        "shape": [
+          1,
+          6,
+          2,
+          18944
+        ],
+        "finite": true
+      }
+    }
+  },
+  "reports": {
+    "short-4-B0.json": {
+      "backend": {
+        "attention_freq": "cudnn",
+        "attention_time": "cudnn",
+        "cublaslt": true,
+        "ff1": "handwritten",
+        "qk_rope": "split"
+      },
+      "correctness": {
+        "finite": true,
+        "overall": {
+          "bit_equal": false,
+          "finite": true,
+          "max_abs_error": 0.0002705346212223958,
+          "reference_rms": 0.09854428983105289,
+          "snr_db": 80.83087260425546
+        },
+        "relative_to_b0": null,
+        "relative_to_b0_reason": "computed by benchmark_matrix compare",
+        "shape": [
+          1,
+          6,
+          2,
+          132300
+        ],
+        "stems": [
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00005759787416081963,
+            "reference_rms": 0.000004766905627999627,
+            "snr_db": 0.1272913408267504
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0002705346212223958,
+            "reference_rms": 0.000015162353669656302,
+            "snr_db": 0.18614502460470572
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00006273388862609863,
+            "reference_rms": 0.24138267335444596,
+            "snr_db": 85.257053588563
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0000569789676774235,
+            "reference_rms": 0.000004376036533017272,
+            "snr_db": 1.2497050170746564
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.000048561406174485455,
+            "reference_rms": 0.000007500521160868392,
+            "snr_db": 1.7628286766203896
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00003101092443102971,
+            "reference_rms": 0.0005167457129730142,
+            "snr_db": 43.00413540960677
+          }
+        ],
+        "tail_covered": true
+      },
+      "identity": {
+        "binary_sha256": "591649c73b18d94b1af206f8a3446a786d789f10b09a1cb383ac3b66885de477",
+        "config_sha256": "070da10aa5cedefbf7cf1f8c5812c9ab8b43af48aa0f757b23a37c4ed856a383",
+        "device": "NVIDIA GeForce RTX 3080",
+        "driver": "595.91.07",
+        "fixture_id": "short",
+        "model_sha256": "2fe1eee94606c220a9113647e486f53fc1561f413f6c4a14f49500c925ed3deb",
+        "reference_sha256": "b379ab1a60f10a0ced91b9a3cf9cb5aac5f1dc7531ea8bc81fbe3529da1bba57",
+        "sm": "8.6",
+        "source_hash_reason": "runner supplies hash of the build snapshot",
+        "source_revision": null,
+        "source_sha256": "8e4797509c13f57b0d95e878a33a6005b60d24c4040723507675ffa3be042c21"
+      },
+      "memory_bytes": {
+        "accounting": "explicit device allocations; driver/library internal memory is recorded by external telemetry",
+        "external_peak": null,
+        "scratch": 1806244520,
+        "tracked_peak": 2934991480,
+        "tracked_resident": 2934991480,
+        "tuning_temporary": 50378752,
+        "weights": 1044813776,
+        "workspace": 33554432
+      },
+      "mfu": {
+        "matrix_flops": 1013639108608,
+        "nominal_mfu": 0.4981884511994842,
+        "nominal_peak_tflops": 59.53536,
+        "reason": null
+      },
+      "ola_vs_host": {
+        "bit_equal": false,
+        "finite": true,
+        "max_abs_error": 1.1920928955078125e-7,
+        "reference_rms": 0.09854545519044143,
+        "snr_db": 143.8129853235729
+      },
+      "pipeline": "waveform",
+      "precision": {
+        "accumulation": "fp32",
+        "input_resident_gpu": true,
+        "matrix_input": "fp16",
+        "output_resident_gpu": true,
+        "residual": "fp32",
+        "tf32": false
+      },
+      "schema_version": 1,
+      "shape": {
+        "T": 259,
+        "bands": 62,
+        "batch": 1,
+        "channels": 2,
+        "sample_rate": 44100,
+        "samples": 132300,
+        "stems": 6
+      },
+      "timing_ms": {
+        "allocation_input_h2d": 5.53593,
+        "context_kernels": 130.549878,
+        "cuda_event": [
+          35.056640625,
+          35.04230499267578,
+          34.36134338378906,
+          34.2845458984375,
+          34.343936920166016,
+          34.21593475341797,
+          34.160640716552734,
+          34.167808532714844,
+          34.15449523925781,
+          34.1638069152832,
+          34.164737701416016,
+          34.1657600402832,
+          34.18009567260742,
+          34.17292785644531,
+          34.162689208984375,
+          34.167808532714844,
+          34.179073333740234,
+          34.18521499633789,
+          34.16883087158203,
+          34.17804718017578
+        ],
+        "download_and_host_ola_check": 16.806829,
+        "fft_plan": 7.363407,
+        "host_per_iteration": 34.28577355,
+        "host_total": 685.715471,
+        "iterations": 20,
+        "prepare_algorithms": 1669.8433129999999,
+        "process_before_hashes": 6272.337107,
+        "rtf": 0.011428591183333335,
+        "warmup": 5,
+        "weights_pack_h2d": 1341.826894,
+        "weights_parse": 587.7562670000001,
+        "weights_read": 284.77298
+      }
+    },
+    "short-0-B0.json": {
+      "backend": {
+        "attention_freq": "cudnn",
+        "attention_time": "cudnn",
+        "cublaslt": true,
+        "ff1": "handwritten",
+        "qk_rope": "split"
+      },
+      "correctness": {
+        "finite": true,
+        "overall": {
+          "bit_equal": false,
+          "finite": true,
+          "max_abs_error": 0.0002705346212223958,
+          "reference_rms": 0.09854428983105289,
+          "snr_db": 80.83087260425546
+        },
+        "relative_to_b0": null,
+        "relative_to_b0_reason": "computed by benchmark_matrix compare",
+        "shape": [
+          1,
+          6,
+          2,
+          132300
+        ],
+        "stems": [
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00005759787416081963,
+            "reference_rms": 0.000004766905627999627,
+            "snr_db": 0.1272913408267504
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0002705346212223958,
+            "reference_rms": 0.000015162353669656302,
+            "snr_db": 0.18614502460470572
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00006273388862609863,
+            "reference_rms": 0.24138267335444596,
+            "snr_db": 85.257053588563
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0000569789676774235,
+            "reference_rms": 0.000004376036533017272,
+            "snr_db": 1.2497050170746564
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.000048561406174485455,
+            "reference_rms": 0.000007500521160868392,
+            "snr_db": 1.7628286766203896
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00003101092443102971,
+            "reference_rms": 0.0005167457129730142,
+            "snr_db": 43.00413540960677
+          }
+        ],
+        "tail_covered": true
+      },
+      "identity": {
+        "binary_sha256": "591649c73b18d94b1af206f8a3446a786d789f10b09a1cb383ac3b66885de477",
+        "config_sha256": "070da10aa5cedefbf7cf1f8c5812c9ab8b43af48aa0f757b23a37c4ed856a383",
+        "device": "NVIDIA GeForce RTX 3080",
+        "driver": "595.91.07",
+        "fixture_id": "short",
+        "model_sha256": "2fe1eee94606c220a9113647e486f53fc1561f413f6c4a14f49500c925ed3deb",
+        "reference_sha256": "b379ab1a60f10a0ced91b9a3cf9cb5aac5f1dc7531ea8bc81fbe3529da1bba57",
+        "sm": "8.6",
+        "source_hash_reason": "runner supplies hash of the build snapshot",
+        "source_revision": null,
+        "source_sha256": "8e4797509c13f57b0d95e878a33a6005b60d24c4040723507675ffa3be042c21"
+      },
+      "memory_bytes": {
+        "accounting": "explicit device allocations; driver/library internal memory is recorded by external telemetry",
+        "external_peak": null,
+        "scratch": 1806244520,
+        "tracked_peak": 2934991480,
+        "tracked_resident": 2934991480,
+        "tuning_temporary": 50378752,
+        "weights": 1044813776,
+        "workspace": 33554432
+      },
+      "mfu": {
+        "matrix_flops": 1013639108608,
+        "nominal_mfu": 0.4984497800320573,
+        "nominal_peak_tflops": 59.53536,
+        "reason": null
+      },
+      "ola_vs_host": {
+        "bit_equal": false,
+        "finite": true,
+        "max_abs_error": 1.1920928955078125e-7,
+        "reference_rms": 0.09854545519044143,
+        "snr_db": 143.8129853235729
+      },
+      "pipeline": "waveform",
+      "precision": {
+        "accumulation": "fp32",
+        "input_resident_gpu": true,
+        "matrix_input": "fp16",
+        "output_resident_gpu": true,
+        "residual": "fp32",
+        "tf32": false
+      },
+      "schema_version": 1,
+      "shape": {
+        "T": 259,
+        "bands": 62,
+        "batch": 1,
+        "channels": 2,
+        "sample_rate": 44100,
+        "samples": 132300,
+        "stems": 6
+      },
+      "timing_ms": {
+        "allocation_input_h2d": 5.666097,
+        "context_kernels": 128.921468,
+        "cuda_event": [
+          33.95891189575195,
+          34.02969741821289,
+          34.1657600402832,
+          34.17599868774414,
+          34.16883087158203,
+          34.171905517578125,
+          34.157569885253906,
+          34.1657600402832,
+          34.177024841308594,
+          34.155521392822266,
+          34.15654373168945,
+          34.157569885253906,
+          34.153472900390625,
+          34.157569885253906,
+          34.17497634887695,
+          34.15654373168945,
+          34.15692901611328,
+          34.177024841308594,
+          34.15145492553711,
+          34.16883087158203
+        ],
+        "download_and_host_ola_check": 17.683718000000002,
+        "fft_plan": 7.372104,
+        "host_per_iteration": 34.1484856,
+        "host_total": 682.969712,
+        "iterations": 20,
+        "prepare_algorithms": 1266.5630290000001,
+        "process_before_hashes": 5927.504093,
+        "rtf": 0.011382828533333333,
+        "warmup": 5,
+        "weights_pack_h2d": 1343.827413,
+        "weights_parse": 592.001917,
+        "weights_read": 349.59554799999995
+      }
+    },
+    "full-3-B0.json": {
+      "backend": {
+        "attention_freq": "cudnn",
+        "attention_time": "cudnn",
+        "cublaslt": true,
+        "ff1": "handwritten",
+        "qk_rope": "split"
+      },
+      "correctness": {
+        "finite": true,
+        "overall": {
+          "bit_equal": false,
+          "finite": true,
+          "max_abs_error": 0.0036187171936035156,
+          "reference_rms": 0.06487502286083931,
+          "snr_db": 59.35299380901563
+        },
+        "relative_to_b0": null,
+        "relative_to_b0_reason": "computed by benchmark_matrix compare",
+        "shape": [
+          1,
+          6,
+          2,
+          588800
+        ],
+        "stems": [
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00013407364713202696,
+            "reference_rms": 0.0000035950089406242448,
+            "snr_db": 0.14823469712170395
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00019068804613198154,
+            "reference_rms": 0.000006357314846211402,
+            "snr_db": 2.8697465768248636
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0036187171936035156,
+            "reference_rms": 0.15440384523167297,
+            "snr_db": 61.534959182401
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0030195899307727814,
+            "reference_rms": 0.03757744055418071,
+            "snr_db": 50.518832788695136
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00003795360589720076,
+            "reference_rms": 0.000002198220257185175,
+            "snr_db": 8.066368610687316
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00007206002192106098,
+            "reference_rms": 0.000005328740813883081,
+            "snr_db": 11.100307622789549
+          }
+        ],
+        "tail_covered": true
+      },
+      "identity": {
+        "binary_sha256": "591649c73b18d94b1af206f8a3446a786d789f10b09a1cb383ac3b66885de477",
+        "config_sha256": "070da10aa5cedefbf7cf1f8c5812c9ab8b43af48aa0f757b23a37c4ed856a383",
+        "device": "NVIDIA GeForce RTX 3080",
+        "driver": "595.91.07",
+        "fixture_id": "full",
+        "model_sha256": "2fe1eee94606c220a9113647e486f53fc1561f413f6c4a14f49500c925ed3deb",
+        "reference_sha256": "76633ba967eeb5a9155835105e70aef5245d588ce680ffcb8cdcef2c4bbd3cd1",
+        "sm": "8.6",
+        "source_hash_reason": "runner supplies hash of the build snapshot",
+        "source_revision": null,
+        "source_sha256": "8e4797509c13f57b0d95e878a33a6005b60d24c4040723507675ffa3be042c21"
+      },
+      "memory_bytes": {
+        "accounting": "explicit device allocations; driver/library internal memory is recorded by external telemetry",
+        "external_peak": null,
+        "scratch": 10063872328,
+        "tracked_peak": 11362513176,
+        "tracked_resident": 11362513176,
+        "tuning_temporary": 220272640,
+        "weights": 1044813776,
+        "workspace": 33554432
+      },
+      "mfu": {
+        "matrix_flops": 6069010774016,
+        "nominal_mfu": 0.6381251073332991,
+        "nominal_peak_tflops": 59.53536,
+        "reason": null
+      },
+      "ola_vs_host": {
+        "bit_equal": false,
+        "finite": true,
+        "max_abs_error": 1.1920928955078125e-7,
+        "reference_rms": 0.06487111683720936,
+        "snr_db": 143.70281650864612
+      },
+      "pipeline": "waveform",
+      "precision": {
+        "accumulation": "fp32",
+        "input_resident_gpu": true,
+        "matrix_input": "fp16",
+        "output_resident_gpu": true,
+        "residual": "fp32",
+        "tf32": false
+      },
+      "schema_version": 1,
+      "shape": {
+        "T": 1151,
+        "bands": 62,
+        "batch": 1,
+        "channels": 2,
+        "sample_rate": 44100,
+        "samples": 588800,
+        "stems": 6
+      },
+      "timing_ms": {
+        "allocation_input_h2d": 16.933052,
+        "context_kernels": 129.68642,
+        "cuda_event": [
+          160.97891235351562,
+          159.4132537841797,
+          159.38458251953125,
+          159.4439697265625,
+          159.494140625,
+          160.6287384033203,
+          161.26156616210938,
+          159.8269500732422,
+          159.425537109375,
+          159.4071044921875,
+          159.6405792236328,
+          160.06655883789062,
+          161.43775939941406,
+          160.41778564453125,
+          159.4439697265625,
+          159.43270874023438,
+          159.67027282714844,
+          159.95904541015625,
+          161.12742614746094,
+          161.07008361816406
+        ],
+        "download_and_host_ola_check": 89.178143,
+        "fft_plan": 3.8589539999999998,
+        "host_per_iteration": 160.0769503,
+        "host_total": 3201.539006,
+        "iterations": 20,
+        "prepare_algorithms": 1167.827741,
+        "process_before_hashes": 8784.698861,
+        "rtf": 0.01198945908327106,
+        "warmup": 5,
+        "weights_pack_h2d": 929.047359,
+        "weights_parse": 589.798685,
+        "weights_read": 350.85525099999995
+      }
+    },
+    "full-4-B0.json": {
+      "backend": {
+        "attention_freq": "cudnn",
+        "attention_time": "cudnn",
+        "cublaslt": true,
+        "ff1": "handwritten",
+        "qk_rope": "split"
+      },
+      "correctness": {
+        "finite": true,
+        "overall": {
+          "bit_equal": false,
+          "finite": true,
+          "max_abs_error": 0.0036187171936035156,
+          "reference_rms": 0.06487502286083931,
+          "snr_db": 59.35299380901563
+        },
+        "relative_to_b0": null,
+        "relative_to_b0_reason": "computed by benchmark_matrix compare",
+        "shape": [
+          1,
+          6,
+          2,
+          588800
+        ],
+        "stems": [
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00013407364713202696,
+            "reference_rms": 0.0000035950089406242448,
+            "snr_db": 0.14823469712170395
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00019068804613198154,
+            "reference_rms": 0.000006357314846211402,
+            "snr_db": 2.8697465768248636
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0036187171936035156,
+            "reference_rms": 0.15440384523167297,
+            "snr_db": 61.534959182401
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0030195899307727814,
+            "reference_rms": 0.03757744055418071,
+            "snr_db": 50.518832788695136
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00003795360589720076,
+            "reference_rms": 0.000002198220257185175,
+            "snr_db": 8.066368610687316
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00007206002192106098,
+            "reference_rms": 0.000005328740813883081,
+            "snr_db": 11.100307622789549
+          }
+        ],
+        "tail_covered": true
+      },
+      "identity": {
+        "binary_sha256": "591649c73b18d94b1af206f8a3446a786d789f10b09a1cb383ac3b66885de477",
+        "config_sha256": "070da10aa5cedefbf7cf1f8c5812c9ab8b43af48aa0f757b23a37c4ed856a383",
+        "device": "NVIDIA GeForce RTX 3080",
+        "driver": "595.91.07",
+        "fixture_id": "full",
+        "model_sha256": "2fe1eee94606c220a9113647e486f53fc1561f413f6c4a14f49500c925ed3deb",
+        "reference_sha256": "76633ba967eeb5a9155835105e70aef5245d588ce680ffcb8cdcef2c4bbd3cd1",
+        "sm": "8.6",
+        "source_hash_reason": "runner supplies hash of the build snapshot",
+        "source_revision": null,
+        "source_sha256": "8e4797509c13f57b0d95e878a33a6005b60d24c4040723507675ffa3be042c21"
+      },
+      "memory_bytes": {
+        "accounting": "explicit device allocations; driver/library internal memory is recorded by external telemetry",
+        "external_peak": null,
+        "scratch": 10063872328,
+        "tracked_peak": 11362513176,
+        "tracked_resident": 11362513176,
+        "tuning_temporary": 220272640,
+        "weights": 1044813776,
+        "workspace": 33554432
+      },
+      "mfu": {
+        "matrix_flops": 6069010774016,
+        "nominal_mfu": 0.6392930111712078,
+        "nominal_peak_tflops": 59.53536,
+        "reason": null
+      },
+      "ola_vs_host": {
+        "bit_equal": false,
+        "finite": true,
+        "max_abs_error": 1.1920928955078125e-7,
+        "reference_rms": 0.06487111683720936,
+        "snr_db": 143.70281650864612
+      },
+      "pipeline": "waveform",
+      "precision": {
+        "accumulation": "fp32",
+        "input_resident_gpu": true,
+        "matrix_input": "fp16",
+        "output_resident_gpu": true,
+        "residual": "fp32",
+        "tf32": false
+      },
+      "schema_version": 1,
+      "shape": {
+        "T": 1151,
+        "bands": 62,
+        "batch": 1,
+        "channels": 2,
+        "sample_rate": 44100,
+        "samples": 588800,
+        "stems": 6
+      },
+      "timing_ms": {
+        "allocation_input_h2d": 17.103269,
+        "context_kernels": 113.68187,
+        "cuda_event": [
+          161.9824676513672,
+          160.13516235351562,
+          158.91046142578125,
+          159.21664428710938,
+          159.13880920410156,
+          159.30572509765625,
+          161.1366424560547,
+          160.8642578125,
+          159.33030700683594,
+          159.1961669921875,
+          159.1910400390625,
+          159.45318603515625,
+          160.42189025878906,
+          160.67379760742188,
+          159.87814331054688,
+          159.46035766601562,
+          159.31698608398438,
+          159.43373107910156,
+          160.02969360351562,
+          160.8038330078125
+        ],
+        "download_and_host_ola_check": 90.045008,
+        "fft_plan": 4.046595,
+        "host_per_iteration": 159.8943044,
+        "host_total": 3197.886088,
+        "iterations": 20,
+        "prepare_algorithms": 1195.986336,
+        "process_before_hashes": 8906.359545000001,
+        "rtf": 0.011975779252785326,
+        "warmup": 5,
+        "weights_pack_h2d": 1165.039921,
+        "weights_parse": 575.596548,
+        "weights_read": 257.211409
+      }
+    },
+    "full-2-B0.json": {
+      "backend": {
+        "attention_freq": "cudnn",
+        "attention_time": "cudnn",
+        "cublaslt": true,
+        "ff1": "handwritten",
+        "qk_rope": "split"
+      },
+      "correctness": {
+        "finite": true,
+        "overall": {
+          "bit_equal": false,
+          "finite": true,
+          "max_abs_error": 0.0036187171936035156,
+          "reference_rms": 0.06487502286083931,
+          "snr_db": 59.35299380901563
+        },
+        "relative_to_b0": null,
+        "relative_to_b0_reason": "computed by benchmark_matrix compare",
+        "shape": [
+          1,
+          6,
+          2,
+          588800
+        ],
+        "stems": [
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00013407364713202696,
+            "reference_rms": 0.0000035950089406242448,
+            "snr_db": 0.14823469712170395
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00019068804613198154,
+            "reference_rms": 0.000006357314846211402,
+            "snr_db": 2.8697465768248636
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0036187171936035156,
+            "reference_rms": 0.15440384523167297,
+            "snr_db": 61.534959182401
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0030195899307727814,
+            "reference_rms": 0.03757744055418071,
+            "snr_db": 50.518832788695136
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00003795360589720076,
+            "reference_rms": 0.000002198220257185175,
+            "snr_db": 8.066368610687316
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00007206002192106098,
+            "reference_rms": 0.000005328740813883081,
+            "snr_db": 11.100307622789549
+          }
+        ],
+        "tail_covered": true
+      },
+      "identity": {
+        "binary_sha256": "591649c73b18d94b1af206f8a3446a786d789f10b09a1cb383ac3b66885de477",
+        "config_sha256": "070da10aa5cedefbf7cf1f8c5812c9ab8b43af48aa0f757b23a37c4ed856a383",
+        "device": "NVIDIA GeForce RTX 3080",
+        "driver": "595.91.07",
+        "fixture_id": "full",
+        "model_sha256": "2fe1eee94606c220a9113647e486f53fc1561f413f6c4a14f49500c925ed3deb",
+        "reference_sha256": "76633ba967eeb5a9155835105e70aef5245d588ce680ffcb8cdcef2c4bbd3cd1",
+        "sm": "8.6",
+        "source_hash_reason": "runner supplies hash of the build snapshot",
+        "source_revision": null,
+        "source_sha256": "8e4797509c13f57b0d95e878a33a6005b60d24c4040723507675ffa3be042c21"
+      },
+      "memory_bytes": {
+        "accounting": "explicit device allocations; driver/library internal memory is recorded by external telemetry",
+        "external_peak": null,
+        "scratch": 10063872328,
+        "tracked_peak": 11362513176,
+        "tracked_resident": 11362513176,
+        "tuning_temporary": 220272640,
+        "weights": 1044813776,
+        "workspace": 33554432
+      },
+      "mfu": {
+        "matrix_flops": 6069010774016,
+        "nominal_mfu": 0.6419851610917923,
+        "nominal_peak_tflops": 59.53536,
+        "reason": null
+      },
+      "ola_vs_host": {
+        "bit_equal": false,
+        "finite": true,
+        "max_abs_error": 1.1920928955078125e-7,
+        "reference_rms": 0.06487111683720936,
+        "snr_db": 143.70281650864612
+      },
+      "pipeline": "waveform",
+      "precision": {
+        "accumulation": "fp32",
+        "input_resident_gpu": true,
+        "matrix_input": "fp16",
+        "output_resident_gpu": true,
+        "residual": "fp32",
+        "tf32": false
+      },
+      "schema_version": 1,
+      "shape": {
+        "T": 1151,
+        "bands": 62,
+        "batch": 1,
+        "channels": 2,
+        "sample_rate": 44100,
+        "samples": 588800,
+        "stems": 6
+      },
+      "timing_ms": {
+        "allocation_input_h2d": 17.051340000000003,
+        "context_kernels": 120.642395,
+        "cuda_event": [
+          159.3159637451172,
+          158.75584411621094,
+          158.31141662597656,
+          158.55410766601562,
+          158.80908203125,
+          160.02560424804688,
+          159.9447021484375,
+          158.4005126953125,
+          158.4496612548828,
+          158.50291442871094,
+          158.72409057617188,
+          159.57093811035156,
+          159.89248657226562,
+          158.81727600097656,
+          158.49778747558594,
+          158.65650939941406,
+          158.76710510253906,
+          159.2647705078125,
+          159.77574157714844,
+          159.0630340576172
+        ],
+        "download_and_host_ola_check": 98.41845,
+        "fft_plan": 4.0128960000000005,
+        "host_per_iteration": 159.005454,
+        "host_total": 3180.1090799999997,
+        "iterations": 20,
+        "prepare_algorithms": 1194.550067,
+        "process_before_hashes": 8846.926836999999,
+        "rtf": 0.011909206048573368,
+        "warmup": 5,
+        "weights_pack_h2d": 1083.02473,
+        "weights_parse": 577.913328,
+        "weights_read": 299.500581
+      }
+    },
+    "short-2-B0.json": {
+      "backend": {
+        "attention_freq": "cudnn",
+        "attention_time": "cudnn",
+        "cublaslt": true,
+        "ff1": "handwritten",
+        "qk_rope": "split"
+      },
+      "correctness": {
+        "finite": true,
+        "overall": {
+          "bit_equal": false,
+          "finite": true,
+          "max_abs_error": 0.0002705346212223958,
+          "reference_rms": 0.09854428983105289,
+          "snr_db": 80.83087260425546
+        },
+        "relative_to_b0": null,
+        "relative_to_b0_reason": "computed by benchmark_matrix compare",
+        "shape": [
+          1,
+          6,
+          2,
+          132300
+        ],
+        "stems": [
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00005759787416081963,
+            "reference_rms": 0.000004766905627999627,
+            "snr_db": 0.1272913408267504
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0002705346212223958,
+            "reference_rms": 0.000015162353669656302,
+            "snr_db": 0.18614502460470572
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00006273388862609863,
+            "reference_rms": 0.24138267335444596,
+            "snr_db": 85.257053588563
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0000569789676774235,
+            "reference_rms": 0.000004376036533017272,
+            "snr_db": 1.2497050170746564
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.000048561406174485455,
+            "reference_rms": 0.000007500521160868392,
+            "snr_db": 1.7628286766203896
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00003101092443102971,
+            "reference_rms": 0.0005167457129730142,
+            "snr_db": 43.00413540960677
+          }
+        ],
+        "tail_covered": true
+      },
+      "identity": {
+        "binary_sha256": "591649c73b18d94b1af206f8a3446a786d789f10b09a1cb383ac3b66885de477",
+        "config_sha256": "070da10aa5cedefbf7cf1f8c5812c9ab8b43af48aa0f757b23a37c4ed856a383",
+        "device": "NVIDIA GeForce RTX 3080",
+        "driver": "595.91.07",
+        "fixture_id": "short",
+        "model_sha256": "2fe1eee94606c220a9113647e486f53fc1561f413f6c4a14f49500c925ed3deb",
+        "reference_sha256": "b379ab1a60f10a0ced91b9a3cf9cb5aac5f1dc7531ea8bc81fbe3529da1bba57",
+        "sm": "8.6",
+        "source_hash_reason": "runner supplies hash of the build snapshot",
+        "source_revision": null,
+        "source_sha256": "8e4797509c13f57b0d95e878a33a6005b60d24c4040723507675ffa3be042c21"
+      },
+      "memory_bytes": {
+        "accounting": "explicit device allocations; driver/library internal memory is recorded by external telemetry",
+        "external_peak": null,
+        "scratch": 1806244520,
+        "tracked_peak": 2934991480,
+        "tracked_resident": 2934991480,
+        "tuning_temporary": 50378752,
+        "weights": 1044813776,
+        "workspace": 33554432
+      },
+      "mfu": {
+        "matrix_flops": 1013639108608,
+        "nominal_mfu": 0.49833029254025357,
+        "nominal_peak_tflops": 59.53536,
+        "reason": null
+      },
+      "ola_vs_host": {
+        "bit_equal": false,
+        "finite": true,
+        "max_abs_error": 1.1920928955078125e-7,
+        "reference_rms": 0.09854545519044143,
+        "snr_db": 143.8129853235729
+      },
+      "pipeline": "waveform",
+      "precision": {
+        "accumulation": "fp32",
+        "input_resident_gpu": true,
+        "matrix_input": "fp16",
+        "output_resident_gpu": true,
+        "residual": "fp32",
+        "tf32": false
+      },
+      "schema_version": 1,
+      "shape": {
+        "T": 259,
+        "bands": 62,
+        "batch": 1,
+        "channels": 2,
+        "sample_rate": 44100,
+        "samples": 132300,
+        "stems": 6
+      },
+      "timing_ms": {
+        "allocation_input_h2d": 5.740831,
+        "context_kernels": 108.645317,
+        "cuda_event": [
+          35.51948928833008,
+          34.15865707397461,
+          34.03263854980469,
+          34.127872467041016,
+          34.1739501953125,
+          34.167808532714844,
+          34.1657600402832,
+          34.164737701416016,
+          34.18214416503906,
+          34.155521392822266,
+          34.155521392822266,
+          34.171905517578125,
+          34.1473274230957,
+          34.1657600402832,
+          34.18214416503906,
+          34.15654373168945,
+          34.17497634887695,
+          34.179073333740234,
+          34.15449523925781,
+          34.17087936401367
+        ],
+        "download_and_host_ola_check": 18.042695000000002,
+        "fft_plan": 7.381112,
+        "host_per_iteration": 34.22729225,
+        "host_total": 684.545845,
+        "iterations": 20,
+        "prepare_algorithms": 1879.799797,
+        "process_before_hashes": 6406.476546000001,
+        "rtf": 0.011409097416666666,
+        "warmup": 5,
+        "weights_pack_h2d": 1345.192653,
+        "weights_parse": 538.216878,
+        "weights_read": 271.75602
+      }
+    },
+    "short-3-B0.json": {
+      "backend": {
+        "attention_freq": "cudnn",
+        "attention_time": "cudnn",
+        "cublaslt": true,
+        "ff1": "handwritten",
+        "qk_rope": "split"
+      },
+      "correctness": {
+        "finite": true,
+        "overall": {
+          "bit_equal": false,
+          "finite": true,
+          "max_abs_error": 0.0002705346212223958,
+          "reference_rms": 0.09854428983105289,
+          "snr_db": 80.83087260425546
+        },
+        "relative_to_b0": null,
+        "relative_to_b0_reason": "computed by benchmark_matrix compare",
+        "shape": [
+          1,
+          6,
+          2,
+          132300
+        ],
+        "stems": [
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00005759787416081963,
+            "reference_rms": 0.000004766905627999627,
+            "snr_db": 0.1272913408267504
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0002705346212223958,
+            "reference_rms": 0.000015162353669656302,
+            "snr_db": 0.18614502460470572
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00006273388862609863,
+            "reference_rms": 0.24138267335444596,
+            "snr_db": 85.257053588563
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0000569789676774235,
+            "reference_rms": 0.000004376036533017272,
+            "snr_db": 1.2497050170746564
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.000048561406174485455,
+            "reference_rms": 0.000007500521160868392,
+            "snr_db": 1.7628286766203896
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00003101092443102971,
+            "reference_rms": 0.0005167457129730142,
+            "snr_db": 43.00413540960677
+          }
+        ],
+        "tail_covered": true
+      },
+      "identity": {
+        "binary_sha256": "591649c73b18d94b1af206f8a3446a786d789f10b09a1cb383ac3b66885de477",
+        "config_sha256": "070da10aa5cedefbf7cf1f8c5812c9ab8b43af48aa0f757b23a37c4ed856a383",
+        "device": "NVIDIA GeForce RTX 3080",
+        "driver": "595.91.07",
+        "fixture_id": "short",
+        "model_sha256": "2fe1eee94606c220a9113647e486f53fc1561f413f6c4a14f49500c925ed3deb",
+        "reference_sha256": "b379ab1a60f10a0ced91b9a3cf9cb5aac5f1dc7531ea8bc81fbe3529da1bba57",
+        "sm": "8.6",
+        "source_hash_reason": "runner supplies hash of the build snapshot",
+        "source_revision": null,
+        "source_sha256": "8e4797509c13f57b0d95e878a33a6005b60d24c4040723507675ffa3be042c21"
+      },
+      "memory_bytes": {
+        "accounting": "explicit device allocations; driver/library internal memory is recorded by external telemetry",
+        "external_peak": null,
+        "scratch": 1806244520,
+        "tracked_peak": 2934991480,
+        "tracked_resident": 2934991480,
+        "tuning_temporary": 50378752,
+        "weights": 1044813776,
+        "workspace": 33554432
+      },
+      "mfu": {
+        "matrix_flops": 1013639108608,
+        "nominal_mfu": 0.4982481537804691,
+        "nominal_peak_tflops": 59.53536,
+        "reason": null
+      },
+      "ola_vs_host": {
+        "bit_equal": false,
+        "finite": true,
+        "max_abs_error": 1.1920928955078125e-7,
+        "reference_rms": 0.09854545519044143,
+        "snr_db": 143.8129853235729
+      },
+      "pipeline": "waveform",
+      "precision": {
+        "accumulation": "fp32",
+        "input_resident_gpu": true,
+        "matrix_input": "fp16",
+        "output_resident_gpu": true,
+        "residual": "fp32",
+        "tf32": false
+      },
+      "schema_version": 1,
+      "shape": {
+        "T": 259,
+        "bands": 62,
+        "batch": 1,
+        "channels": 2,
+        "sample_rate": 44100,
+        "samples": 132300,
+        "stems": 6
+      },
+      "timing_ms": {
+        "allocation_input_h2d": 5.258324,
+        "context_kernels": 127.87136599999998,
+        "cuda_event": [
+          34.19247817993164,
+          34.34086227416992,
+          34.37260818481445,
+          34.20876693725586,
+          34.155521392822266,
+          34.15961456298828,
+          34.151519775390625,
+          34.171905517578125,
+          34.15449523925781,
+          34.17292785644531,
+          34.17804718017578,
+          34.1841926574707,
+          34.17804718017578,
+          34.16166305541992,
+          34.1657600402832,
+          34.157569885253906,
+          34.17087936401367,
+          34.1627197265625,
+          34.1657600402832,
+          34.17292785644531
+        ],
+        "download_and_host_ola_check": 17.744652,
+        "fft_plan": 6.406918,
+        "host_per_iteration": 34.1901872,
+        "host_total": 683.8037439999999,
+        "iterations": 20,
+        "prepare_algorithms": 1326.598717,
+        "process_before_hashes": 5887.900699,
+        "rtf": 0.011396729066666665,
+        "warmup": 5,
+        "weights_pack_h2d": 1328.6097029999999,
+        "weights_parse": 596.911431,
+        "weights_read": 261.104668
+      }
+    },
+    "short-1-B0.json": {
+      "backend": {
+        "attention_freq": "cudnn",
+        "attention_time": "cudnn",
+        "cublaslt": true,
+        "ff1": "handwritten",
+        "qk_rope": "split"
+      },
+      "correctness": {
+        "finite": true,
+        "overall": {
+          "bit_equal": false,
+          "finite": true,
+          "max_abs_error": 0.0002705346212223958,
+          "reference_rms": 0.09854428983105289,
+          "snr_db": 80.83087260425546
+        },
+        "relative_to_b0": null,
+        "relative_to_b0_reason": "computed by benchmark_matrix compare",
+        "shape": [
+          1,
+          6,
+          2,
+          132300
+        ],
+        "stems": [
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00005759787416081963,
+            "reference_rms": 0.000004766905627999627,
+            "snr_db": 0.1272913408267504
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0002705346212223958,
+            "reference_rms": 0.000015162353669656302,
+            "snr_db": 0.18614502460470572
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00006273388862609863,
+            "reference_rms": 0.24138267335444596,
+            "snr_db": 85.257053588563
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0000569789676774235,
+            "reference_rms": 0.000004376036533017272,
+            "snr_db": 1.2497050170746564
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.000048561406174485455,
+            "reference_rms": 0.000007500521160868392,
+            "snr_db": 1.7628286766203896
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00003101092443102971,
+            "reference_rms": 0.0005167457129730142,
+            "snr_db": 43.00413540960677
+          }
+        ],
+        "tail_covered": true
+      },
+      "identity": {
+        "binary_sha256": "591649c73b18d94b1af206f8a3446a786d789f10b09a1cb383ac3b66885de477",
+        "config_sha256": "070da10aa5cedefbf7cf1f8c5812c9ab8b43af48aa0f757b23a37c4ed856a383",
+        "device": "NVIDIA GeForce RTX 3080",
+        "driver": "595.91.07",
+        "fixture_id": "short",
+        "model_sha256": "2fe1eee94606c220a9113647e486f53fc1561f413f6c4a14f49500c925ed3deb",
+        "reference_sha256": "b379ab1a60f10a0ced91b9a3cf9cb5aac5f1dc7531ea8bc81fbe3529da1bba57",
+        "sm": "8.6",
+        "source_hash_reason": "runner supplies hash of the build snapshot",
+        "source_revision": null,
+        "source_sha256": "8e4797509c13f57b0d95e878a33a6005b60d24c4040723507675ffa3be042c21"
+      },
+      "memory_bytes": {
+        "accounting": "explicit device allocations; driver/library internal memory is recorded by external telemetry",
+        "external_peak": null,
+        "scratch": 1806244520,
+        "tracked_peak": 2934991480,
+        "tracked_resident": 2934991480,
+        "tuning_temporary": 50378752,
+        "weights": 1044813776,
+        "workspace": 33554432
+      },
+      "mfu": {
+        "matrix_flops": 1013639108608,
+        "nominal_mfu": 0.4983377762181341,
+        "nominal_peak_tflops": 59.53536,
+        "reason": null
+      },
+      "ola_vs_host": {
+        "bit_equal": false,
+        "finite": true,
+        "max_abs_error": 1.1920928955078125e-7,
+        "reference_rms": 0.09854545519044143,
+        "snr_db": 143.8129853235729
+      },
+      "pipeline": "waveform",
+      "precision": {
+        "accumulation": "fp32",
+        "input_resident_gpu": true,
+        "matrix_input": "fp16",
+        "output_resident_gpu": true,
+        "residual": "fp32",
+        "tf32": false
+      },
+      "schema_version": 1,
+      "shape": {
+        "T": 259,
+        "bands": 62,
+        "batch": 1,
+        "channels": 2,
+        "sample_rate": 44100,
+        "samples": 132300,
+        "stems": 6
+      },
+      "timing_ms": {
+        "allocation_input_h2d": 3.867793,
+        "context_kernels": 133.957503,
+        "cuda_event": [
+          35.12416076660156,
+          33.979393005371094,
+          34.16166305541992,
+          34.16166305541992,
+          34.16166305541992,
+          34.162689208984375,
+          34.171905517578125,
+          34.167808532714844,
+          34.17094421386719,
+          34.1739501953125,
+          34.17087936401367,
+          34.15654373168945,
+          34.16371154785156,
+          34.17087936401367,
+          34.16678237915039,
+          34.17599868774414,
+          34.160640716552734,
+          34.17599868774414,
+          34.16191864013672,
+          34.15961456298828
+        ],
+        "download_and_host_ola_check": 32.084631,
+        "fft_plan": 3.9450060000000002,
+        "host_per_iteration": 34.2071961,
+        "host_total": 684.143922,
+        "iterations": 20,
+        "prepare_algorithms": 1171.939911,
+        "process_before_hashes": 5361.795800000001,
+        "rtf": 0.011402398699999998,
+        "warmup": 5,
+        "weights_pack_h2d": 960.183185,
+        "weights_parse": 589.253209,
+        "weights_read": 294.944487
+      }
+    },
+    "full-0-B0.json": {
+      "backend": {
+        "attention_freq": "cudnn",
+        "attention_time": "cudnn",
+        "cublaslt": true,
+        "ff1": "handwritten",
+        "qk_rope": "split"
+      },
+      "correctness": {
+        "finite": true,
+        "overall": {
+          "bit_equal": false,
+          "finite": true,
+          "max_abs_error": 0.0036187171936035156,
+          "reference_rms": 0.06487502286083931,
+          "snr_db": 59.35299380901563
+        },
+        "relative_to_b0": null,
+        "relative_to_b0_reason": "computed by benchmark_matrix compare",
+        "shape": [
+          1,
+          6,
+          2,
+          588800
+        ],
+        "stems": [
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00013407364713202696,
+            "reference_rms": 0.0000035950089406242448,
+            "snr_db": 0.14823469712170395
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00019068804613198154,
+            "reference_rms": 0.000006357314846211402,
+            "snr_db": 2.8697465768248636
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0036187171936035156,
+            "reference_rms": 0.15440384523167297,
+            "snr_db": 61.534959182401
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0030195899307727814,
+            "reference_rms": 0.03757744055418071,
+            "snr_db": 50.518832788695136
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00003795360589720076,
+            "reference_rms": 0.000002198220257185175,
+            "snr_db": 8.066368610687316
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00007206002192106098,
+            "reference_rms": 0.000005328740813883081,
+            "snr_db": 11.100307622789549
+          }
+        ],
+        "tail_covered": true
+      },
+      "identity": {
+        "binary_sha256": "591649c73b18d94b1af206f8a3446a786d789f10b09a1cb383ac3b66885de477",
+        "config_sha256": "070da10aa5cedefbf7cf1f8c5812c9ab8b43af48aa0f757b23a37c4ed856a383",
+        "device": "NVIDIA GeForce RTX 3080",
+        "driver": "595.91.07",
+        "fixture_id": "full",
+        "model_sha256": "2fe1eee94606c220a9113647e486f53fc1561f413f6c4a14f49500c925ed3deb",
+        "reference_sha256": "76633ba967eeb5a9155835105e70aef5245d588ce680ffcb8cdcef2c4bbd3cd1",
+        "sm": "8.6",
+        "source_hash_reason": "runner supplies hash of the build snapshot",
+        "source_revision": null,
+        "source_sha256": "8e4797509c13f57b0d95e878a33a6005b60d24c4040723507675ffa3be042c21"
+      },
+      "memory_bytes": {
+        "accounting": "explicit device allocations; driver/library internal memory is recorded by external telemetry",
+        "external_peak": null,
+        "scratch": 10063872328,
+        "tracked_peak": 11362513176,
+        "tracked_resident": 11362513176,
+        "tuning_temporary": 220272640,
+        "weights": 1044813776,
+        "workspace": 33554432
+      },
+      "mfu": {
+        "matrix_flops": 6069010774016,
+        "nominal_mfu": 0.6484311597221961,
+        "nominal_peak_tflops": 59.53536,
+        "reason": null
+      },
+      "ola_vs_host": {
+        "bit_equal": false,
+        "finite": true,
+        "max_abs_error": 1.1920928955078125e-7,
+        "reference_rms": 0.06487111683720936,
+        "snr_db": 143.70281650864612
+      },
+      "pipeline": "waveform",
+      "precision": {
+        "accumulation": "fp32",
+        "input_resident_gpu": true,
+        "matrix_input": "fp16",
+        "output_resident_gpu": true,
+        "residual": "fp32",
+        "tf32": false
+      },
+      "schema_version": 1,
+      "shape": {
+        "T": 1151,
+        "bands": 62,
+        "batch": 1,
+        "channels": 2,
+        "sample_rate": 44100,
+        "samples": 588800,
+        "stems": 6
+      },
+      "timing_ms": {
+        "allocation_input_h2d": 16.997842,
+        "context_kernels": 2090.776522,
+        "cuda_event": [
+          157.64991760253906,
+          157.25669860839844,
+          155.8456268310547,
+          155.92037963867188,
+          156.72962951660156,
+          156.96588134765625,
+          157.86802673339844,
+          157.94175720214844,
+          156.91981506347656,
+          155.9910430908203,
+          156.30540466308594,
+          157.06008911132812,
+          157.7328643798828,
+          158.16294860839844,
+          158.0431365966797,
+          157.16249084472656,
+          157.11744689941406,
+          157.2569580078125,
+          157.95712280273438,
+          158.01344299316406
+        ],
+        "download_and_host_ola_check": 98.31117,
+        "fft_plan": 3.9656659999999997,
+        "host_per_iteration": 157.19536985,
+        "host_total": 3143.907397,
+        "iterations": 20,
+        "prepare_algorithms": 1174.147461,
+        "process_before_hashes": 9954.743404,
+        "rtf": 0.01177363418883322,
+        "warmup": 5,
+        "weights_pack_h2d": 690.692136,
+        "weights_parse": 281.616823,
+        "weights_read": 168.30937200000002
+      }
+    },
+    "full-1-B0.json": {
+      "backend": {
+        "attention_freq": "cudnn",
+        "attention_time": "cudnn",
+        "cublaslt": true,
+        "ff1": "handwritten",
+        "qk_rope": "split"
+      },
+      "correctness": {
+        "finite": true,
+        "overall": {
+          "bit_equal": false,
+          "finite": true,
+          "max_abs_error": 0.0036187171936035156,
+          "reference_rms": 0.06487502286083931,
+          "snr_db": 59.35299380901563
+        },
+        "relative_to_b0": null,
+        "relative_to_b0_reason": "computed by benchmark_matrix compare",
+        "shape": [
+          1,
+          6,
+          2,
+          588800
+        ],
+        "stems": [
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00013407364713202696,
+            "reference_rms": 0.0000035950089406242448,
+            "snr_db": 0.14823469712170395
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00019068804613198154,
+            "reference_rms": 0.000006357314846211402,
+            "snr_db": 2.8697465768248636
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0036187171936035156,
+            "reference_rms": 0.15440384523167297,
+            "snr_db": 61.534959182401
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.0030195899307727814,
+            "reference_rms": 0.03757744055418071,
+            "snr_db": 50.518832788695136
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00003795360589720076,
+            "reference_rms": 0.000002198220257185175,
+            "snr_db": 8.066368610687316
+          },
+          {
+            "bit_equal": false,
+            "finite": true,
+            "max_abs_error": 0.00007206002192106098,
+            "reference_rms": 0.000005328740813883081,
+            "snr_db": 11.100307622789549
+          }
+        ],
+        "tail_covered": true
+      },
+      "identity": {
+        "binary_sha256": "591649c73b18d94b1af206f8a3446a786d789f10b09a1cb383ac3b66885de477",
+        "config_sha256": "070da10aa5cedefbf7cf1f8c5812c9ab8b43af48aa0f757b23a37c4ed856a383",
+        "device": "NVIDIA GeForce RTX 3080",
+        "driver": "595.91.07",
+        "fixture_id": "full",
+        "model_sha256": "2fe1eee94606c220a9113647e486f53fc1561f413f6c4a14f49500c925ed3deb",
+        "reference_sha256": "76633ba967eeb5a9155835105e70aef5245d588ce680ffcb8cdcef2c4bbd3cd1",
+        "sm": "8.6",
+        "source_hash_reason": "runner supplies hash of the build snapshot",
+        "source_revision": null,
+        "source_sha256": "8e4797509c13f57b0d95e878a33a6005b60d24c4040723507675ffa3be042c21"
+      },
+      "memory_bytes": {
+        "accounting": "explicit device allocations; driver/library internal memory is recorded by external telemetry",
+        "external_peak": null,
+        "scratch": 10063872328,
+        "tracked_peak": 11362513176,
+        "tracked_resident": 11362513176,
+        "tuning_temporary": 220272640,
+        "weights": 1044813776,
+        "workspace": 33554432
+      },
+      "mfu": {
+        "matrix_flops": 6069010774016,
+        "nominal_mfu": 0.641238726905432,
+        "nominal_peak_tflops": 59.53536,
+        "reason": null
+      },
+      "ola_vs_host": {
+        "bit_equal": false,
+        "finite": true,
+        "max_abs_error": 1.1920928955078125e-7,
+        "reference_rms": 0.06487111683720936,
+        "snr_db": 143.70281650864612
+      },
+      "pipeline": "waveform",
+      "precision": {
+        "accumulation": "fp32",
+        "input_resident_gpu": true,
+        "matrix_input": "fp16",
+        "output_resident_gpu": true,
+        "residual": "fp32",
+        "tf32": false
+      },
+      "schema_version": 1,
+      "shape": {
+        "T": 1151,
+        "bands": 62,
+        "batch": 1,
+        "channels": 2,
+        "sample_rate": 44100,
+        "samples": 588800,
+        "stems": 6
+      },
+      "timing_ms": {
+        "allocation_input_h2d": 17.094134,
+        "context_kernels": 121.040087,
+        "cuda_event": [
+          159.70407104492188,
+          158.73536682128906,
+          158.30528259277344,
+          158.25100708007812,
+          158.37081909179688,
+          159.51974487304688,
+          160.1914825439453,
+          158.95245361328125,
+          158.57766723632812,
+          158.18240356445312,
+          158.39129638671875,
+          158.993408203125,
+          159.84742736816406,
+          159.49209594726562,
+          159.09580993652344,
+          158.37286376953125,
+          158.44248962402344,
+          159.09478759765625,
+          159.77984619140625,
+          159.3480682373047
+        ],
+        "download_and_host_ola_check": 101.15779599999999,
+        "fft_plan": 4.131734,
+        "host_per_iteration": 158.98288215,
+        "host_total": 3179.657643,
+        "iterations": 20,
+        "prepare_algorithms": 1182.1764779999999,
+        "process_before_hashes": 9038.642973,
+        "rtf": 0.011907515459943953,
+        "warmup": 5,
+        "weights_pack_h2d": 1297.120276,
+        "weights_parse": 577.586583,
+        "weights_read": 256.303631
+      }
+    }
+  }
+}

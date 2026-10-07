@@ -1,162 +1,93 @@
 # logic-bs-roformer-rs
 
-BS-RoFormer 六 stem 音源分离模型的纯 Rust + cuda-oxide 推理实现，
-在 RTX 3080 上与 PyTorch/pymss 基线对比。
+BS-RoFormer 六 stem 音源分离的 Rust + cuda-oxide 实现，支持 Windows 原生和 Linux CUDA。模型权重、训练 YAML 与六个双声道 WAV 的输出格式保持兼容。
 
-## 结果速览（RTX 3080 20GB，3 秒单 chunk，warm）
+## 当前结果
 
-| 指标 | PyTorch 2.14.1 基线 | 本实现 | 对比 |
-|---|---|---|---|
-| wall（warm，10 次均值） | 120.8 ms | **73.5 ms** | **1.64×** |
-| GPU kernel 合计（nsys） | ~119.6 ms | ~73 ms | 1.63× |
-| RTF | 0.0403 | **0.0245** | — |
-| 六 stem 输出 SNR | —（同一模型） | **80.87 dB** | 验收线 ≥60 dB |
+RTX 3080 20GB，完整波形（包括 GPU ISTFT overlap-add），5轮交替配对、每轮预热5次/计时20次：
 
-完整剖析、逐内核时间线与全部优化实验记录见
-[docs/BENCHMARK.md](docs/BENCHMARK.md)。
+| 指标 | 同轮 B0 | 最终默认组合 |
+|---|---:|---:|
+| 588800 samples，T=1151 | 159.79 ms | **157.89 ms** |
+| 132300 samples，T=259 | 34.16 ms | **33.81 ms** |
+| 完整块生产 scratch | 9.373 GiB | **2.322 GiB** |
+| 常驻 GPU 权重 | 996.41 MiB | **336.18 MiB** |
+| 进程 GPU 峰值（NVML） | 10.883 GiB | **3.164 GiB** |
 
-## 模型
+完整块配对收益为 **1.19%**；对初始 B0 158.97 ms 的收益为 **0.68%**。原定8%延迟目标未达到。输出在3080正式对照中逐位一致，九个固定 fixture 通过逐 stem 误差门槛。更充分的 GEMM 调优增加了冷启动时间，进程墙钟中位数约5.49→6.19秒；它与热推理延迟分别报告。
 
-- 174.66M 参数（1989 个 state-dict key 全量校验，逐 key 消费恰好一次）
-- 62 频带 BandSplit → 12 层 ×（时间轴 + 频率轴）线性注意力 transformer
-  → MaskEstimator → 复数域 mask → ISTFT 六 stem
-- dim 256 / FF 1024 / 8 头（head dim 64）/ 每 8 头门控
+方法、候选拒绝原因、冷启动、MFU和原始结果见[性能验收报告](docs/BENCHMARK.md)。Windows及WSL已完成编译、短golden和边界检查；本地繁忙时仅作数值验证，正式性能结论来自3080。
 
-## 代码结构
+## Windows 原生构建与运行
 
-| 文件 | 内容 |
+[编译器子模块](vendor/cuda-rust) 使用 [cuda-rust-windows fork](https://github.com/ansidium/cuda-rust-windows)，现有 stable 1.99 工具链与构建入口保持不变。
+
+~~~powershell
+powershell scripts/build_win.ps1
+powershell scripts/lbrr.ps1 --separate --model-dir assets --input song.wav --outdir separated
+powershell scripts/lbrr.ps1 --bench --model-dir assets --warmup 5 --iters 20 --bench-json output/short.json
+~~~
+
+运行库布局与 shim 编译说明在[Windows 构建脚本](scripts/build_win.ps1)。现有本机 cuDNN/cfe/shim 位于 D:/Projects/lbrr-win-libs。
+
+依赖与缓存沿用 D 盘约定：CARGO_HOME=D:/cargo、RUSTUP_HOME=D:/rustup。禁止把新增依赖安装到 C 盘；构建脚本会拒绝指向 C 盘的 Rust 工具链/缓存路径。
+
+## 可复现基准与后端选择
+
+~~~bash
+lbrr --bench --model-dir assets --bench-ref fixtures/full/ref_output.npz --bench-stage waveform --warmup 5 --iters 20 --attn-time cudnn --attn-freq cudnn --ff1-backend handwritten --qk-rope split --bench-json output/full.json
+python tools/check_benchmark.py output/full.json --baseline output/b0-full.json
+lbrr --kernel-regression --bench-json output/kernels.json
+~~~
+
+- 默认测完整 GPU 波形；frames 模式只用于历史 C2R 帧边界复核，JSON明确标注计时终点。RTF根据真实样本数/采样率计算。
+- 时间轴和频率轴独立选择 auto/cudnn/handwritten。优先级是显式CLI > LBRR_NO_CUDNN > auto；环境变量保留“存在即禁用”的旧语义。auto在准备阶段按轴回退并记录原因；显式cuDNN失败返回错误。执行错误会中止该次推理。
+- FF1支持 auto/handwritten/cublaslt-erf/handwritten-async。实测后默认保留 handwritten；候选没有通过收益门槛。原有erf形式GELU和FP16舍入边界不变。
+- Q/K RoPE支持 split/fused。默认split；广播gate没有收益，生产路径保留原gate pass。手写注意力保持原有Q旋转语义。
+- 结果记录源码/二进制/模型/配置/参考哈希、实际后端、初始化细项、CUDA Event/host时间、内存和逐stem误差。算法只在进程内缓存，不跨库版本保存opaque数据。
+
+固定样本生成和五轮配对入口在[benchmark_matrix.py](tools/benchmark_matrix.py)：
+
+~~~bash
+python tools/benchmark_matrix.py prepare --reference-root /path/to/pymss --model-dir assets --audio assets/cyberangel.wav --out fixtures
+python tools/benchmark_matrix.py run --rust-bin /path/to/b0 --candidate-bin ./target/release/lbrr --model-dir assets --fixtures fixtures --rounds 5 --warmup 5 --iters 20 --cases full,short --out output/paired
+~~~
+
+## Linux、WSL与隔离目录
+
+[WSL同步脚本](scripts/sync_wsl.sh) 支持 LBRR_SOURCE_DIR/LBRR_WSL_ROOT，[构建脚本](scripts/build_wsl.sh)支持 CARGO_TARGET_DIR。同步前验证目标是指定任务目录，保留真实的编译器源码目录，排除构建缓存。既有 Linux nightly 编译环境可用 LBRR_VENDOR_SOURCE 指定原编译器源码；这不修改 Windows fork 或工具链 pin。
+
+~~~bash
+export LBRR_SOURCE_DIR=/mnt/d/Projects/logic-bs-roformer-rs
+export LBRR_WSL_ROOT=/root/work/lbrr-isolated
+export CARGO_TARGET_DIR=/root/work/target-lbrr-isolated
+bash scripts/sync_wsl.sh
+LBRR_CARGO_ACTION=build bash scripts/build_wsl.sh -- --release
+~~~
+
+[远程构建脚本](scripts/build_remote.sh)支持 LBRR_REMOTE_ROOT/CARGO_TARGET_DIR，默认复用既有 CUDA13.3、LLVM19 与 nightly-2026-08-28 环境。运行时通过 LBRR_CUDNN_DIR、LBRR_NVRTC_DIR、LBRR_SDPA_WRAP 指向本机准备好的库；不把训练配置的 flash_attn 映射成 Rust 后端选择。
+
+## 模型与实现
+
+模型固定为174.66M参数、1989个checkpoint key、62频带、12个双轴层、8heads×64、dim256/FF1024、6stems。加载保留dtype/shape/key完整性校验。
+
+| 文件 | 职责 |
 |---|---|
-| src/main.rs | host 编排、全部 CUDA 内核（gpu_kernels 模块）、warm bench |
-| src/weights.rs | Safetensors 加载与全量 key 校验 |
-| src/config.rs | 零依赖 YAML 解析 |
-| src/stft.rs, src/cufft.rs | STFT/ISTFT 与 dlopen cuFFT 绑定 |
-| src/audio.rs, src/npz.rs | WAV 与 NPZ 读写 |
-| tools/bench_ref.py | PyTorch 基线（同输入、同计时口径） |
-| tools/dump_refs.py | parity 参考生成 |
-| scripts/build_remote.sh | 远程构建入口（cargo oxide run） |
+| [main.rs](src/main.rs) | GPU内核、生产流水线、独立parity资源、CLI接线 |
+| [inference_options.rs](src/inference_options.rs) | 后端请求、优先级与保守默认 |
+| [benchmark.rs](src/benchmark.rs) | 完整波形测量契约、数值指标、MFU和结果身份 |
+| [cublaslt.rs](src/cublaslt.rs) | 非别名调优、描述符缓存、资源生命周期 |
+| [cudnn.rs](src/cudnn.rs) | 按轴准备、完整缓存键、workspace与明确失败语义 |
+| [stft.rs](src/stft.rs)、[cufft.rs](src/cufft.rs) | 单流FFT计划和执行 |
+| [weights.rs](src/weights.rs) | 权重加载与完整校验 |
+| [bench_ref.py](tools/bench_ref.py)、[separate_ref.py](tools/separate_ref.py) | PyTorch完整波形与整曲参考 |
 
-## 关键内核
+生产 scratch 与诊断资源分离，GPU只保留实际使用的矩阵表示。MaskEstimator使用真实 band 宽度，pre2/GLU总宽为8200/4100；157项静态tile表复用于6个stem。
 
-- **attn_flash_tc**：tensor-core flash attention。RoPE 融合进 Q/K 加载、
-  在线 softmax 在寄存器内、C fragment 原地转 PV 的 A fragment、门控
-  sigmoid 融合进 epilogue；分数矩阵零落显存。两轴统一使用。
-- **gemm_f16_128x64 / residual / gelu**：f16x2 tensor-core GEMM，float4
-  向量化加载，残差/GELU 融合进 epilogue。
-- **rmsnorm_gates**：RMSNorm 与 8 头门控投影融合（lane-major 合并访问）。
-- **mask_gemm1/2 + glu_scatter**：逐 stem 分组 MaskEstimator。
+## 验证与CI
 
-## 本机构建
+[本地CI](scripts/ci.sh)运行GPU smoke、核函数边界回归、后端生命周期单元测试以及完整波形JSON门槛。LBRR_MODEL_DIR可指定模型目录，LBRR_CI_BASELINE_JSON可启用相对B0逐stem门槛。
 
-**Windows 原生（当前主路径，2026-10-07 起）**：vendor/cuda-rust 已切至
-[ansidium/cuda-rust-windows](https://github.com/ansidium/cuda-rust-windows)
-fork（基线上同源 +101 Windows 移植 commits），工具链 stable 1.99。
-历史上的 LNK1189（>65535 导出）只挡"在 Windows 上构建上游 backend"，
-fork 的 release 后端无此问题；运行时链路（dlopen + 驱动 JIT）平台中立。
+[GitHub workflow](.github/workflows/ci.yml)在托管 Linux/Windows runner验证构建；GPU步骤通过设备探测启用。缺GPU或权重会明确说明资源型检查被跳过。最终性能验收必须使用资源齐备的机器。
 
-```powershell
-# 一次性布置运行库（cuDNN 9 DLL + cudnn-frontend 头 + 编出的 shim）
-#   详见 scripts/build_win.ps1 内的提示文本；本机布局固定在
-#   D:\Projects\lbrr-win-libs（cudnn\bin、cfe\、cudnn_sdpa_wrap.dll）
-
-# 构建（编译 shim DLL + cargo oxide build --release）
-powershell scripts\build_win.ps1
-
-# 运行（自动注入 CUDA_HOME 等环境）
-powershell scripts\lbrr.ps1 --separate --input song.wav --outdir out
-```
-
-本机实测（4060 Ti / CUDA 13.4 / stable 1.99）：整曲 cyberangel.wav 180.5s
-GPU wall **4.64s**（RTF 0.0257），golden SNR **80.96 dB**，8s 短输入无静音尾。
-
-**依赖落盘约定**：Rust 工具链与全部构建依赖一律 D 盘（`CARGO_HOME=D:cargo`、
-`RUSTUP_HOME=D:ustup`，已设为用户级环境变量；cuDNN/cfe/shim 在
-`D:Projectslbrr-win-libs`）。禁止任何依赖安装到 C 盘；build_win.ps1
-内置守卫，CARGO_HOME/RUSTUP_HOME 落 C 盘时直接报错。
-
-**WSL 构建（备用的 Linux 路径）**：
-
-```bash
-# 一次性环境：WSL Ubuntu-22.04 + rustup nightly-2026-08-28 +
-#   CUDA 13.3 toolkit（.cn ubuntu2204 apt 源，cuda-toolkit-13-3）
-#   + llvm-14（libclang，bindgen 用）
-
-# 环境已持久化到 WSL /etc/profile.d/99-rust-cuda.sh（PATH 含
-# /root/.cargo/bin 与 /usr/local/cuda-13.3/bin、CUDA_HOME、LIBCLANG_PATH、
-# CARGO_TARGET_DIR），登录 shell（bash -l）自动生效，无需手动 export。
-# rustup 工具链由 rust-toolchain.toml 钉定 nightly-2026-08-28。
-
-# 同步源码到 ext4 并构建（rsync exclude 已修复为锚定 /target，
-# 不再误删 cuda-oxide-codegen/src/target/ 源码目录）
-wsl -d Ubuntu-22.04 -u root -- bash -lc \
-  'bash /mnt/d/Projects/logic-bs-roformer-rs/scripts/sync_wsl.sh && \
-   cd /root/work/lbrr && cargo oxide build -- --release'
-# 产物: /root/work/target-lbrr/release/lbrr（GPU 直通可用）
-```
-
-注意：cuda-oxide-codegen 的 src/target/ 目录被上游 gitignore 规则吞掉
-（不入库），只能靠文件系统同步——sync_wsl.sh 的 exclude 必须保持锚定写法。
-
-本机 cudnn fused SDPA（可选，提速 ~20%）：部署在 /opt/lbrr-cudnn/（pip wheel
-cudnn 9.10.2.21 + nvrtc 12.6.85 的 lib/include + 本机重编的
-libcudnn_sdpa_wrap.so——远程编译版需要 GLIBC 2.38，Ubuntu 22.04 只有 2.35，
-须用本机 g++ 11 重编：frontend 头在 cfe/cudnn-frontend-v1212/include）。
-LBRR_CUDNN_DIR/LBRR_NVRTC_DIR/LBRR_SDPA_WRAP 已入 profile.d。坑：frontend
-的 load_cudart_so() 要求进程可 dlopen 的 libcudart 唯一——WSL 装过 CUDA
-12.6 时 ldconfig 缓存同时有 .12/.13 会报 "Multiple libcudart"，需禁用
-ld.so.conf.d 里 12.x 的条目（988_cuda-12.conf、gds-12-6.conf）后 ldconfig。
-验证：golden SNR 80.94dB，全曲 GPU wall 6.67s(回退) -> 5.45s(cudnn)。
-
-## CI
-
-本地一条命令全链验证（overlay → sync → release 构建 → GPU 自检 →
-golden SNR ≥60dB 门槛）：
-
-```bash
-wsl -d Ubuntu-22.04 -u root -- bash -lc \
-  'bash /mnt/d/Projects/logic-bs-roformer-rs/scripts/ci.sh'
-```
-
-`.github/workflows/ci.yml` 提供等价的 self-hosted workflow（标签
-`self-hosted, cuda`；runner 需预置 CUDA 13.x、nightly-2026-08-28 与
-assets/ 模型权重）。fresh checkout 缺的 `cuda-oxide-codegen/src/target/`
-（上游 gitignore 吞掉、不入库）由 `vendor-overlay/` 恢复，ci.sh 与
-workflow 均已内置该步骤。
-
-## 远程构建与运行（基准环境：Komari 节点 RTX 3080）
-
-```bash
-# 上传源码（MD5 校验的可靠通道）
-node <SSH_TOOLS_DIR>/upload_model.js src/main.rs \
-     /data/dsh/logic-bs-roformer-rs/src/main.rs 1
-
-# 构建并跑端到端正确性
-cd /data/dsh/logic-bs-roformer-rs
-nohup bash scripts/build_remote.sh -- --e2e-test > build.log 2>&1 &
-
-# warm 基准（与 tools/bench_ref.py 同口径）
-/data/dsh/target-lbrr/release/lbrr --bench --iters 10
-```
-
-环境要求（build_remote.sh 已内置）：RUSTUP_TOOLCHAIN=nightly-2026-08-28、
-CUDA_HOME=/usr/local/cuda-13.3、LIBCLANG_PATH=/usr/lib/llvm-19/lib、
-CARGO_TARGET_DIR=/data/dsh/target-lbrr。
-
-## 已知边界（详见 BENCHMARK.md）
-
-1. f16 GEMM 停在 ~15 TFLOP/s：LDS fragment 读是墙；非 2 次幂行距触发
-   ~5× 编译惩罚（bank 冲突修复两轮证伪）、>32 个累加 float 的寄存器
-   数组必 spill（四轮证伪）、cp.async 对已 L2 命中的加载无收益。
-2. flash 注意力与三段链持平（~2.6 ms/launch 时间轴）：gather 模式由
-   折叠 qkv 布局决定，warp 级 MLP 已足够掩盖延迟。
-3. cuBLAS/cuBLASLt 与 cuda-oxide 的上下文/流不兼容（719/参数错误）。
-
-## 正确性工作流
-
-```bash
-lbrr --e2e-test      # 黄金输入全链路：阶段级 parity + 六 stem SNR（80.87 dB）
-lbrr --stft-test     # STFT vs torch.stft parity
-lbrr --attn-test     # 注意力算子级 parity
-# ...其余 --*-test 覆盖每个算子
-```
-
-参考数据在 assets/ref_output.npz 与 parity/（由 tools/dump_refs.py 生成）。
+已有 --e2e-test、--stft-test、--attn-test 等诊断入口保留，所需参考可用[dump_refs.py](tools/dump_refs.py)生成。新增 --kernel-regression 不依赖模型权重，覆盖RoPE、FFT/OLA、Mask映射、FF1尾行和调优输入保护。

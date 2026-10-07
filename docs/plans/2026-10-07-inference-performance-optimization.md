@@ -1,6 +1,6 @@
 # BS-RoFormer GPU 推理优化实施计划
 
-> 执行约定：本计划获批后，按下列依赖顺序在本会话实施；每个任务形成可单独验收的变更。当前交付仅为计划。
+> 执行状态：任务1–7已落地并按分层实验验收。性能、逐stem误差、显存、冷启动、被拒绝候选及复现入口见[验收报告](../BENCHMARK.md)。完整块相对初始B0快0.68%，同轮配对快1.19%；8%收益目标未达到。用户要求本地停止GPU测试后，剩余验收全部在3080完成，WSL I/O实验未作收益结论。
 
 **Goal：** 以“呵呵”RTX 3080 为主要验收设备、本地 WSL RTX 4060 Ti 为交叉验证设备，降低完整波形推理延迟、生产显存占用和初始化成本，同时保持当前 Rust 实现的数值质量。
 
@@ -77,13 +77,13 @@
 
 **依赖：** 无。**交付：** Rust/PyTorch 可比较的固定输入、完整波形计时、B0 记录和可重复构建入口。
 
-- [ ] 为构建/同步脚本增加 LBRR_SOURCE_DIR、LBRR_WSL_ROOT、LBRR_REMOTE_ROOT 和可覆盖 CARGO_TARGET_DIR，保留当前默认。调用 rsync --delete 前核验解析后的源/目标是指定任务目录；不可指向项目根的父级、磁盘根或其他工作的目录。
-- [ ] 在 cuFFT 加载 cufftSetStream，提供 CufftPlan::set_stream；STFT/C2R 计划绑定实际推理 stream。此任务仍只跑单流，先确保 Event 覆盖全部 GPU 工作。
-- [ ] 保留 bench_forward 的“到 C2R frames”内部语义，新增 istft_ola GPU kernel：复用 ola_demix 的 gather、window-energy reciprocal 和中心裁剪公式，直接覆写 [stem,channel,sample] 波形，不使用跨迭代 +=。整曲仍调用现有 ola_demix，避免额外产生整块波形中间副本。
-- [ ] waveform 基准计时从驻留 GPU 输入开始，到归一化后的驻留 GPU 波形结束；模型加载、plan 构建、调优、分配、H2D/D2H 和文件 I/O 均单独记录。每轮同步只在测量边界，正确性下载放在计时后；输出必须实际消费校验。
-- [ ] 整理 tools/benchmark_matrix.py：以现有短参考、音频开头/中间/结尾三个完整块、静音和立体声不对称输入生成未压缩 NPZ 与 manifest。PyTorch 模块位置用 --reference-root 指定；复用远程现有依赖，WSL 无 PyTorch 时执行 Rust 的 B0/候选回归和现有短 golden。
-- [ ] 修复 PyTorch --full 起点算法为覆盖最后一个有效样本的网格，并按所需最后块扩大反射填充；与当前 Rust 整曲算法一致。单块模式 L 必须满足 STFT 反射约束，空输入明确报错；整曲短音频走固定块填充。
-- [ ] 输出 schema_version=1；测量 B0，归档 source/binary/model 哈希和必要原始结果。初始库/内核算法不在此任务改变。
+- [x] 为构建/同步脚本增加 LBRR_SOURCE_DIR、LBRR_WSL_ROOT、LBRR_REMOTE_ROOT 和可覆盖 CARGO_TARGET_DIR，保留当前默认。调用 rsync --delete 前核验解析后的源/目标是指定任务目录；不可指向项目根的父级、磁盘根或其他工作的目录。
+- [x] 在 cuFFT 加载 cufftSetStream，提供 CufftPlan::set_stream；STFT/C2R 计划绑定实际推理 stream。此任务仍只跑单流，先确保 Event 覆盖全部 GPU 工作。
+- [x] 保留 bench_forward 的“到 C2R frames”内部语义，新增 istft_ola GPU kernel：复用 ola_demix 的 gather、window-energy reciprocal 和中心裁剪公式，直接覆写 [stem,channel,sample] 波形，不使用跨迭代 +=。整曲仍调用现有 ola_demix，避免额外产生整块波形中间副本。
+- [x] waveform 基准计时从驻留 GPU 输入开始，到归一化后的驻留 GPU 波形结束；模型加载、plan 构建、调优、分配、H2D/D2H 和文件 I/O 均单独记录。每轮同步只在测量边界，正确性下载放在计时后；输出必须实际消费校验。
+- [x] 整理 tools/benchmark_matrix.py：以现有短参考、音频开头/中间/结尾三个完整块、静音和立体声不对称输入生成未压缩 NPZ 与 manifest。PyTorch 模块位置用 --reference-root 指定；复用远程现有依赖，WSL 无 PyTorch 时执行 Rust 的 B0/候选回归和现有短 golden。
+- [x] 修复 PyTorch --full 起点算法为覆盖最后一个有效样本的网格，并按所需最后块扩大反射填充；与当前 Rust 整曲算法一致。单块模式 L 必须满足 STFT 反射约束，空输入明确报错；整曲短音频走固定块填充。
+- [x] 输出 schema_version=1；测量 B0，归档 source/binary/model 哈希和必要原始结果。初始库/内核算法不在此任务改变。
 
 **验收：** 同输入两侧样本数、6 stems、双声道、采样率一致；新增 OLA 的输出与既有 host OLA 数值一致。整曲覆盖短于块长、恰好一块、30 秒、最后不足一步的音频；30 秒必须覆盖 3 块，尾部不能为未计算区域。用单/双声道冲激检查 STFT/ISTFT 裁剪与通道对应，使用静音检查 NaN/除零。
 
@@ -93,12 +93,12 @@
 
 **依赖：** 任务 1。**修改：** 主程序、inference_options、cuDNN 封装；现有 C++ wrapper 的 build/exec/workspace 参数足够，本轮保持其 ABI。
 
-- [ ] 定义 AttentionBackendRequest { Auto, Cudnn, Handwritten }，每轴保存请求值、实际值和回退原因；解析前述 CLI/环境变量优先级。
-- [ ] 将 CudnnSdpa 分为 prepare 与 execute：在修改 Q/K 之前准备好两个轴的 plan。候选仅按 heuristic A → B → FALLBACK 顺序寻找首个可用方案；本轮不做新一轮 SDPA 在线速度搜索。
-- [ ] 将 plans 的缓存键从 (b,s) 扩展为 axis、B/H/S/D、dtype、Q/K/V/O strides 和 attention scale；context/设备由 CudnnSdpa 实例拥有，计划不得跨 context 使用。
-- [ ] 接入真实 workspace，以当前 stream 分配，单实例单流复用最大需求；本轮上限 64MiB。超过上限、不支持或分配失败：auto 在执行前回退，显式 cudnn 返回错误。去掉 ws==0 的 panic，并检查 set_stream 的返回码。
-- [ ] 正式 execute 失败时中止该次推理并保留 CUDA 错误，不在 Q 已原地 RoPE 后直接调用手写内核，避免重复旋转或继续使用已损坏的 context。
-- [ ] 补齐 graph/handle/workspace 生命周期；启动日志与 JSON 必须一致地说明每个轴的选用路径。
+- [x] 定义 AttentionBackendRequest { Auto, Cudnn, Handwritten }，每轴保存请求值、实际值和回退原因；解析前述 CLI/环境变量优先级。
+- [x] 将 CudnnSdpa 分为 prepare 与 execute：在修改 Q/K 之前准备好两个轴的 plan。候选仅按 heuristic A → B → FALLBACK 顺序寻找首个可用方案；本轮不做新一轮 SDPA 在线速度搜索。
+- [x] 将 plans 的缓存键从 (b,s) 扩展为 axis、B/H/S/D、dtype、Q/K/V/O strides 和 attention scale；context/设备由 CudnnSdpa 实例拥有，计划不得跨 context 使用。
+- [x] 接入真实 workspace，以当前 stream 分配，单实例单流复用最大需求；本轮上限 64MiB。超过上限、不支持或分配失败：auto 在执行前回退，显式 cudnn 返回错误。去掉 ws==0 的 panic，并检查 set_stream 的返回码。
+- [x] 正式 execute 失败时中止该次推理并保留 CUDA 错误，不在 Q 已原地 RoPE 后直接调用手写内核，避免重复旋转或继续使用已损坏的 context。
+- [x] 补齐 graph/handle/workspace 生命周期；启动日志与 JSON 必须一致地说明每个轴的选用路径。
 
 **验收：** CLI 覆盖环境变量、库缺失、单轴不支持、非零 workspace、显式选择失败、正常自动回退均有确定结果。使用 T=62 验证两个轴虽然 B/S 相同、strides 不同也不会复用错误计划。测试失败路径后没有泄漏或二次释放；准备期间不修改生产 QKV。
 
@@ -106,11 +106,11 @@
 
 **依赖：** 任务 2。**修改：** 主程序的 E2eScratch、BenchBufs、make_bench_bufs、separate、forward_only、e2e_test、upload_weights，以及权重模块。
 
-- [ ] 将 E2eScratch 分为 RuntimeScratch 与 ParityScratch；生产构造函数只创建 transformer_step/bench_forward 实际需要的资源，诊断路径显式申请旧参考资源。将重复初始化集中到同一生产构造函数，保持 GPU 核函数代码所在模块不变。
-- [ ] 从生产构造中移除 h、qkv、qkv_rope、qkv_attn、v_flat、scaled、oproj、ffpre、ff1、ff2、p_big、attn_out_long 等旧 FP32 scratch；legacy parity 用到时在 ParityScratch 分配。不得用零长 buffer 冒充仍被调用的内核输入。
-- [ ] 分开运行与 parity 权重上传。保留生产需要的 norm、bias、BandSplit FP32 权重和 FP16 打包矩阵；仅 parity 使用的 QKV/输出投影/FFN/Mask FP32 矩阵不进入生产 GPU 常驻集合。
-- [ ] 上传时借用 TransformerLayer，消除两轮 layer.clone；每个 mask stem 只整理/打包一次。GPU 上传与异步复制完成后释放 SafeTensors、宿主模型和临时拼接副本，明确最后一次读与释放的 stream 顺序。
-- [ ] 保持 safetensors/YAML 格式不变，不新增磁盘预打包格式、服务进程或批量任务 API。分别测宿主读取、解析、转换、H2D；WSL ext4 权重与 /mnt/d 权重只作为受控 I/O 对照，不自动移动用户文件。
+- [x] 将 E2eScratch 分为 RuntimeScratch 与 ParityScratch；生产构造函数只创建 transformer_step/bench_forward 实际需要的资源，诊断路径显式申请旧参考资源。将重复初始化集中到同一生产构造函数，保持 GPU 核函数代码所在模块不变。
+- [x] 从生产构造中移除 h、qkv、qkv_rope、qkv_attn、v_flat、scaled、oproj、ffpre、ff1、ff2、p_big、attn_out_long 等旧 FP32 scratch；legacy parity 用到时在 ParityScratch 分配。不得用零长 buffer 冒充仍被调用的内核输入。
+- [x] 分开运行与 parity 权重上传。保留生产需要的 norm、bias、BandSplit FP32 权重和 FP16 打包矩阵；仅 parity 使用的 QKV/输出投影/FFN/Mask FP32 矩阵不进入生产 GPU 常驻集合。
+- [x] 上传时借用 TransformerLayer，消除两轮 layer.clone；每个 mask stem 只整理/打包一次。GPU 上传与异步复制完成后释放 SafeTensors、宿主模型和临时拼接副本，明确最后一次读与释放的 stream 顺序。
+- [x] 保持 safetensors/YAML 格式不变，不新增磁盘预打包格式、服务进程或批量任务 API。分别测宿主读取、解析、转换、H2D；WSL ext4 权重与 /mnt/d 权重只作为受控 I/O 对照，不自动移动用户文件。
 
 **验收：** T=1151 生产 scratch 较 B0 下降至少 4.7GiB；显式 cuDNN/手写后端都能运行；诊断 flags 仍能取得所需旧 buffer。shape/dtype/key 校验不放宽。固定后端和相同 GEMM 算法时，纯资源重排应保持输出逐位一致；算法选择变更时适用全局数值门槛。冷启动与宿主峰值内存有分项记录，稳态延迟回退不超过 1%。
 
@@ -120,12 +120,12 @@
 
 当前源码有两个明确问题：[调优](<D:/Projects/logic-bs-roformer-rs/src/cublaslt.rs#L346>)将 A/B/C/D 全部指向同一 dummy；同时 D 始终按 M×N×4 估算，而 [dummy 分配](<D:/Projects/logic-bs-roformer-rs/src/main.rs#L5827>)为 M×3072，导致 QKV FP16 输出的调优被容量检查跳过。
 
-- [ ] 使用真实只读 W/X/C 和独立 D_scratch 计时，不修改残差或生产输出；beta=0 不读取 C。按各矩阵 dtype/stride 计算实际容量，删除错误的统一 4 字节输出估计。
-- [ ] 保留最多 8 个 heuristic 候选。每候选预热 3 次，CUDA Event 测 3 组×10 次；任何调用失败都淘汰该候选，不能因提前 break 计得更短而胜出。CUDA 执行/同步错误直接终止，不能当作普通“不支持”。
-- [ ] 缓存 operation/layout/算法，键覆盖 M/N/K、dtype、转置/stride、epilogue、beta 语义和 workspace 上限。每次正确更新 bias 指针；描述符/handle 用 RAII 释放。调优临时输出测完释放；workspace 保持 32MiB。算法缓存本轮仅驻留进程，不把 opaque Algo 跨版本写盘。
-- [ ] 只验证三个 FF1 候选：现有 handwritten；cuBLASLt FP32 输出+独立精确 erf-GELU+FP16 打包；复用现有 swizzle/ldmatrix 的 handwritten-async（Mtile=128、Ntile=64、Ktile=64、256 threads、两级 cp.async，48KiB shared tile，保持计算与舍入顺序）。不引入其他 tile 搜索或第三方 GEMM 库。
-- [ ] FF1 的额外中间输出、GELU、转换都包含在候选时间和峰值内存中。覆盖 M=16058/71362 及非整 tile 尾行；异步加载的越界行显式 zero-fill。
-- [ ] auto 默认只采用在对应 SM/shape 通过完整模型收益与数值门槛的候选；未知 SM/shape 保持 handwritten。显式选择缺失库时报错。若候选都未获益，保留原 FF1，仅交付正确调优和测量结论。
+- [x] 使用真实只读 W/X/C 和独立 D_scratch 计时，不修改残差或生产输出；beta=0 不读取 C。按各矩阵 dtype/stride 计算实际容量，删除错误的统一 4 字节输出估计。
+- [x] 保留最多 8 个 heuristic 候选。每候选预热 3 次，CUDA Event 测 3 组×10 次；任何调用失败都淘汰该候选，不能因提前 break 计得更短而胜出。CUDA 执行/同步错误直接终止，不能当作普通“不支持”。
+- [x] 缓存 operation/layout/算法，键覆盖 M/N/K、dtype、转置/stride、epilogue、beta 语义和 workspace 上限。每次正确更新 bias 指针；描述符/handle 用 RAII 释放。调优临时输出测完释放；workspace 保持 32MiB。算法缓存本轮仅驻留进程，不把 opaque Algo 跨版本写盘。
+- [x] 只验证三个 FF1 候选：现有 handwritten；cuBLASLt FP32 输出+独立精确 erf-GELU+FP16 打包；复用现有 swizzle/ldmatrix 的 handwritten-async（Mtile=128、Ntile=64、Ktile=64、256 threads、两级 cp.async，48KiB shared tile，保持计算与舍入顺序）。不引入其他 tile 搜索或第三方 GEMM 库。
+- [x] FF1 的额外中间输出、GELU、转换都包含在候选时间和峰值内存中。覆盖 M=16058/71362 及非整 tile 尾行；异步加载的越界行显式 zero-fill。
+- [x] auto 默认只采用在对应 SM/shape 通过完整模型收益与数值门槛的候选；未知 SM/shape 保持 handwritten。显式选择缺失库时报错。若候选都未获益，保留原 FF1，仅交付正确调优和测量结论。
 
 **验收：** QKV 不再因为 FP16 容量误算跳过候选；调优前后生产输入/残差不变。FF1 核函数候选至少快 10%，且完整波形至少快 1%、5 组中至少 4 组同向，才进入默认组合；短块不得回退 >1%。本任务不采用 tanh-GELU 近似。FF1 即使两倍提速，按原占比整模型上限收益约 8.8%，报告不得混淆局部与整体。
 
@@ -133,10 +133,10 @@
 
 **依赖：** 任务 4。**修改：** transformer_step、rope_k16/rope_q16_inplace/sdpa_gate 周边核函数。
 
-- [ ] 新增 rope_qk16：一条线程处理同一 token/head 的 Q/K f16x2，共享位置/cos/sin 读取；Q 原地写回 qkv16，K 写入 k16r。保留当前旋转后的 FP16 舍入边界；scale=0.125 仍只由 cuDNN 应用。
-- [ ] 保留 split 模式供 A/B；手写路径继续使用其原有 Q RoPE 语义，禁止给手写内核传已经旋转的 Q。
-- [ ] sdpa_gate 按每 warp 对应一个 head 的现有布局，由一个 lane 计算 sigmoid 再广播；保留独立输出 pass 和原始 gates buffer 语义，避免破坏 parity/手写路径。若广播无净收益，保留原 gate 实现。
-- [ ] 本轮不新增轴连续 pack 缓冲，也不改写 cuDNN attention epilogue；这些属于后述独立实验。现有 RMSNorm+gate 线性投影已融合，不重复实现。
+- [x] 新增 rope_qk16：一条线程处理同一 token/head 的 Q/K f16x2，共享位置/cos/sin 读取；Q 原地写回 qkv16，K 写入 k16r。保留当前旋转后的 FP16 舍入边界；scale=0.125 仍只由 cuDNN 应用。
+- [x] 保留 split 模式供 A/B；手写路径继续使用其原有 Q RoPE 语义，禁止给手写内核传已经旋转的 Q。
+- [x] sdpa_gate 按每 warp 对应一个 head 的现有布局，由一个 lane 计算 sigmoid 再广播；保留独立输出 pass 和原始 gates buffer 语义，避免破坏 parity/手写路径。若广播无净收益，保留原 gate 实现。
+- [x] 本轮不新增轴连续 pack 缓冲，也不改写 cuDNN attention epilogue；这些属于后述独立实验。现有 RMSNorm+gate 线性投影已融合，不重复实现。
 
 **验收：** Q/K 单独比较通过现有 RoPE parity，全模型通过数值门槛；覆盖 axis=0/1、T=1/37/62/63/64/65/259/1151 的内核边界和尾线程。合并后的周边处理至少快 10%、完整波形至少快 1% 才切默认；否则保留 split。结果必须包含 Q/K/gate 整段成本。
 
@@ -150,9 +150,9 @@
 - glu 使用 [stem][band][T][d_b]，地址为 stem×T×D_total + T×offset[b] + t×d_b + d。
 - pre2_all 长度为 6×T×8200 个 f32；glu_all 为 6×T×4100 个 f32。权重布局不变，消费者按同一 offset 计算。
 
-- [ ] 首先只改 compact 写入/读取和分配，保留每 stem 的已有 launch 顺序，核对全部 band/stem/channel/frequency 的映射。
-- [ ] 再加入静态 mask2 tile 表 (band,col_tile)：按 band 升序、有效 ceil(2d_b/64) 列 tile 枚举，复用于六个 stem，减少无效 CTA；如果表寻址造成 >1% 整体回退，则保留原 grid，只保留紧凑布局。
-- [ ] GLU 的两半读取位置和 complex mask 的频点/声道顺序不变。后续融合 GLU+mask_apply 的实现不包含在本轮，先完成紧凑布局的确定性收益。
+- [x] 首先只改 compact 写入/读取和分配，保留每 stem 的已有 launch 顺序，核对全部 band/stem/channel/frequency 的映射。
+- [x] 再加入静态 mask2 tile 表 (band,col_tile)：按 band 升序、有效 ceil(2d_b/64) 列 tile 枚举，复用于六个 stem，减少无效 CTA；如果表寻址造成 >1% 整体回退，则保留原 grid，只保留紧凑布局。
+- [x] GLU 的两半读取位置和 complex mask 的频点/声道顺序不变。后续融合 GLU+mask_apply 的实现不包含在本轮，先完成紧凑布局的确定性收益。
 
 **验收：** 两个缓冲区合计减少至少 2.0GiB（理论约 2.15GiB）；每个 band 的 GLU 输出和最终谱图与原布局一致。专测最窄 d=8、最宽 d=516、非整 64 列 tile、T=259/1151、最后 band 和最后 stem。旧 padded 槽位不能再被读，所有有效槽位都有唯一写者；完整块与短块回退不超过 1%。
 
@@ -160,11 +160,11 @@
 
 **依赖：** 任务 1–6。
 
-- [ ] 对“原 B0、仅资源清理、逐项接受候选、最终组合”保存分层对照，避免多个优化互相掩盖回退。主设备 3080 做配对矩阵；WSL 4060 Ti 做同输入回归和代表性完整块测量。
-- [ ] 更新 CI：沿用 self-test 与既有 golden 检查，补充完整波形基准、每 stem 数值门槛、尾块覆盖、backend failure/cache 键及 compact mask 测试。缺少权重时只允许明确标记资源型测试 skipped，最终性能验收必须在资源齐备的远程完成。
-- [ ] 使用既有 Windows 原生构建入口做兼容性 build/self-test/短 golden smoke，保留 D 盘工具链路径；本轮不改 vendor 编译器、toolchain pin 或无关 Windows 代码。
-- [ ] 对最终组合做一次 Nsight Systems，只有新的热点或回退需要解释时再做定点 NCU。NCU 若改变时钟或导致库回退，只作为单核诊断，不进入延迟排名。
-- [ ] 更新基准文档，记录同口径 B0、新延迟/MFU/内存/冷启动、实际后端和数值误差、未获益候选及原因；保留复现命令和源码/模型哈希。关闭本任务启动的遥测及 profiler 进程，收集全部结果后交付。
+- [x] 对“原 B0、仅资源清理、逐项接受候选、最终组合”保存分层对照，避免多个优化互相掩盖回退。主设备 3080 做配对矩阵；WSL 4060 Ti 做同输入回归和代表性完整块测量。
+- [x] 更新 CI：沿用 self-test 与既有 golden 检查，补充完整波形基准、每 stem 数值门槛、尾块覆盖、backend failure/cache 键及 compact mask 测试。缺少权重时只允许明确标记资源型测试 skipped，最终性能验收必须在资源齐备的远程完成。
+- [x] 使用既有 Windows 原生构建入口做兼容性 build/self-test/短 golden smoke，保留 D 盘工具链路径；本轮不改 vendor 编译器、toolchain pin 或无关 Windows 代码。
+- [x] 对最终组合做一次 Nsight Systems，只有新的热点或回退需要解释时再做定点 NCU。NCU 若改变时钟或导致库回退，只作为单核诊断，不进入延迟排名。
+- [x] 更新基准文档，记录同口径 B0、新延迟/MFU/内存/冷启动、实际后端和数值误差、未获益候选及原因；保留复现命令和源码/模型哈希。关闭本任务启动的遥测及 profiler 进程，收集全部结果后交付。
 
 ### 统一数值门槛
 
