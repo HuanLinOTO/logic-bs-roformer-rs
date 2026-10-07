@@ -17,6 +17,7 @@ pub struct Cufft {
     exec_r2c: unsafe extern "C" fn(c_int, *mut c_void, *mut c_void) -> c_int,
     exec_c2r: unsafe extern "C" fn(c_int, *mut c_void, *mut c_void) -> c_int,
     destroy: unsafe extern "C" fn(c_int) -> c_int,
+    set_stream: unsafe extern "C" fn(c_int, *mut c_void) -> c_int,
 }
 
 const CUFFT_R2C: c_int = 0x2A;
@@ -106,7 +107,8 @@ impl Cufft {
             let exec_r2c = *lib.get(b"cufftExecR2C").expect("cufftExecR2C symbol");
             let exec_c2r = *lib.get(b"cufftExecC2R").expect("cufftExecC2R symbol");
             let destroy = *lib.get(b"cufftDestroy").expect("cufftDestroy symbol");
-            Cufft { _lib: lib, plan_many, exec_r2c, exec_c2r, destroy }
+            let set_stream = *lib.get(b"cufftSetStream").expect("cufftSetStream symbol");
+            Cufft { _lib: lib, plan_many, exec_r2c, exec_c2r, destroy, set_stream }
         }
     }
 
@@ -149,6 +151,13 @@ pub struct CufftPlan<'a> {
 }
 
 impl CufftPlan<'_> {
+    /// Bind all executions to the inference stream, including CUDA Event timing.
+    pub fn set_stream(&self, stream: &cuda_core::CudaStream) -> Result<(), String> {
+        let rc = unsafe { (self.cufft.set_stream)(self.handle, stream.cu_stream().cast()) };
+        if rc != 0 { return Err(format!("cufftSetStream: {}", result_str(rc))); }
+        Ok(())
+    }
+
     /// R2C: input `n * batch` reals, output `(n/2+1) * batch` complex
     /// (interleaved f32 pairs).
     pub fn exec_r2c(&self, input: CUdeviceptr, output: CUdeviceptr) -> Result<(), String> {

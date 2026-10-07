@@ -8,8 +8,9 @@ use cuda_core::{CudaContext, DeviceBuffer, Stream};
 use std::sync::Arc;
 
 pub struct Stft {
-    _fft: Arc<Cufft>,
+    // Drop the plan before its owning library (fields drop in declaration order).
     fwd: CufftPlan<'static>,
+    _fft: Arc<Cufft>,
     window: Vec<f32>,
 }
 
@@ -42,6 +43,10 @@ impl Stft {
             stat.plan(N_FFT, 2 * frames, true)?
         };
         Ok(Stft { _fft: fft, fwd, window: hann_window(N_FFT) })
+    }
+
+    pub fn set_stream(&self, stream: &cuda_core::CudaStream) -> Result<(), String> {
+        self.fwd.set_stream(stream)
     }
 
     pub fn window(&self) -> &[f32] {

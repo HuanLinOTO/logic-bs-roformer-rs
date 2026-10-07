@@ -6,6 +6,7 @@
 //!   lbrr --print-config       # parse and dump the model YAML
 
 mod audio;
+mod benchmark;
 mod config;
 mod cublas;
 mod cublaslt;
@@ -46,6 +47,7 @@ struct Args {
     dualbench: bool,
     iters: usize,
     stems: Option<usize>,
+    benchmark: benchmark::Options,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -78,7 +80,12 @@ fn parse_args() -> Result<Args, String> {
             "--reorder-test" => args.reorder_test = true,
             "--bench" => args.bench = true,
             "--dualbench" => args.dualbench = true,
-            "--iters" => args.iters = need("--iters")?.parse().map_err(|_| "bad --iters")?,
+            "--iters" => { args.iters = need("--iters")?.parse().map_err(|_| "bad --iters")?; if args.iters == 0 { return Err("--iters must be positive".into()); } },
+            "--bench-ref" => args.benchmark.reference = Some(need("--bench-ref")?.into()),
+            "--bench-stage" => args.benchmark.stage = benchmark::Stage::parse(&need("--bench-stage")?)?,
+            "--warmup" => args.benchmark.warmup = need("--warmup")?.parse().map_err(|_| "bad --warmup")?,
+            "--bench-json" => args.benchmark.json = Some(need("--bench-json")?.into()),
+            "--bench-output" => args.benchmark.output = Some(need("--bench-output")?.into()),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -139,7 +146,7 @@ fn main() {
     }
 
     if args.bench || args.dualbench {
-        bench_warm(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), args.iters, args.dualbench);
+        bench_warm(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), args.iters, args.dualbench, &args.benchmark);
         return;
     }
 
@@ -4679,6 +4686,25 @@ mod gpu_kernels {
         }
     }
 
+    /// Complete single-block ISTFT. Each launch overwrites every waveform sample.
+    #[kernel]
+    pub fn istft_ola(pcm: &[f32], win: &[f32], inv: &[f32], mut out: DisjointSlice<f32>, len: u32, frames: u32) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        let l = len as usize;
+        if i >= 12 * l { return; }
+        let sc = i / l;
+        let pos = i % l + 1024;
+        let first = (pos.saturating_sub(2047) + 511) / 512;
+        let last = (pos / 512).min(frames as usize - 1);
+        let mut sum = 0.0f32;
+        for t in first..last+1 {
+            let n = pos - t*512;
+            sum += pcm[(sc*frames as usize+t)*2048+n] * win[n];
+        }
+        if let Some(dst) = out.get_mut(idx) { *dst = sum * ((1.0/2048.0) * inv[pos]); }
+    }
+
     /// Full-song demix overlap-add, gather form (no atomics). One thread per
     /// demix output sample j of the current chunk. The thread re-gathers the
     /// <=4 ISTFT frames covering padded position pos = j + n_fft/2, weights
@@ -6151,6 +6177,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path) {
     // 1. STFT
     let fft = std::sync::Arc::new(cufft::Cufft::load().expect("cufft"));
     let sp = stft::Stft::new(fft.clone(), t_frames).expect("stft plan");
+    sp.set_stream(&stream).expect("stft stream");
     let win_dev = DeviceBuffer::from_host(&stream, sp.window()).unwrap();
     let mut frames_dev = DeviceBuffer::<f32>::zeroed(&stream, 2 * t_frames * stft::N_FFT).unwrap();
     // SAFETY: one thread per frame element.
@@ -6959,170 +6986,186 @@ k16r: DeviceBuffer::<u32>::zeroed(st, m * 256).unwrap(),
     }
 }
 
-fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bool) {
-    let iters = iters.max(1);
-    let golden = npz::Npz::open(&model_dir.join("ref_output.npz")).unwrap_or_else(|e| panic!("{e}"));
+fn bench_memory(gw: &GpuWeights, b: &BenchBufs, extra: usize) -> serde_json::Value {
+    let weights = gw.qkv_w.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.qkv_w_h.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.out_w_h.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.ff_w1_h.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.ff_w2_h.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.gates_w.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.gates_b.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.out_w.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.norm_gamma.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.ff_gamma.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.ff_w1.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.ff_b1.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.ff_b1_h.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.ff_w2.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.ff_b2.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.shared_qkv_bias.len()*4 +
+        gw.shared_qkv_bias_h.len()*4 +
+        gw.shared_out_bias.len()*4 +
+        gw.final_norm.len()*4 +
+        gw.band_gamma.len()*4 +
+        gw.band_w.len()*4 +
+        gw.band_b.len()*4 +
+        gw.mask_w1.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.mask_b1.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.mask_w2.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.mask_b2.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.mask_w1_h.iter().map(|b|b.len()*4).sum::<usize>() +
+        gw.mask_w2_h.iter().map(|b|b.len()*4).sum::<usize>();
+    let scratch = extra + b.x_dev.len()*4 +
+        b.win_dev.len()*4 +
+        b.frames_dev.len()*4 +
+        b.spec_dev.len()*4 +
+        b.xin_dev.len()*4 +
+        b.bsnorm.len()*4 +
+        b.x.len()*4 +
+        b.x_final.len()*4 +
+        b.xb.len()*4 +
+        b.xb16.len()*4 +
+        b.glu_all.len()*4 +
+        b.hidden_t.len()*4 +
+        b.pre2_all.len()*4 +
+        b.c2r_in.len()*4 +
+        b.pcm.len()*4 +
+        b.offs_dev.len()*4 +
+        b.dims_dev.len()*4 +
+        b.f0_dev.len()*4 + b.scr.h.len()*4 +
+        b.scr.h16.len()*4 +
+        b.scr.qkv.len()*4 +
+        b.scr.qkv16.len()*4 +
+        b.scr.k16r.len()*4 +
+        b.scr.qkv_rope.len()*4 +
+        b.scr.qkv_attn.len()*4 +
+        b.scr.v_flat.len()*4 +
+        b.scr.gates.len()*4 +
+        b.scr.scaled.len()*4 +
+        b.scr.scaled16.len()*4 +
+        b.scr.oproj.len()*4 +
+        b.scr.attn_out.len()*4 +
+        b.scr.ffpre.len()*4 +
+        b.scr.ff1.len()*4 +
+        b.scr.ff1_16.len()*4 +
+        b.scr.ff2.len()*4 +
+        b.scr.p_big.len()*4 +
+        b.scr.attn_out_long.len()*4 +
+        b.scr.zero_bias_t.len()*4 +
+        b.scr.zero_bias_64.len()*4 +
+        b.scr.attn_max.len()*4 +
+        b.scr.attn_scale.len()*4 + b.scr.cos.iter().chain(b.scr.sin.iter()).map(|v|v.len()*4).sum::<usize>();
+    let workspace = b.scr.lt_ws.as_ref().map_or(0,|v|v.len());
+    let tuning = b.scr.lt_dummy.as_ref().map_or(0,|v|v.len());
+    serde_json::json!({"weights":weights,"scratch":scratch,"workspace":workspace,"tuning_temporary":tuning,"tracked_resident":weights+scratch+workspace+tuning,"tracked_peak":weights+scratch+workspace+tuning,"external_peak":null,"accounting":"explicit device allocations; driver/library internal memory is recorded by external telemetry"})
+}
+
+fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bool, options: &benchmark::Options) {
+    use serde_json::json;
+    use std::time::Instant;
+    let wall = Instant::now();
+    let reference = options.reference.clone().unwrap_or_else(||model_dir.join("ref_output.npz"));
+    let golden = npz::Npz::open(&reference).unwrap_or_else(|e|panic!("{e}"));
     let inp = golden.f32("inp").expect("inp");
     let ref_out = golden.f32("out").expect("out");
+    let len = inp.len()/2;
+    assert!(len > stft::N_FFT/2 && inp.len() == 2*len, "single-block input must be nonempty stereo with L > n_fft/2");
+    assert!(golden.shapes["inp"] == [1,2,len] || golden.shapes["inp"] == [2,len], "inp shape must be [1,2,L] or [2,L]");
+    assert!(golden.shapes["out"] == [1,6,2,len] || golden.shapes["out"] == [6,2,len], "out shape must be [1,6,2,L] or [6,2,L]");
+    assert!(inp.iter().chain(ref_out).all(|v|v.is_finite()), "fixture contains nonfinite values");
     let cfg = config::ModelConfig::parse(&std::fs::read_to_string(model_dir.join("logic_bs_roformer.yaml")).unwrap()).unwrap();
-    let t_frames = stft::num_frames(inp.len() / 2);
-    let bands = cfg.num_bands();
-    let m = t_frames * bands;
-    let len = inp.len() / 2;
-    println!("bench: L={len} T={t_frames} bands={bands} M={m} iters={iters}");
-
+    let t_frames = stft::num_frames(len); let bands = cfg.num_bands(); let m=t_frames*bands;
+    println!("bench: L={len} T={t_frames} bands={bands} M={m} iters={iters} pipeline={}",options.stage.name());
+    let init = Instant::now();
     let ctx = CudaContext::new(device).expect("ctx");
-    let stream = ctx.default_stream();
-    let km = gpu_kernels::load(&ctx).expect("kernels");
-
-    let setup_t0 = std::time::Instant::now();
-    let st = weights::SafeTensors::open(&model_dir.join("model.safetensors")).unwrap();
-    let w = weights::ModelWeights::load(&st, &cfg).unwrap();
-    let gw = upload_weights(&ctx, &stream, &w).expect("weights upload");
-    println!("weights load+upload: {:?}", setup_t0.elapsed());
-
-    // input interleaved
-    let mut xi = vec![0.0f32; len * 2];
-    for i in 0..len {
-        xi[i * 2] = inp[i];
-        xi[i * 2 + 1] = inp[len + i];
-    }
-    let fft = std::sync::Arc::new(cufft::Cufft::load().expect("cufft"));
-    let sp = stft::Stft::new(fft.clone(), t_frames).expect("stft plan");
-    // One reusable C2R plan for all 12 stem/channel planes (same shape).
-    let c2r_plan = {
-        let r: &cufft::Cufft = &fft;
-        // SAFETY: the Arc<Cufft> outlives the plan in this scope.
-        unsafe {
-            let s: &'static cufft::Cufft = std::mem::transmute(r);
-            s.plan(2048, t_frames, false).expect("c2r plan")
-        }
+    let stream=ctx.default_stream(); let km=gpu_kernels::load(&ctx).expect("kernels");
+    let context_ms=init.elapsed().as_secs_f64()*1000.0;
+    let load=Instant::now(); let st=weights::SafeTensors::open(&model_dir.join("model.safetensors")).unwrap();
+    let read_ms=load.elapsed().as_secs_f64()*1000.0;
+    let parse=Instant::now(); let w=weights::ModelWeights::load(&st,&cfg).unwrap();
+    let parse_ms=parse.elapsed().as_secs_f64()*1000.0;
+    let upload=Instant::now(); let gw=upload_weights(&ctx,&stream,&w).expect("weights upload");
+    stream.synchronize().expect("upload sync");
+    let upload_ms=upload.elapsed().as_secs_f64()*1000.0;
+    let mut xi=vec![0.0f32;2*len]; for i in 0..len { xi[2*i]=inp[i];xi[2*i+1]=inp[len+i]; }
+    let plan_start=Instant::now();
+    let fft=Arc::new(cufft::Cufft::load().expect("cufft"));
+    let sp=stft::Stft::new(fft.clone(),t_frames).expect("stft plan");
+    let c2r=fft.plan(2048,t_frames,false).expect("c2r plan");
+    sp.set_stream(&stream).expect("stft stream"); c2r.set_stream(&stream).expect("c2r stream");
+    let fft_plan_ms=plan_start.elapsed().as_secs_f64()*1000.0;
+    let dims:Vec<u32>=cfg.freqs_per_bands.iter().map(|f|(4*f)as u32).collect();
+    let mut offs=vec![0u32;bands+1];let mut f0=vec![0u32;bands];
+    for i in 0..bands { offs[i+1]=offs[i]+dims[i]; f0[i]=offs[i]/4; }
+    let table=|n:usize,sine:bool|->Vec<f32>{(0..n).flat_map(|p|(0..32).map(move|i|{let a=(p as f64*(1.0/10000.0f64.powf(2.0*i as f64/64.0)))as f32;if sine {a.sin()} else {a.cos()}})).collect()};
+    let (cos_t,sin_t,cos_f,sin_f)=(table(t_frames,false),table(t_frames,true),table(bands,false),table(bands,true));
+    let allocation=Instant::now();
+    let mut bufs=make_bench_bufs(&stream,&xi,sp.window(),&cos_t,&sin_t,&cos_f,&sin_f,&offs,&dims,&f0,m,t_frames,bands);
+    let inverse=benchmark::istft_inverse(sp.window(),len,t_frames);
+    assert!(inverse[1024..1024+len].iter().all(|x|*x>0.0),"ISTFT has uncovered samples");
+    let inv_dev=DeviceBuffer::from_host(&stream,&inverse).unwrap();
+    let mut waveform=DeviceBuffer::<f32>::zeroed(&stream,12*len).unwrap();
+    stream.synchronize().expect("allocation/H2D sync");
+    let allocation_ms=allocation.elapsed().as_secs_f64()*1000.0;
+    let forward=|b:&mut BenchBufs,y:&mut DeviceBuffer<f32>| {
+        unsafe { bench_forward(&km,&ctx,&stream,&gw,&sp,&c2r,b,len,t_frames,bands,None).expect("forward"); }
+        if options.stage==benchmark::Stage::Waveform { unsafe { km.istft_ola(&stream,LaunchConfig::for_num_elems((12*len)as u32),&b.pcm,&b.win_dev,&inv_dev,y,len as u32,t_frames as u32).expect("istft OLA"); } }
     };
-
-    // band tables
-    let freqs: Vec<usize> = cfg.freqs_per_bands.clone();
-    let dims: Vec<u32> = freqs.iter().map(|f| (2 * f * 2) as u32).collect();
-    let mut offs = vec![0u32; bands + 1];
-    let mut f0 = vec![0u32; bands];
-    for i in 0..bands {
-        offs[i + 1] = offs[i] + dims[i];
-        f0[i] = freqs[..i].iter().sum::<usize>() as u32;
-    }
-    let offs_dev = DeviceBuffer::from_host(&stream, &offs).unwrap();
-    let dims_dev = DeviceBuffer::from_host(&stream, &dims).unwrap();
-    let f0_dev = DeviceBuffer::from_host(&stream, &f0).unwrap();
-
-    // rotary tables
-    let cos_t: Vec<f32> = (0..t_frames).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).cos())).collect();
-    let sin_t: Vec<f32> = (0..t_frames).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).sin())).collect();
-    let cos_f: Vec<f32> = (0..bands).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).cos())).collect();
-    let sin_f: Vec<f32> = (0..bands).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).sin())).collect();
-
-    let alloc_t0 = std::time::Instant::now();
-    let mut bufs = make_bench_bufs(&stream, &xi, sp.window(), &cos_t, &sin_t, &cos_f, &sin_f, &offs, &dims, &f0, m, t_frames, bands);
-    println!("scratch alloc: {:?}", alloc_t0.elapsed());
-
-    // warmup
-    for _ in 0..3 {
-        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands, None).expect("forward"); }
-    }
+    // Resolve lazy plans/algorithms separately even when the requested warmup is zero.
+    let prepare=Instant::now();forward(&mut bufs,&mut waveform);stream.synchronize().expect("prepare sync");
+    let prepare_ms=prepare.elapsed().as_secs_f64()*1000.0;
+    for _ in 0..options.warmup { forward(&mut bufs,&mut waveform); }
     stream.synchronize().expect("warmup sync");
-
-    // timed aggregate loop: single sync around all iters (same as bench_ref.py)
-    let t0 = std::time::Instant::now();
-    for _ in 0..iters {
-        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands, None).expect("forward"); }
-    }
+    let events:Vec<_>=(0..iters).map(|_|(ctx.new_event(Some(0)).unwrap(),ctx.new_event(Some(0)).unwrap())).collect();
+    let begin=Instant::now();
+    for (a,b) in &events { a.record(&stream).unwrap();forward(&mut bufs,&mut waveform);b.record(&stream).unwrap(); }
     stream.synchronize().expect("timed sync");
-    let agg = t0.elapsed().as_secs_f64() / iters as f64;
-    println!("BENCH warm aggregate: {:.3} ms/iter over {iters} iters, RTF {:.4}", agg * 1000.0, agg / 3.0);
-
-    // per-iter breakdown with sync (shows variance; upper bound per chunk)
-    let mut per = Vec::with_capacity(iters);
-    for _ in 0..iters {
-        stream.synchronize().expect("sync");
-        let i0 = std::time::Instant::now();
-        unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands, None).expect("forward"); }
-        stream.synchronize().expect("sync");
-        per.push(i0.elapsed().as_secs_f64() * 1000.0);
+    let host_ms=begin.elapsed().as_secs_f64()*1000.0;
+    let gpu_ms:Vec<f64>=events.iter().map(|(a,b)|a.elapsed_ms(b).unwrap()as f64).collect();
+    let avg=host_ms/iters as f64;
+    println!("BENCH warm aggregate: {avg:.3} ms/iter over {iters} iters, RTF {:.4}",avg/(len as f64/cfg.sample_rate as f64*1000.0));
+    println!("BENCH CUDA Event: median {:.3} ms, mean {:.3} ms",benchmark::median(&gpu_ms),gpu_ms.iter().sum::<f64>()/iters as f64);
+    let d2h=Instant::now();
+    let frames=bufs.pcm.to_host_vec(&stream).unwrap();
+    let host=benchmark::host_ola(&frames,sp.window(),len,t_frames);
+    let output=if options.stage==benchmark::Stage::Waveform { waveform.to_host_vec(&stream).unwrap() } else { host.clone() };
+    let download_check_ms=d2h.elapsed().as_secs_f64()*1000.0;
+    let ola=benchmark::metric(&output,&host);
+    assert!(ola.finite && ola.max_abs_error<=1e-6,"GPU OLA differs from host: {ola:?}");
+    let correct=benchmark::correctness(&output,ref_out,len);
+    assert!(correct["finite"].as_bool().unwrap(),"nonfinite inference output");
+    let total=benchmark::metric(&output,ref_out);
+    println!("BENCH final SNR vs ref_output: {:.2} dB",total.snr_db.unwrap_or(300.0));
+    if let Some(path)=&options.output {
+        let bytes:Vec<u8>=output.iter().flat_map(|x|x.to_le_bytes()).collect();
+        std::fs::write(path,bytes).expect("write benchmark waveform");
     }
-    let med = {
-        let mut v = per.clone();
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        v[v.len() / 2]
-    };
-    println!("BENCH warm per-iter (sync each): min {:.3} ms, med {med:.3} ms, max {:.3} ms", per.iter().cloned().fold(f64::INFINITY, f64::min), per.iter().cloned().fold(0.0, f64::max));
-
-    // ---- dual-stream co-scheduling probe ----
-    // Rationale: nsys GPU metrics over the demix show SM Issue 18% avg and
-    // 53% unallocated warp slots on active SMs. Two independent forwards on
-    // two streams measure how much of that idle capacity co-residency can
-    // actually reclaim before committing to a full dual-stream demix.
+    if let Some(path)=&options.json {
+        let name=ctx.device_name().unwrap();let sm=ctx.compute_capability().unwrap();
+        let report=json!({"schema_version":1,"identity":benchmark::identity(model_dir,&reference,&name,sm).expect("benchmark identity"),
+            "shape":{"batch":1,"channels":2,"stems":6,"samples":len,"T":t_frames,"bands":bands,"sample_rate":cfg.sample_rate},
+            "pipeline":options.stage.name(),
+            "backend":{"attention_time":if bufs.scr.cudnn.is_some(){"cudnn"}else{"handwritten"},"attention_freq":if bufs.scr.cudnn.is_some(){"cudnn"}else{"handwritten"},"ff1":"handwritten","qk_rope":"split","cublaslt":bufs.scr.lt.is_some()},
+            "precision":{"matrix_input":"fp16","accumulation":"fp32","residual":"fp32","tf32":false,"input_resident_gpu":true,"output_resident_gpu":options.stage==benchmark::Stage::Waveform},
+            "timing_ms":{"context_kernels":context_ms,"weights_read":read_ms,"weights_parse":parse_ms,"weights_pack_h2d":upload_ms,"fft_plan":fft_plan_ms,"allocation_input_h2d":allocation_ms,"prepare_algorithms":prepare_ms,"warmup":options.warmup,"iterations":iters,"host_total":host_ms,"host_per_iteration":avg,"cuda_event":gpu_ms,"download_and_host_ola_check":download_check_ms,"process_before_hashes":wall.elapsed().as_secs_f64()*1000.0,"rtf":avg/(len as f64/cfg.sample_rate as f64*1000.0)},
+            "memory_bytes":bench_memory(&gw,&bufs,12*len*4+inverse.len()*4),
+            "correctness":correct,"ola_vs_host":ola,"mfu":benchmark::mfu(&name,t_frames,benchmark::median(&gpu_ms))});
+        benchmark::write_json(path,&report).expect("write benchmark JSON");
+    }
     if dual {
-        let stream2 = ctx.new_stream().unwrap();
-        let sp2 = stft::Stft::new(fft.clone(), t_frames).expect("stft plan 2");
-        let c2r2 = {
-            let r: &cufft::Cufft = &fft;
-            // SAFETY: the Arc<Cufft> outlives this plan in this scope.
-            unsafe {
-                let s: &'static cufft::Cufft = std::mem::transmute(r);
-                s.plan(2048, t_frames, false).expect("c2r plan 2")
-            }
-        };
-        let alloc2 = std::time::Instant::now();
-        let mut bufs2 = make_bench_bufs(&stream2, &xi, sp.window(), &cos_t, &sin_t, &cos_f, &sin_f, &offs, &dims, &f0, m, t_frames, bands);
-        println!("scratch2 alloc: {:?}", alloc2.elapsed());
-        for _ in 0..2 {
-            unsafe { bench_forward(&km, &ctx, &stream2, &gw, &sp2, &c2r2, &mut bufs2, len, t_frames, bands, None).expect("forward2"); }
-        }
-        stream.synchronize().expect("sync");
-        stream2.synchronize().expect("sync2");
-        let pairs = (iters / 2).max(2);
-        let d0 = std::time::Instant::now();
-        for _ in 0..pairs {
-            unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands, None).expect("f1"); }
-            unsafe { bench_forward(&km, &ctx, &stream2, &gw, &sp2, &c2r2, &mut bufs2, len, t_frames, bands, None).expect("f2"); }
-        }
-        stream.synchronize().expect("sync");
-        stream2.synchronize().expect("sync2");
-        let per = d0.elapsed().as_secs_f64() / (pairs * 2) as f64;
-        println!("BENCH dual-stream aggregate: {:.3} ms/iter over {pairs} pairs, RTF {:.4}", per * 1000.0, per / 3.0);
+        let stream2=ctx.new_stream().unwrap();let sp2=stft::Stft::new(fft.clone(),t_frames).unwrap();let c2r2=fft.plan(2048,t_frames,false).unwrap();
+        sp2.set_stream(&stream2).unwrap();c2r2.set_stream(&stream2).unwrap();
+        let mut b2=make_bench_bufs(&stream2,&xi,sp2.window(),&cos_t,&sin_t,&cos_f,&sin_f,&offs,&dims,&f0,m,t_frames,bands);
+        unsafe { bench_forward(&km,&ctx,&stream2,&gw,&sp2,&c2r2,&mut b2,len,t_frames,bands,None).unwrap(); }
+        stream2.synchronize().unwrap();stream.synchronize().unwrap();
+        let start=Instant::now();let pairs=(iters/2).max(2);
+        for _ in 0..pairs { unsafe {
+            bench_forward(&km,&ctx,&stream,&gw,&sp,&c2r,&mut bufs,len,t_frames,bands,None).unwrap();
+            bench_forward(&km,&ctx,&stream2,&gw,&sp2,&c2r2,&mut b2,len,t_frames,bands,None).unwrap();
+        } }
+        stream.synchronize().unwrap();stream2.synchronize().unwrap();
+        println!("BENCH dual-stream frames: {:.3} ms/iter",start.elapsed().as_secs_f64()*1000.0/(2*pairs)as f64);
     }
-
-    // correctness spot-check on the last output (host OLA + SNR, untimed)
-    let frames_out = bufs.pcm.to_host_vec(&stream).unwrap();
-    let win = sp.window();
-    let hop = stft::HOP;
-    let padded = len + 2 * 1024;
-    let mut result = vec![0.0f32; 6 * 2 * padded];
-    let mut counter = vec![0.0f32; padded];
-    for t in 0..t_frames {
-        for n in 0..2048usize {
-            let pos = t * hop + n;
-            if pos < padded {
-                counter[pos] += win[n] * win[n];
-                for sc in 0..12usize {
-                    result[(sc / 2 * 2 + sc % 2) * padded + pos] += frames_out[(sc * t_frames + t) * 2048 + n] * win[n] * (1.0 / 2048.0);
-                }
-            }
-        }
-    }
-    let mut sig = 0.0f64;
-    let mut noise = 0.0f64;
-    for s in 0..6usize {
-        for ch in 0..2usize {
-            for i in 0..len {
-                let c = counter[1024 + i];
-                let v = if c > 1e-8 { result[(s * 2 + ch) * padded + 1024 + i] / c } else { 0.0 };
-                let r = ref_out[(s * 2 + ch) * len + i];
-                sig += (r as f64) * (r as f64);
-                let d = (v - r) as f64;
-                noise += d * d;
-            }
-        }
-    }
-    let snr = 10.0 * (sig / (noise + 1e-30)).log10();
-    println!("BENCH final SNR vs ref_output: {snr:.2} dB");
 }
 
 // ---------------------------------------------------------------------------
@@ -7132,28 +7175,15 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bo
 // ---------------------------------------------------------------------------
 
 fn reflect_pad(x: &[f32], len: usize, left: usize, right: usize) -> Vec<f32> {
-    // numpy 'reflect' on an interleaved stereo signal: mirror each channel
-    // along the time axis WITHOUT repeating the border sample. All indices
-    // here are interleaved (frame, channel) pairs, so the mirror maps a
-    // frame index while preserving the channel bit.
-    let padded = len + left + right;
-    let mut out = vec![0.0f32; padded];
-    let n = len / 2; // per-channel sample count
-    let l = left / 2;
-    let r = right / 2;
-    // left: frame i takes source frame (l - i)
-    for i in 0..l {
-        for ch in 0..2usize {
-            out[i * 2 + ch] = x[(l - i) * 2 + ch];
-        }
-    }
-    out[left..left + len].copy_from_slice(x);
-    // right: frame k past the end takes source frame (n - 2 - k)
-    for k in 0..r {
-        let src = n.saturating_sub(2 + k);
-        for ch in 0..2usize {
-            out[(left + len) + k * 2 + ch] = x[src * 2 + ch];
-        }
+    assert!(len >= 2 && len == x.len() && len % 2 == 0, "audio must contain at least one stereo sample");
+    assert!(left % 2 == 0 && right % 2 == 0);
+    let frames=len/2;
+    let period=2*frames.saturating_sub(1);
+    let mut out=Vec::with_capacity(left+len+right);
+    for i in 0..(left+len+right)/2 {
+        let p=if period==0 { 0 } else { (i as i64-(left/2)as i64).rem_euclid(period as i64)as usize };
+        let src=if p<frames { p } else { period-p };
+        out.extend_from_slice(&x[2*src..2*src+2]);
     }
     out
 }
@@ -7316,6 +7346,7 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
 
     let fft = std::sync::Arc::new(cufft::Cufft::load().expect("cufft"));
     let sp = stft::Stft::new(fft.clone(), t_frames).expect("stft plan");
+    sp.set_stream(&stream).expect("stft stream");
     let c2r_plan = {
         let r: &cufft::Cufft = &fft;
         unsafe {
@@ -7323,6 +7354,7 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
             s.plan(2048, t_frames, false).expect("c2r plan")
         }
     };
+    c2r_plan.set_stream(&stream).expect("c2r stream");
 
     let freqs: Vec<usize> = cfg.freqs_per_bands.clone();
     let dims: Vec<u32> = freqs.iter().map(|f| (2 * f * 2) as u32).collect();
@@ -7542,6 +7574,7 @@ fn forward_only(device: usize, model_dir: &std::path::Path, input: &std::path::P
             s.plan(2048, t_frames, false).expect("c2r plan")
         }
     };
+    c2r_plan.set_stream(&stream).expect("c2r stream");
     let freqs: Vec<usize> = cfg.freqs_per_bands.clone();
     let dims: Vec<u32> = freqs.iter().map(|f| (2 * f * 2) as u32).collect();
     let mut offs = vec![0u32; bands + 1];

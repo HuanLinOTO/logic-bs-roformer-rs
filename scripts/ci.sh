@@ -6,8 +6,10 @@
 # 门槛: SNR >= 60 dB（BENCH final SNR vs ref_output）
 set -euo pipefail
 
-SRC_DIR=$(cd "$(dirname "$0")/.." && pwd)
-WSL_ROOT=/root/work/lbrr
+SRC_DIR=$(realpath "${LBRR_SOURCE_DIR:-$(dirname "$0")/..}")
+WSL_ROOT="${LBRR_WSL_ROOT:-/root/work/lbrr}"
+export LBRR_SOURCE_DIR="$SRC_DIR" LBRR_WSL_ROOT="$WSL_ROOT"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/root/work/target-lbrr}"
 SNR_GATE=60
 
 echo "== [1/5] vendor overlay (cuda-oxide-codegen src/target) =="
@@ -21,7 +23,7 @@ echo "== [2/5] sync -> ext4 =="
 bash "$SRC_DIR/scripts/sync_wsl.sh"
 
 echo "== [3/5] build (release) =="
-cd "$WSL_ROOT" && cargo oxide build -- --release
+LBRR_CARGO_ACTION=build bash "$SRC_DIR/scripts/build_wsl.sh" -- --release
 
 BIN="${CARGO_TARGET_DIR:-/root/work/target-lbrr}/release/lbrr"
 
