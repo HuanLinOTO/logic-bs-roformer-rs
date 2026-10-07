@@ -1,10 +1,14 @@
 name: build-and-test
 
-# GitHub 托管 runner（ubuntu-24.04，无 GPU）：验证 fresh checkout 可编译。
-# GPU 步骤（self-test / SNR 门槛）为探测式：将来接到带 GPU 的 runner
-# 自动生效。为省配额只跑最新一次（cancel-in-progress）。
+# GitHub 托管 runner（无 GPU）：验证 fresh checkout 可编译，并产出
+# 双平台 × 双 CUDA 大版本的裸二进制与免依赖整合包（lbrr + cuBLASLt/
+# cuFFT/cuDNN/nvrtc/cudart + sdpa shim 同目录布局，仅需 NVIDIA 驱动与
+# ffmpeg）。GPU 数值门槛为探测式，接入带 GPU 的 runner 自动生效。
+# tag v* 时把全部整合包发布为 GitHub Release。
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -12,57 +16,148 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CUDNN_FRONTEND_TAG: v1.12.0
+
 jobs:
-  build-and-test:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-cuda13
+            os: ubuntu-24.04
+            cuda_pkg: cuda-toolkit-13-3
+            cuda_home: /usr/local/cuda-13.3
+            cuda_major: "13"
+            cudnn_wheel: nvidia-cudnn-cu13
+            bundle: lbrr-linux-x64-cu13
+          - name: linux-cuda12
+            os: ubuntu-24.04
+            cuda_pkg: cuda-toolkit-12-4
+            cuda_home: /usr/local/cuda-12.4
+            cuda_major: "12"
+            cudnn_wheel: nvidia-cudnn-cu12
+            bundle: lbrr-linux-x64-cu12
+          - name: windows-cuda13
+            os: windows-latest
+            cuda: "13.2.0"
+            cuda_major: "13"
+            cudnn_wheel: nvidia-cudnn-cu13
+            bundle: lbrr-win-x64-cu13
+          - name: windows-cuda12
+            os: windows-latest
+            cuda: "12.4.0"
+            cuda_major: "12"
+            cudnn_wheel: nvidia-cudnn-cu12
+            bundle: lbrr-win-x64-cu12
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     env:
-      CUDA_HOME: /usr/local/cuda-13.3
-      # bootstrap (rustc-codegen-cuda, dev profile) 去掉 debuginfo：11G -> ~4G
-      CARGO_PROFILE_DEV_DEBUG: "0"
+      CUDA_HOME: ${{ matrix.cuda_home }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      # ---------- Linux toolchain ----------
       - name: Free disk space (drop preinstalled toolchains)
+        if: runner.os == 'Linux'
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
           sudo apt-get clean
           df -h /
 
       - name: Vendor overlay (cuda-oxide-codegen src/target)
+        if: runner.os == 'Linux'
         run: |
           mkdir -p vendor/cuda-rust/cuda-oxide/crates/cuda-oxide-codegen/src
           cp -r vendor-overlay/cuda-oxide-codegen/src/target \
                 vendor/cuda-rust/cuda-oxide/crates/cuda-oxide-codegen/src/
 
-      - name: Install CUDA 13.3 toolkit (network repo)
+      - name: Install CUDA toolkit (network repo)
+        if: runner.os == 'Linux'
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cuda-toolkit-13-3 > /dev/null
-          "$CUDA_HOME/bin/nvcc" --version | tail -2
+          sudo apt-get install -y -qq ${{ matrix.cuda_pkg }} > /dev/null
+          "${CUDA_HOME}/bin/nvcc" --version | tail -2
 
       - name: Install libclang (bindgen)
+        if: runner.os == 'Linux'
         run: sudo apt-get install -y -qq libclang-dev > /dev/null
 
+      # ---------- Windows toolchain ----------
+      - name: Configure MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install CUDA toolkit
+        if: runner.os == 'Windows'
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: local
+
+      - name: Configure Windows CUDA and libclang paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cudaPath = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDA_HOME=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CUDA_TOOLKIT_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LIB=$cudaPath\lib\x64;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INCLUDE=$cudaPath\include;$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          if (Test-Path "$cudaPath\bin\x64") {
+            "$cudaPath\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          if (Test-Path $llvmBin) {
+            "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
+            $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+
+      - name: Install libffi (cuda-bindings link)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: vendor/cuda-rust/.github/scripts/install-libffi.ps1
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+
+      # ---------- Build ----------
       - name: Build (cargo oxide, release)
+        if: runner.os == 'Linux'
         run: |
           export PATH="$HOME/.cargo/bin:${CUDA_HOME}/bin:${PATH}"
           export LIBCLANG_PATH=/usr/lib/llvm-18/lib
           cargo oxide build -- --release
 
+      - name: Build (cargo oxide, release)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup show active-toolchain
+          cargo oxide build -- --release
+
       - name: Upload lbrr binary
         uses: actions/upload-artifact@v4
         with:
-          name: lbrr-linux-x64
-          path: target/release/lbrr
+          name: bin-${{ matrix.bundle }}
+          path: target/release/lbrr*
           if-no-files-found: error
           retention-days: 14
 
+      # ---------- GPU validation (probe; hosted runners have no GPU) ----------
       - name: GPU self-test & golden SNR gate (GPU runners only)
+        if: runner.os == 'Linux'
         run: |
           if [ ! -e /dev/nvidia0 ]; then
             echo 'no GPU on this runner — skipping GPU validation'
@@ -83,62 +178,103 @@ jobs:
           else
             echo "SKIP: model assets absent; waveform numerical gate needs /opt/lbrr-assets"
           fi
-  build-windows:
-    name: windows-latest MSVC no-GPU canary
-    runs-on: windows-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Configure MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+      # ---------- Portable bundle ----------
+      - name: Fetch cuDNN wheel and cudnn-frontend headers
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p third_party/dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pip download "${{ matrix.cudnn_wheel }}" --no-deps --platform win_amd64 --only-binary=:all: -d third_party/wheel
+          else
+            pip download "${{ matrix.cudnn_wheel }}" --no-deps --only-binary=:all: -d third_party/wheel
+          fi
+          python -m zipfile -e third_party/wheel/*.whl third_party/cudnn/
+          git clone --depth 1 --branch "${CUDNN_FRONTEND_TAG}" https://github.com/NVIDIA/cudnn-frontend.git third_party/cudnn-frontend
 
-      - name: Install CUDA toolkit
-        id: cuda-toolkit
-        uses: Jimver/cuda-toolkit@v0.2.35
-        with:
-          cuda: "13.2.0"
-          method: local
+      - name: Stage cudnn-frontend headers with lbrr shim patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # cudnn_frontend_utils.h 引号 include 同目录 shim 头，MSVC 引号
+          # 搜索先于 -I；staging 目录必须名为 include（官方头 ../include/ 自引用）。
+          mkdir -p third_party/cfe-stage/include
+          cp -r third_party/cudnn-frontend/include/* third_party/cfe-stage/include/
+          cp tools/cfe-win-override/cudnn_frontend_shim.h third_party/cfe-stage/include/
 
-      - name: Configure Windows CUDA and libclang paths
+      - name: Build sdpa shim (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          g++ -shared -fPIC -O2 -std=c++17 -DNV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING=1 -Ithird_party/cfe-stage/include -Ithird_party/cudnn/nvidia/cudnn/include -I"${CUDA_HOME}/include" tools/cudnn_sdpa_wrap.cpp -o third_party/dist/libcudnn_sdpa_wrap.so
+
+      - name: Build sdpa shim (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $cudaPath = "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
-          "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "CUDA_HOME=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "CUDA_TOOLKIT_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "LIB=$cudaPath\lib\x64;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "INCLUDE=$cudaPath\include;$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-          if (Test-Path "$cudaPath\bin\x64") {
-            "$cudaPath\bin\x64" | Out-File -FilePath $env:GITHUB_PATH -Append
-          }
-          $llvmBin = "C:\Program Files\LLVM\bin"
-          if (Test-Path $llvmBin) {
-            "LIBCLANG_PATH=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
-            $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Append
-          }
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path third_party/dist | Out-Null
+          $cudnnInc = "third_party/cudnn/nvidia/cudnn/include"
+          cl /LD /O2 /EHsc /std:c++17 /utf-8 /DWIN32_LEAN_AND_MEAN /DNV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING=1 -Ithird_party/cfe-stage/include -I$cudnnInc -I"$env:CUDA_PATH/include" tools/cudnn_sdpa_wrap.cpp /Fe:third_party/dist/cudnn_sdpa_wrap.dll
+          if ($LASTEXITCODE -ne 0) { throw "shim compile failed" }
 
-      - name: Install libffi (cuda-bindings link)
-        shell: pwsh
-        run: vendor/cuda-rust/.github/scripts/install-libffi.ps1
-        env:
-          VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      - name: Assemble portable bundle (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          dist=third_party/dist
+          cp target/release/lbrr $dist/
+          cp -L "${CUDA_HOME}/lib64/libcublas.so."* $dist/ 2>/dev/null || true
+          cp -L "${CUDA_HOME}/lib64/libcublasLt.so."* $dist/
+          cp -L "${CUDA_HOME}/lib64/libcufft.so."* $dist/
+          cp -L "${CUDA_HOME}/lib64/libnvrtc.so."* $dist/
+          cp -L "${CUDA_HOME}/lib64/libnvrtc-builtins.so."* $dist/ 2>/dev/null || true
+          cp -L "${CUDA_HOME}/lib64/libcudart.so."* $dist/
+          cp -L third_party/cudnn/nvidia/cudnn/lib/*.so* $dist/
+          printf 'lbrr portable bundle (Linux x86-64, CUDA ${{ matrix.cuda_major }})\nRequirements: NVIDIA driver; ffmpeg on PATH for non-wav input.\nUsage: ./lbrr --input song.mp3 --outdir out --model-dir <model dir>\nEvery runtime library lives next to the executable; no CUDA toolkit install is needed. Model weights are not bundled.\n' > $dist/README.txt
+          tar -C third_party/dist -czf "${{ matrix.bundle }}.tar.gz" .
+          ls -lh "${{ matrix.bundle }}.tar.gz"
 
-      - name: Build (cargo oxide, release)
+      - name: Assemble portable bundle (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          rustup show active-toolchain
-          cargo oxide build -- --release
+          $ErrorActionPreference = 'Stop'
+          $dist = 'third_party/dist'
+          Copy-Item target/release/lbrr.exe $dist/
+          $bin = "$env:CUDA_PATH/bin"
+          if (Test-Path "$bin/x64") { $bin = "$bin/x64" }
+          foreach ($pat in 'cublas*.dll','cudart64_*.dll','cufft64_*.dll','nvrtc*.dll') {
+            Get-ChildItem "$bin/$pat" -ErrorAction SilentlyContinue | Copy-Item -Destination $dist/
+          }
+          Get-ChildItem third_party/cudnn/nvidia/cudnn/bin/*.dll | Copy-Item -Destination $dist/
+          "lbrr portable bundle (Windows x64, CUDA ${{ matrix.cuda_major }})", "Requirements: NVIDIA driver; ffmpeg on PATH for non-wav input.", "Usage: lbrr --input song.mp3 --outdir out --model-dir <model dir>", "Every runtime DLL lives next to the executable; no CUDA toolkit install is needed. Model weights are not bundled." | Set-Content $dist/README.txt
+          Compress-Archive -Path "$dist/*" -DestinationPath "${{ matrix.bundle }}.zip"
+          Get-Item "${{ matrix.bundle }}.zip" | Select-Object Name, Length
 
-      - name: Upload lbrr binary
+      - name: Upload portable bundle
         uses: actions/upload-artifact@v4
         with:
-          name: lbrr-win-x64
-          path: target/release/lbrr.exe
+          name: bundle-${{ matrix.bundle }}
+          path: ${{ matrix.bundle }}.zi*
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: bundles
+          pattern: bundle-*
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" bundles/* --title "lbrr ${GITHUB_REF_NAME}" --generate-notes
