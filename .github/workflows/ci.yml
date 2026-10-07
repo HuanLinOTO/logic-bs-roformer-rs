@@ -25,6 +25,8 @@ jobs:
     name: ${{ matrix.name }}
     strategy:
       fail-fast: false
+      # cuda-rust (cuda-oxide + cuda-bindings) 硬性要求 CUDA 13.2+
+      #（Tile compiler），CUDA 12.x 无法构建本仓库；13.x 系列按需加行。
       matrix:
         include:
           - name: linux-cuda13
@@ -34,25 +36,12 @@ jobs:
             cuda_major: "13"
             cudnn_wheel: nvidia-cudnn-cu13
             bundle: lbrr-linux-x64-cu13
-          - name: linux-cuda12
-            os: ubuntu-24.04
-            cuda_pkg: cuda-toolkit-12-4
-            cuda_home: /usr/local/cuda-12.4
-            cuda_major: "12"
-            cudnn_wheel: nvidia-cudnn-cu12
-            bundle: lbrr-linux-x64-cu12
           - name: windows-cuda13
             os: windows-latest
             cuda: "13.2.0"
             cuda_major: "13"
             cudnn_wheel: nvidia-cudnn-cu13
             bundle: lbrr-win-x64-cu13
-          - name: windows-cuda12
-            os: windows-latest
-            cuda: "12.4.0"
-            cuda_major: "12"
-            cudnn_wheel: nvidia-cudnn-cu12
-            bundle: lbrr-win-x64-cu12
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:
@@ -215,7 +204,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path third_party/dist | Out-Null
-          $cudnnInc = "third_party/cudnn/nvidia/cudnn/include"
+          # cuDNN headers: prefer the wheel's copy; the vendored set in
+          # tools/cudnn-include is the fallback (some win wheels ship
+          # no include tree).
+          $cudnnInc = "tools/cudnn-include"
+          $fromWheel = Get-ChildItem third_party/cudnn -Recurse -Filter cudnn.h -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($fromWheel) { $cudnnInc = $fromWheel.DirectoryName }
+          "cudnn headers: $cudnnInc"
           cl /LD /O2 /EHsc /std:c++17 /utf-8 /DWIN32_LEAN_AND_MEAN /DNV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING=1 -Ithird_party/cfe-stage/include -I$cudnnInc -I"$env:CUDA_PATH/include" tools/cudnn_sdpa_wrap.cpp /Fe:third_party/dist/cudnn_sdpa_wrap.dll
           if ($LASTEXITCODE -ne 0) { throw "shim compile failed" }
 
@@ -257,7 +252,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.bundle }}
-          path: ${{ matrix.bundle }}.zi*
+          path: ${{ matrix.bundle }}.*
           if-no-files-found: error
           retention-days: 14
 
