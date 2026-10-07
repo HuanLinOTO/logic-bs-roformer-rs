@@ -1,3 +1,6 @@
+# Isolated implementation worktrees
+/.worktrees/
+
 # Build artifacts
 /target/
 **/*.bc
