@@ -207,11 +207,15 @@ jobs:
           # cuDNN headers: prefer the wheel's copy; the vendored set in
           # tools/cudnn-include is the fallback (some win wheels ship
           # no include tree).
-          $cudnnInc = "tools/cudnn-include"
+          $cudnnInc = (Resolve-Path tools/cudnn-include).Path
           $fromWheel = Get-ChildItem third_party/cudnn -Recurse -Filter cudnn.h -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($fromWheel) { $cudnnInc = $fromWheel.DirectoryName }
+          $cfeInc = (Resolve-Path third_party/cfe-stage/include).Path
+          $cudaInc = "$env:CUDA_PATH/include"
           "cudnn headers: $cudnnInc"
-          cl /LD /O2 /EHsc /std:c++17 /utf-8 /DWIN32_LEAN_AND_MEAN /DNV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING=1 -Ithird_party/cfe-stage/include -I$cudnnInc -I"$env:CUDA_PATH/include" tools/cudnn_sdpa_wrap.cpp /Fe:third_party/dist/cudnn_sdpa_wrap.dll
+          "cfe stage: $cfeInc"
+          Test-Path "$cudnnInc/cudnn.h"
+          cl /LD /O2 /EHsc /std:c++17 /utf-8 /DWIN32_LEAN_AND_MEAN /DNV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING=1 "-I$cfeInc" "-I$cudnnInc" "-I$cudaInc" tools/cudnn_sdpa_wrap.cpp /Fe:third_party/dist/cudnn_sdpa_wrap.dll
           if ($LASTEXITCODE -ne 0) { throw "shim compile failed" }
 
       - name: Assemble portable bundle (Linux)
