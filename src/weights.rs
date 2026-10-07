@@ -382,9 +382,10 @@ impl ModelWeights {
                 }
                 axes.push((attn, ff));
             }
+            let mut axes=axes.into_iter();
             layers.push(TransformerLayer {
-                time: axes[0].clone(),
-                freq: axes[1].clone(),
+                time: axes.next().expect("time layer"),
+                freq: axes.next().expect("frequency layer"),
             });
         }
         let final_norm_gamma = take(st, &mut used, "final_norm.gamma")?;

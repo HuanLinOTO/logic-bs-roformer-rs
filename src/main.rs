@@ -31,6 +31,7 @@ struct Args {
     outdir: Option<PathBuf>,
     device: usize,
     self_test: bool,
+    kernel_regression: bool,
     print_config: bool,
     check_weights: bool,
     fft_test: bool,
@@ -67,6 +68,7 @@ fn parse_args() -> Result<Args, String> {
             "--device" => args.device = need("--device")?.parse().map_err(|_| "bad --device")?,
             "--stems" => args.stems = Some(need("--stems")?.parse().map_err(|_| "bad --stems")?),
             "--self-test" => args.self_test = true,
+            "--kernel-regression" => args.kernel_regression = true,
             "--print-config" => args.print_config = true,
             "--check-weights" => args.check_weights = true,
             "--fft-test" => args.fft_test = true,
@@ -112,6 +114,11 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if args.kernel_regression {
+        kernel_regression(args.device, args.benchmark.json.as_deref());
+        return;
+    }
 
     if args.self_test {
         self_test(args.device);
@@ -1682,11 +1689,13 @@ mod gpu_kernels {
             }
             let fi = fpos - band_f0[band] as usize;
             let gcol = fi * 4 + ch * 2 + c;
-            // glu rows are padded to max_dim = 516
+            // Compact [stem][band][time][4*band-frequency] layout.
             // Complex multiplication: (sr + si*j) * (mr + mi*j)
             // Each thread handles ONE component (c=0 for real, c=1 for imag).
             // Read both spec and mask components to compute this component.
-            let g_base = ((stem * bands_ + band) * t_f + t) * 516 + fi * 4 + ch * 2;
+            let next=if band+1<bands_ {band_f0[band+1]as usize}else{1025};
+            let width=(next-band_f0[band]as usize)*4;
+            let g_base=stem*t_f*4100+t_f*band_f0[band]as usize*4+t*width+fi*4+ch*2;
             let mr = glu[g_base];
             let mi = glu[g_base + 1];
             let sr = spec[((ch * t_f + t) * 1025 + fpos) * 2];
@@ -2519,6 +2528,192 @@ mod gpu_kernels {
 
     /// FF1 GEMM: f32 activation input, f16x2 weight, GELU epilogue packed
     /// to f16x2 words (halves the 66 MB/launch ff1 stream).
+    // 48KiB shared, two asynchronous stages; the accumulation order is unchanged.
+    #[kernel]
+    pub fn gemm_f16_gelu_async(
+        m: u32, n: u32, k: u32,
+        x: &[u32], w: &[u32], bias: &[f32],
+        mut y: DisjointSlice<u32>,
+    ) {
+        static mut SA: SharedArray<u32, { 2 * 128 * 32 }, 16> = SharedArray::UNINIT;
+        static mut SB: SharedArray<u32, { 2 * 64 * 32 }, 16> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let warp_id = tid / 32;
+        let group = lane / 4;
+        let tig = lane % 4;
+        let block_row_base = thread::blockIdx_y() as usize * 128;
+        let row_base = block_row_base + warp_id * 16;
+        let col_base = thread::blockIdx_x() as usize * 64;
+        let (m_size, n_size, k_size) = (m as usize, n as usize, k as usize);
+        let half_k = k_size / 2;
+        let mut acc = [[0.0f32; 4]; 8];
+        // Raw pointers (never &mut on statics): SharedArray is repr(transparent)
+        // over [u32; N], so the cast is the data base.
+        // SAFETY: addresses of block-local statics; no references formed.
+        let sa0: *mut u32 = std::ptr::addr_of_mut!(SA) as *mut u32;
+        let sb0: *mut u32 = std::ptr::addr_of_mut!(SB) as *mut u32;
+
+        // Prologue: issue K-tile 0 into buffer 0.
+        // SAFETY: chunk destinations are 16 B aligned words inside SA/SB;
+        // sources are 16 B aligned (half_k and q4*4 are word multiples of 4).
+        unsafe {
+            let sa = sa0;
+            let sb = sb0;
+            for i in 0..4usize {
+                let c = tid + i * 256;
+                let r = c / 8;
+                let q4 = c % 8;
+                let xr = block_row_base + r;
+                let dst = sa.add(r * 32 + (q4 ^ (r & 7)) * 4);
+                if xr < m_size {
+                    let src = x.as_ptr().add(xr * half_k + q4 * 4);
+                    cuda_device::async_copy::cp_async_cg_16(dst, src);
+                } else {
+                    cuda_device::async_copy::cp_async_cg_zfill_16(dst, x.as_ptr() as *const u8, 0);
+                }
+            }
+            for i in 0..2usize {
+                let c = tid + i * 256;
+                let col = c / 8;
+                let q4 = c % 8;
+                let bc = col_base + col;
+                let dst = sb.add(col * 32 + (q4 ^ (col & 7)) * 4);
+                if bc < n_size {
+                    let src = w.as_ptr().add(bc * half_k + q4 * 4);
+                    cuda_device::async_copy::cp_async_cg_16(dst, src);
+                } else {
+                    cuda_device::async_copy::cp_async_cg_zfill_16(dst, w.as_ptr() as *const u8, 0);
+                }
+            }
+            cuda_device::async_copy::cp_async_commit_group();
+        }
+
+        let num_k = k_size.div_ceil(64);
+        let mut ks = 0usize;
+        while ks < num_k {
+            // Issue K-tile ks+1 into the other buffer (or an empty group).
+            // SAFETY: same alignment guarantees as the prologue.
+            unsafe {
+                if ks + 1 < num_k {
+                    let kb2 = (ks + 1) * 64;
+                    let sa = sa0.add(((ks + 1) % 2) * 4096);
+                    let sb = sb0.add(((ks + 1) % 2) * 2048);
+                    for i in 0..4usize {
+                        let c = tid + i * 256;
+                        let r = c / 8;
+                        let q4 = c % 8;
+                        let xr = block_row_base + r;
+                        let dst = sa.add(r * 32 + (q4 ^ (r & 7)) * 4);
+                        if xr < m_size {
+                            let src = x.as_ptr().add(xr * half_k + kb2 / 2 + q4 * 4);
+                            cuda_device::async_copy::cp_async_cg_16(dst, src);
+                        } else {
+                            cuda_device::async_copy::cp_async_cg_zfill_16(dst, x.as_ptr() as *const u8, 0);
+                        }
+                    }
+                    for i in 0..2usize {
+                        let c = tid + i * 256;
+                        let col = c / 8;
+                        let q4 = c % 8;
+                        let bc = col_base + col;
+                        let dst = sb.add(col * 32 + (q4 ^ (col & 7)) * 4);
+                        if bc < n_size {
+                            let src = w.as_ptr().add(bc * half_k + kb2 / 2 + q4 * 4);
+                            cuda_device::async_copy::cp_async_cg_16(dst, src);
+                        } else {
+                            cuda_device::async_copy::cp_async_cg_zfill_16(dst, w.as_ptr() as *const u8, 0);
+                        }
+                    }
+                }
+                cuda_device::async_copy::cp_async_commit_group();
+                cuda_device::async_copy::cp_async_wait_group(1);
+            }
+            thread::sync_threads();
+
+            // MMA phase from buffer ks%2.
+            let base = (ks % 2) * 4096;
+            let bbase = (ks % 2) * 2048;
+            for kk in 0..4usize {
+                let word = kk * 8;
+                // ldmatrix lane addresses are 16B-aligned swizzled row heads
+                // inside SA/SB (rows < 128/64, words < 32 by construction).
+                unsafe {
+                    let sa = (sa0 as *const u32).add(base);
+                    let sb = (sb0 as *const u32).add(bbase);
+                    // A 16x16 f16 tile via x4: matrix0..3 = {m0-7 k0-7, m8-15 k0-7,
+                    // m0-7 k8-15, m8-15 k8-15}, matching mma A {a0..a3}.
+                    let arow = warp_id * 16 + (lane & 7) + 8 * ((lane >> 3) & 1);
+                    let akh = if lane >= 16 { 4 } else { 0 };
+                    let a: [u32; 4] = wmma::ldmatrix_x4(
+                        sa.add(arow * 32 + ((((word + akh) >> 2) ^ (arow & 7)) << 2)),
+                    );
+                    for j in 0..4usize {
+                        // B: two n8 tiles per x4 (SB is [n][k] row-major, whose
+                        // non-trans lane distribution IS the mma B fragment).
+                        // matrix0..3 = {n-lo k-lo, n-lo k-hi, n-hi k-lo, n-hi k-hi}.
+                        let bcol = j * 16 + (lane & 7) + if lane >= 16 { 8 } else { 0 };
+                        let bkh = if ((lane >> 3) & 1) == 1 { 4 } else { 0 };
+                        let bb: [u32; 4] = wmma::ldmatrix_x4(
+                            sb.add(bcol * 32 + ((((word + bkh) >> 2) ^ (bcol & 7)) << 2)),
+                        );
+                        acc[j * 2] = wmma::mma_m16n8k16_f32_f16(acc[j * 2], a, [bb[0], bb[1]]);
+                        acc[j * 2 + 1] = wmma::mma_m16n8k16_f32_f16(acc[j * 2 + 1], a, [bb[2], bb[3]]);
+                    }
+                }
+            }
+            thread::sync_threads();
+            ks += 1;
+        }
+
+        // GELU epilogue packed to f16x2 words.
+        let out_ptr = y.as_mut_ptr();
+        let half_n = n_size / 2;
+        for nt in 0..8usize {
+            let cw = (col_base + nt * 8 + tig * 2) / 2;
+            let r_lo = row_base + group;
+            let r_hi = r_lo + 8;
+            let (b0, b1) = (bias[col_base + nt * 8 + tig * 2], bias[col_base + nt * 8 + tig * 2 + 1]);
+            let gelu = |v: f32| -> f32 {
+                let sign = if v < 0.0 { -1.0f32 } else { 1.0 };
+                let a = v.abs() * 0.70710678;
+                let t = 1.0 / (1.0 + 0.3275911 * a);
+                let poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+                let erfa = sign * (1.0 - poly * (-a * a).exp());
+                0.5 * v * (1.0 + erfa)
+            };
+            if r_lo < m_size && cw < half_n {
+                // SAFETY: bounds checked; y has m*(n/2) words.
+                unsafe {
+                    *out_ptr.add(r_lo * half_n + cw) = cuda_device::convert::cvt_f16x2_f32(gelu(acc[nt][0] + b0), gelu(acc[nt][1] + b1));
+                }
+            }
+            if r_hi < m_size && cw < half_n {
+                // SAFETY: bounds checked.
+                unsafe {
+                    *out_ptr.add(r_hi * half_n + cw) = cuda_device::convert::cvt_f16x2_f32(gelu(acc[nt][2] + b0), gelu(acc[nt][3] + b1));
+                }
+            }
+        }
+    }
+
+    /// Preserve the handwritten erf-form GELU expression and FP16 rounding boundary.
+    #[kernel]
+    pub fn erf_gelu_pack(input:&[f32],mut output:DisjointSlice<u32>) {
+        let index=thread::index_1d();let i=index.get();
+        if i*2+1>=input.len(){return;}
+        let gelu = |v: f32| -> f32 {
+                let sign = if v < 0.0 { -1.0f32 } else { 1.0 };
+                let a = v.abs() * 0.70710678;
+                let t = 1.0 / (1.0 + 0.3275911 * a);
+                let poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+                let erfa = sign * (1.0 - poly * (-a * a).exp());
+                0.5 * v * (1.0 + erfa)
+            };
+        if let Some(y)=output.get_mut(index){*y=cuda_device::convert::cvt_f16x2_f32(gelu(input[2*i]),gelu(input[2*i+1]));}
+    }
+
     #[kernel]
     pub fn gemm_f16_gelu_a16w(
         m: u32, n: u32, k: u32,
@@ -3406,6 +3601,24 @@ mod gpu_kernels {
     /// The cudnn SDPA path needs fully rotated Q/K as plain tensor inputs;
     /// rotation math is identical to rope_k16 (no attention scale here —
     /// cudnn applies attn_scale=0.125 itself).
+    /// One thread rotates the same token/head pair in Q and K using shared coefficients.
+    #[kernel]
+    pub fn rope_qk16(mut qkv:DisjointSlice<u32>,cos:&[f32],sin:&[f32],mut key:DisjointSlice<u32>,bands:u32,axis:u32) {
+        let idx=thread::index_1d();let i=idx.get();
+        if i>=key.len() || i*3>=qkv.len(){return;}
+        let token=i/256;let rem=i%256;let pair=rem%32;
+        let pos=if axis==0{token/bands as usize}else{token%bands as usize};
+        let c=cos[pos*32+pair];let s=sin[pos*32+pair];
+        unsafe {
+            let q=qkv.as_mut_ptr().add(token*768+rem);
+            let k=qkv.as_mut_ptr().add(token*768+256+rem);
+            let (qe,qo)=cuda_device::convert::cvt_f32x2_f16x2(*q);
+            let (ke,ko)=cuda_device::convert::cvt_f32x2_f16x2(*k);
+            *q=cuda_device::convert::cvt_f16x2_f32(qe*c-qo*s,qo*c+qe*s);
+            if let Some(o)=key.get_mut(idx){*o=cuda_device::convert::cvt_f16x2_f32(ke*c-ko*s,ko*c+ke*s);}
+        }
+    }
+
     #[kernel]
     pub fn rope_q16_inplace(
         mut qkv: DisjointSlice<u32>, cos: &[f32], sin: &[f32],
@@ -3433,6 +3646,16 @@ mod gpu_kernels {
     /// Multiply the cudnn SDPA output by the per-(token, head) sigmoid gate,
     /// in place. The hand-written flash kernels fold this into their
     /// epilogue; on the cudnn path it runs as this cheap elementwise pass.
+    /// One complete warp owns one head, so only lane zero evaluates sigmoid.
+    #[kernel]
+    pub fn sdpa_gate_broadcast(mut y:DisjointSlice<u32>,gates:&[f32]) {
+        let idx=thread::index_1d();let i=idx.get();
+        if i>=y.len(){return;}
+        let sig=if warp::lane_id()==0 {1.0/(1.0+(-gates[i/32]).exp())}else{0.0};
+        let sig=warp::shuffle_f32_sync(0xffffffff,sig,0);
+        unsafe {let p=y.as_mut_ptr().add(i);let(a,b)=cuda_device::convert::cvt_f32x2_f16x2(*p);*p=cuda_device::convert::cvt_f16x2_f32(a*sig,b*sig);}
+    }
+
     #[kernel]
     pub fn sdpa_gate(
         mut y: DisjointSlice<u32>, gates: &[f32],
@@ -4515,8 +4738,8 @@ mod gpu_kernels {
     /// band_off. Rows are padded to max_dim in y for the subsequent GLU pass.
     #[kernel]
     pub fn mask_gemm2_f16(
-        t_rows: u32, group_base: u32, out_width: u32,
-        band_off: &[u32],
+        t_rows: u32, group_base: u32,
+        band_off: &[u32], tiles: &[u32],
         x: &[u32], w: &[u32], bias: &[f32],
         mut y: DisjointSlice<f32>,
     ) {
@@ -4534,10 +4757,11 @@ mod gpu_kernels {
         let tig = lane % 4;
         let block_row_base = thread::blockIdx_y() as usize * 128;
         let row_base = block_row_base + warp_id * 16;
-        let col_base = thread::blockIdx_x() as usize * 64;
+        let tile=tiles[thread::blockIdx_z()as usize];
+        let col_base=(tile & 65535)as usize*64;
         let m_size = t_rows as usize;
         let k_size = 1024usize;
-        let band = thread::blockIdx_z() as usize;
+        let band=(tile >> 16)as usize;
         let dim_in = (band_off[band + 1] - band_off[band]) as usize;
         let n_size = dim_in * 2;
         if col_base >= n_size {
@@ -4547,8 +4771,10 @@ mod gpu_kernels {
         let x_off = out_group * m_size * 512; // word stride (f16x2)
         let w_off = (2 * band_off[band] as usize) * (k_size / 2); // f16x2 words
         let bias_off = 2 * band_off[band] as usize;
-        let out_width = out_width as usize;
-        let y_off = out_group * m_size * out_width;
+        let out_width = n_size;
+        let bands=band_off.len()-1;
+        let stem=group_base as usize/bands;
+        let y_off=stem*m_size*2*band_off[bands]as usize + m_size*2*band_off[band]as usize;
         let mut acc = [[0.0f32; 4]; 8];
 
         // K tiles of 64 with float4 loads (16 barriers instead of 64).
@@ -4646,28 +4872,19 @@ mod gpu_kernels {
     /// GLU + scatter for all mask bands: read padded pre2 rows and write the
     /// compact-into-max_dim glu layout consumed by mask_apply.
     #[kernel]
-    pub fn glu_scatter(
-        pre: &[f32], band_off: &[u32], mut out: DisjointSlice<f32>,
-        t_rows: u32, bands: u32, max_dim: u32,
-    ) {
-        let idx = thread::index_1d();
-        let i = idx.get();
-        if i >= out.len() { return; }
-        let (t_f, bands_, width) = (t_rows as usize, bands as usize, max_dim as usize);
-        let pre_width = width * 2;
-        let d = i % width;
-        let row = i / width;
-        let t = row % t_f;
-        let sb = row / t_f;
-        let band = sb % bands_;
-        let dim_in = (band_off[band + 1] - band_off[band]) as usize;
-        let group = sb * t_f + t;
-        let value = if d < dim_in {
-            let a = pre[group * pre_width + d];
-            let b = pre[group * pre_width + dim_in + d];
-            a / (1.0 + (-b).exp())
-        } else { 0.0 };
-        if let Some(o) = out.get_mut(idx) { *o = value; }
+    pub fn glu_scatter(pre:&[f32],band_off:&[u32],mut out:DisjointSlice<f32>,t_rows:u32,bands:u32) {
+        let t=thread::blockIdx_x()as usize;let band=thread::blockIdx_y()as usize;let stem=thread::blockIdx_z()as usize;
+        let frames=t_rows as usize;let total=band_off[bands as usize]as usize;
+        let offset=band_off[band]as usize;let width=(band_off[band+1]-band_off[band])as usize;
+        let src=stem*frames*2*total+frames*2*offset+t*2*width;
+        let dst=stem*frames*total+frames*offset+t*width;
+        let mut d=thread::threadIdx_x()as usize;
+        while d<width {
+            let a=pre[src+d];let b=pre[src+width+d];
+            // (stem,band,t,d) is a unique compact output slot; no padded reads.
+            unsafe{*out.as_mut_ptr().add(dst+d)=a/(1.0+(-b).exp());}
+            d+=thread::blockDim_x()as usize;
+        }
     }
 
     /// Element-wise: y[i] += bias[i % n]. Used after cuBLAS GEMM (no bias).
@@ -5659,22 +5876,18 @@ fn f16_bits_to_f32(h: u16) -> f32 {
 }
 
 struct GpuWeights {
+    pack_ms: f64,
+    h2d_ms: f64,
     // transformer per layer per axis: qkv_w, gates_w, gates_b, out_w (shared biases shared once)
-    qkv_w: Vec<DeviceBuffer<f32>>,      // [24] (1536*256)
     qkv_w_h: Vec<DeviceBuffer<u32>>,    // [24] packed f16x2
     out_w_h: Vec<DeviceBuffer<u32>>,    // [24] packed f16x2
     ff_w1_h: Vec<DeviceBuffer<u32>>,    // [24] packed f16x2
     ff_w2_h: Vec<DeviceBuffer<u32>>,    // [24] packed f16x2
     gates_w: Vec<DeviceBuffer<f32>>,    // [24] (8*256)
     gates_b: Vec<DeviceBuffer<f32>>,    // [24] (8)
-    out_w: Vec<DeviceBuffer<f32>>,      // [24] (256*512)
     norm_gamma: Vec<DeviceBuffer<f32>>, // [24] attention pre-norm
     ff_gamma: Vec<DeviceBuffer<f32>>,   // [24]
-    ff_w1: Vec<DeviceBuffer<f32>>,      // [24] (1024*256)
     ff_b1: Vec<DeviceBuffer<f32>>,      // [24]
-    // f16-packed FF1 bias for the cuBLASLt GELU_BIAS path.
-    ff_b1_h: Vec<DeviceBuffer<u32>>,    // [24]
-    ff_w2: Vec<DeviceBuffer<f32>>,      // [24] (256*1024)
     ff_b2: Vec<DeviceBuffer<f32>>,      // [24]
     shared_qkv_bias: DeviceBuffer<f32>,
     // f16-packed copy for the cuBLASLt QKV path (its f16-D epilogue requires
@@ -5686,46 +5899,30 @@ struct GpuWeights {
     band_w: DeviceBuffer<f32>,
     band_b: DeviceBuffer<f32>,
     // maskest per stem: w1 (62*1024*256), b1, w2 concatenated, b2
-    mask_w1: Vec<DeviceBuffer<f32>>,
     mask_b1: Vec<DeviceBuffer<f32>>,
-    mask_w2: Vec<DeviceBuffer<f32>>,
     mask_b2: Vec<DeviceBuffer<f32>>,
     mask_w1_h: Vec<DeviceBuffer<u32>>, // packed f16x2 (hot-path GEMMs)
     mask_w2_h: Vec<DeviceBuffer<u32>>,
 }
 
 
-struct E2eScratch {
-    h: DeviceBuffer<f32>,          // (M, 256)
+struct RuntimeScratch {
     h16: DeviceBuffer<u32>,        // (M, 128) packed f16x2
-    qkv: DeviceBuffer<f32>,        // (M, 1536)
     qkv16: DeviceBuffer<u32>,      // (M, 768) packed f16x2 (Q|K|V)
     k16r: DeviceBuffer<u32>,       // (M, 256) pre-roped K, folded layout
-    qkv_rope: DeviceBuffer<f32>,   // (M, 1536)
-    qkv_attn: DeviceBuffer<f32>,   // time: [3*496, T, 64]; freq: [3*9208, 62, 64]
-    v_flat: DeviceBuffer<f32>,     // (M, 512)
     gates: DeviceBuffer<f32>,      // (M, 8)
-    scaled: DeviceBuffer<f32>,     // (M, 512)
     scaled16: DeviceBuffer<u32>,   // (M, 256) packed f16x2 attention output
-    oproj: DeviceBuffer<f32>,      // (M, 256)
     attn_out: DeviceBuffer<f32>,   // (M, 256)
-    ffpre: DeviceBuffer<f32>,      // (M, 1024)
-    ff1: DeviceBuffer<f32>,        // (M, 1024)
     ff1_16: DeviceBuffer<u32>,     // (M, 512) packed f16x2 GELU output
-    ff2: DeviceBuffer<f32>,        // (M, 256)
-    p_big: DeviceBuffer<f32>,      // time scores: 496*T*T
-    attn_out_long: DeviceBuffer<f32>, // [496, T, 64]
     cos: [DeviceBuffer<f32>; 2],
     sin: [DeviceBuffer<f32>; 2],
-    zero_bias_t: DeviceBuffer<f32>,
-    zero_bias_64: DeviceBuffer<f32>,
     attn_max: DeviceBuffer<f32>,
     attn_scale: DeviceBuffer<f32>,
     // cuBLASLt accelerator (lazily created on first transformer step; on any
     // load failure the hand-written kernels keep running — see lt_ready).
     lt: Option<cublaslt::CublasLt>,
     lt_ws: Option<DeviceBuffer<u8>>,
-    lt_dummy: Option<DeviceBuffer<u8>>,
+    ff1_pre: Option<DeviceBuffer<f32>>,
     lt_dead: bool,
     // cudnn fused SDPA accelerator (lazily created; on any load failure the
     // hand-written flash kernels keep running — see cudnn_ready).
@@ -5734,91 +5931,83 @@ struct E2eScratch {
     attention: Option<[AttentionSelection;2]>,
 }
 
-fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights::ModelWeights) -> Result<GpuWeights, String> {
-    let up = |v: &[f32]| DeviceBuffer::from_host(stream, v).map_err(|e| e.to_string());
-    let mut qkv_w = Vec::new();
-    let mut gates_w = Vec::new();
-    let mut gates_b = Vec::new();
-    let mut out_w = Vec::new();
-    let mut norm_gamma = Vec::new();
-    let mut ff_gamma = Vec::new();
-    let mut ff_w1 = Vec::new();
-    let mut ff_b1 = Vec::new();
-    let mut ff_w2 = Vec::new();
-    let mut ff_b2 = Vec::new();
-    for layer in &w.layers {
-        for (attn, ff) in [layer.time.clone(), layer.freq.clone()] {
-            qkv_w.push(up(&attn.to_qkv_w)?);
-            gates_w.push(up(&attn.to_gates_w)?);
-            gates_b.push(up(&attn.to_gates_b)?);
-            out_w.push(up(&attn.to_out_w)?);
-            norm_gamma.push(up(&attn.norm_gamma)?);
-            ff_gamma.push(up(&ff.gamma0)?);
-            ff_w1.push(up(&ff.w1)?);
-            ff_b1.push(up(&ff.b1)?);
-            ff_w2.push(up(&ff.w2)?);
-            ff_b2.push(up(&ff.b2)?);
-        }
+impl RuntimeScratch {
+    #[allow(clippy::too_many_arguments)]
+    fn new(st:&Arc<CudaStream>,m:usize,t_frames:usize,bands:usize,cos_t:&[f32],sin_t:&[f32],cos_f:&[f32],sin_f:&[f32],inference:&InferenceOptions)->Self {
+        assert_eq!(m,t_frames*bands);
+        let f=|n|DeviceBuffer::<f32>::zeroed(st,n).expect("runtime scratch f32");
+        let h=|n|DeviceBuffer::<u32>::zeroed(st,n).expect("runtime scratch f16");
+        Self {h16:h(m*128),qkv16:h(m*768),k16r:h(m*256),gates:f(m*8),scaled16:h(m*256),attn_out:f(m*256),ff1_16:h(m*512),attn_max:f(m*8),attn_scale:f(m*8),
+            cos:[DeviceBuffer::from_host(st,cos_t).unwrap(),DeviceBuffer::from_host(st,cos_f).unwrap()],
+            sin:[DeviceBuffer::from_host(st,sin_t).unwrap(),DeviceBuffer::from_host(st,sin_f).unwrap()],
+            lt:None,lt_ws:None,ff1_pre:if inference.ff1==inference_options::Ff1BackendRequest::CublasltErf{Some(f(m*1024))}else{None},lt_dead:false,cudnn:None,options:inference.clone(),attention:None}
     }
-    let mut qkv_w_h = Vec::new();
-    let mut out_w_h = Vec::new();
-    let mut ff_w1_h = Vec::new();
-    let mut ff_w2_h = Vec::new();
-    let mut ff_b1_h = Vec::new();
-    for layer in &w.layers {
-        for (attn, ff) in [layer.time.clone(), layer.freq.clone()] {
-            qkv_w_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&attn.to_qkv_w)).map_err(|e| e.to_string())?);
-            out_w_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&attn.to_out_w)).map_err(|e| e.to_string())?);
-            ff_w1_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&ff.w1)).map_err(|e| e.to_string())?);
-            ff_w2_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&ff.w2)).map_err(|e| e.to_string())?);
-            ff_b1_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&ff.b1)).map_err(|e| e.to_string())?);
-        }
+}
+/// Legacy FP32 reference resources are requested only by the parity entry point.
+struct ParityScratch {
+    h: DeviceBuffer<f32>,
+    qkv: DeviceBuffer<f32>,
+    qkv_rope: DeviceBuffer<f32>,
+    qkv_attn: DeviceBuffer<f32>,
+    v_flat: DeviceBuffer<f32>,
+    scaled: DeviceBuffer<f32>,
+    oproj: DeviceBuffer<f32>,
+    p_big: DeviceBuffer<f32>,
+    attn_out_long: DeviceBuffer<f32>,
+    zero_bias_t: DeviceBuffer<f32>,
+    zero_bias_64: DeviceBuffer<f32>,
+}
+impl ParityScratch {
+    fn new(st:&Arc<CudaStream>,m:usize,t:usize)->Self {
+        let f=|n|DeviceBuffer::<f32>::zeroed(st,n).expect("parity scratch");
+        Self {h:f(m*256),qkv:f(m*1536),qkv_rope:f(m*1536),qkv_attn:f(m*1536),v_flat:f(m*512),scaled:f(m*512),oproj:f(m*256),p_big:f(62*8*t*t),attn_out_long:f(m*512),zero_bias_t:f(t),zero_bias_64:f(64)}
     }
-    let mut mask_w1 = Vec::new();
-    let mut mask_b1 = Vec::new();
-    let mut mask_w2 = Vec::new();
-    let mut mask_b2 = Vec::new();
-    let mut mask_w1_h = Vec::new();
-    let mut mask_w2_h = Vec::new();
+}
+
+struct ParityWeights { qkv_w:Vec<DeviceBuffer<f32>>, out_w:Vec<DeviceBuffer<f32>> }
+impl ParityWeights {
+    fn upload(st:&Arc<CudaStream>,w:&weights::ModelWeights)->Result<Self,String> {
+        let mut qkv_w=Vec::new();let mut out_w=Vec::new();
+        for layer in &w.layers {for (a,_) in [&layer.time,&layer.freq] {
+            qkv_w.push(DeviceBuffer::from_host(st,&a.to_qkv_w).map_err(|e|e.to_string())?);
+            out_w.push(DeviceBuffer::from_host(st,&a.to_out_w).map_err(|e|e.to_string())?);
+        }}
+        Ok(Self{qkv_w,out_w})
+    }
+}
+fn upload_weights(_ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights::ModelWeights) -> Result<GpuWeights, String> {
+    use std::{cell::Cell,time::Instant};
+    let pack_ms=Cell::new(0.0);let h2d_ms=Cell::new(0.0);
+    let up=|v:&[f32]| {let t=Instant::now();let b=DeviceBuffer::from_host(stream,v).map_err(|e|e.to_string());h2d_ms.set(h2d_ms.get()+t.elapsed().as_secs_f64()*1000.0);b};
+    let packed=|parts:&[&[f32]]| {
+        let t=Instant::now();
+        let mut words=Vec::with_capacity(parts.iter().map(|p|p.len()/2).sum());
+        for part in parts {assert!(part.len()%2==0);words.extend(part.chunks_exact(2).map(|c|(f32_to_f16_bits(c[0])as u32)|((f32_to_f16_bits(c[1])as u32)<<16)));}
+        pack_ms.set(pack_ms.get()+t.elapsed().as_secs_f64()*1000.0);
+        let t=Instant::now();let b=DeviceBuffer::from_host(stream,&words).map_err(|e|e.to_string());h2d_ms.set(h2d_ms.get()+t.elapsed().as_secs_f64()*1000.0);b
+    };
+    let mut qkv_w_h=Vec::new();let mut out_w_h=Vec::new();let mut ff_w1_h=Vec::new();let mut ff_w2_h=Vec::new();
+    let mut gates_w=Vec::new();let mut gates_b=Vec::new();let mut norm_gamma=Vec::new();let mut ff_gamma=Vec::new();let mut ff_b1=Vec::new();let mut ff_b2=Vec::new();
+    for layer in &w.layers {for (attn,ff) in [&layer.time,&layer.freq] {
+        qkv_w_h.push(packed(&[&attn.to_qkv_w])?);out_w_h.push(packed(&[&attn.to_out_w])?);
+        ff_w1_h.push(packed(&[&ff.w1])?);ff_w2_h.push(packed(&[&ff.w2])?);
+        gates_w.push(up(&attn.to_gates_w)?);gates_b.push(up(&attn.to_gates_b)?);
+        norm_gamma.push(up(&attn.norm_gamma)?);ff_gamma.push(up(&ff.gamma0)?);ff_b1.push(up(&ff.b1)?);ff_b2.push(up(&ff.b2)?);
+    }}
+    let mut mask_w1_h=Vec::new();let mut mask_w2_h=Vec::new();let mut mask_b1=Vec::new();let mut mask_b2=Vec::new();
     for s in 0..w.mask_w1.len() {
-        let (w1c, w2c) = (w.mask_w1[s].concat(), w.mask_w2[s].concat());
-        mask_w1_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&w1c)).map_err(|e| e.to_string())?);
-        mask_w2_h.push(DeviceBuffer::from_host(stream, &pack_f16x2(&w2c)).map_err(|e| e.to_string())?);
-        mask_w1.push(up(&w1c)?);
-        mask_b1.push(up(&w.mask_b1[s].concat())?);
-        mask_w2.push(up(&w2c)?);
-        mask_b2.push(up(&w.mask_b2[s].concat())?);
+        // Pack each band directly into the stem buffer, without an FP32 concatenation.
+        mask_w1_h.push(packed(&w.mask_w1[s].iter().map(Vec::as_slice).collect::<Vec<_>>())?);
+        mask_w2_h.push(packed(&w.mask_w2[s].iter().map(Vec::as_slice).collect::<Vec<_>>())?);
+        mask_b1.push(up(&w.mask_b1[s].concat())?);mask_b2.push(up(&w.mask_b2[s].concat())?);
     }
-    Ok(GpuWeights {
-        qkv_w,
-        gates_w,
-        gates_b,
-        out_w,
-        norm_gamma,
-        ff_gamma,
-        ff_w1,
-        ff_b1,
-        ff_w2,
-        ff_b2,
-        qkv_w_h,
-        ff_b1_h,
-        mask_w1_h,
-        mask_w2_h,
-        out_w_h,
-        ff_w1_h,
-        ff_w2_h,
-        shared_qkv_bias: up(&w.shared_qkv_bias)?,
-        shared_qkv_bias_h: DeviceBuffer::from_host(stream, &pack_f16x2(&w.shared_qkv_bias)).map_err(|e| e.to_string())?,
-        shared_out_bias: up(&w.shared_out_bias)?,
-        final_norm: up(&w.final_norm_gamma)?,
-        band_gamma: up(&w.band_gamma.concat())?,
-        band_w: up(&w.band_w.concat())?,
-        band_b: up(&w.band_b.concat())?,
-        mask_w1,
-        mask_b1,
-        mask_w2,
-        mask_b2,
-    })
+    let mut result=GpuWeights {
+        pack_ms:0.0,h2d_ms:0.0,qkv_w_h,out_w_h,ff_w1_h,ff_w2_h,gates_w,gates_b,norm_gamma,ff_gamma,ff_b1,ff_b2,mask_w1_h,mask_w2_h,mask_b1,mask_b2,
+        shared_qkv_bias:up(&w.shared_qkv_bias)?,shared_qkv_bias_h:packed(&[&w.shared_qkv_bias])?,shared_out_bias:up(&w.shared_out_bias)?,final_norm:up(&w.final_norm_gamma)?,
+        band_gamma:up(&w.band_gamma.concat())?,band_w:up(&w.band_w.concat())?,band_b:up(&w.band_b.concat())?,
+    };
+    // from_host synchronizes its stream; all temporary packed slices are now dead.
+    result.pack_ms=pack_ms.get();result.h2d_ms=h2d_ms.get();Ok(result)
 }
 
 
@@ -5826,7 +6015,7 @@ fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights:
 /// Lazily create the cudnn SDPA accelerator inside `scratch`. On
 /// unavailability (LBRR_NO_CUDNN set, dlopen failure) the callers keep the
 /// hand-written flash kernels; failure is sticky.
-fn cudnn_ready(ctx: &Arc<CudaContext>, stream:&Arc<CudaStream>, scratch: &mut E2eScratch, bands:usize, frames:usize) -> Result<(),String> {
+fn cudnn_ready(ctx: &Arc<CudaContext>, stream:&Arc<CudaStream>, scratch: &mut RuntimeScratch, bands:usize, frames:usize) -> Result<(),String> {
     if scratch.attention.is_some() { return Ok(()); }
     let disabled=std::env::var_os("LBRR_NO_CUDNN").is_some();
     let mut choices=std::array::from_fn(|axis|scratch.options.attention_request(axis,disabled));
@@ -5858,42 +6047,17 @@ fn cudnn_ready(ctx: &Arc<CudaContext>, stream:&Arc<CudaStream>, scratch: &mut E2
 /// unavailability (LBRR_NO_LT set, alloc or dlopen failure) the callers keep
 /// the hand-written kernels; failure is sticky so a broken lib never wedges
 /// the pipeline.
-fn lt_ready(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, scratch: &mut E2eScratch, m: usize) {
-    if scratch.lt_dead || scratch.lt.is_some() || std::env::var_os("LBRR_NO_LT").is_some() {
-        return;
+fn lt_ready(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, scratch: &mut RuntimeScratch, _m: usize) -> Result<(),String> {
+    let required=scratch.options.ff1==inference_options::Ff1BackendRequest::CublasltErf;
+    if scratch.lt.is_some(){return Ok(());}
+    if scratch.lt_dead || std::env::var_os("LBRR_NO_LT").is_some(){if required{return Err("explicit cublaslt-erf requires cuBLASLt (LBRR_NO_LT is set or loading failed)".into());}return Ok(());}
+    let ws_size=32usize<<20;
+    let loaded=(||{let ws=DeviceBuffer::<u8>::zeroed(stream,ws_size).map_err(|e|e.to_string())?;let lt=cublaslt::CublasLt::load(ctx,ws.cu_deviceptr(),ws_size)?;Ok::<_,String>((lt,ws))})();
+    match loaded {
+        Ok((lt,ws))=>{eprintln!("[lt] cuBLASLt {} ready",lt.version());scratch.lt=Some(lt);scratch.lt_ws=Some(ws);}
+        Err(e)=>{scratch.lt_dead=true;if required{return Err(format!("explicit cublaslt-erf: {e}"));}eprintln!("[lt] load failed: {e}; using handwritten GEMMs");}
     }
-    let ws_size = 32usize << 20;
-    let ws = match DeviceBuffer::<u8>::zeroed(stream, ws_size) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("[lt] workspace alloc failed: {e}; using hand-written GEMMs");
-            scratch.lt_dead = true;
-            return;
-        }
-    };
-    // Autotune scratch: covers the largest matrix role (qkv D = m*1536 f16
-    // = m*3072 bytes) plus slack.
-    let dummy_size = m * 3072 + (1 << 20);
-    let dummy = match DeviceBuffer::<u8>::zeroed(stream, dummy_size) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("[lt] dummy alloc failed: {e}; using hand-written GEMMs");
-            scratch.lt_dead = true;
-            return;
-        }
-    };
-    match cublaslt::CublasLt::load(ctx, ws.cu_deviceptr() as u64, ws_size, dummy.cu_deviceptr() as u64, dummy_size) {
-        Ok(lt) => {
-            eprintln!("[lt] cuBLASLt handle ready");
-            scratch.lt_ws = Some(ws);
-            scratch.lt_dummy = Some(dummy);
-            scratch.lt = Some(lt);
-        }
-        Err(e) => {
-            eprintln!("[lt] load failed: {e}; using hand-written GEMMs");
-            scratch.lt_dead = true;
-        }
-    }
+    Ok(())
 }
 
 /// One full transformer layer step on the folded token tensor x (M, 256).
@@ -5908,11 +6072,11 @@ unsafe fn transformer_step(
     x: &mut DeviceBuffer<f32>,
     t_frames: usize,
     bands: usize,
-    scratch: &mut E2eScratch,
+    scratch: &mut RuntimeScratch,
 ) -> Result<(), String> {
     let m = t_frames * bands; // 71342
     let idx = layer_idx * 2 + axis;
-    lt_ready(_ctx, stream, scratch, m);
+    lt_ready(_ctx, stream, scratch, m)?;
     cudnn_ready(_ctx, stream, scratch, bands, t_frames)?;
     let launch1 = |n: u32| cuda_core::simt::LaunchConfig::for_num_elems(n);
     // 1. pre-attention RMSNorm
@@ -5925,9 +6089,9 @@ unsafe fn transformer_step(
     // (f16 out + f32-bias epilogue matches the packed row-major layout);
     // the hand-written hout kernel stays as the fallback path.
     if let Some(lt) = scratch.lt.as_mut() {
-        lt.matmul_f16out(stream.cu_stream() as usize, m as u64, 1536, 256,
+        lt.matmul_f16out(stream, m as u64, 1536, 256,
             gw.qkv_w_h[idx].cu_deviceptr(), scratch.h16.cu_deviceptr(),
-            gw.shared_qkv_bias_h.cu_deviceptr(), scratch.qkv16.cu_deviceptr(), false)
+            gw.shared_qkv_bias_h.cu_deviceptr(), scratch.qkv16.cu_deviceptr())
             .map_err(|e| e.to_string())?;
     } else {
         // SAFETY: 2-D tile grid over m x 1536.
@@ -5950,12 +6114,12 @@ unsafe fn transformer_step(
         // song shapes; output verified bit-exact against torch cudnn sdpa).
         if scratch.attention.as_ref().expect("attention prepared")[axis].selected == AttentionBackendRequest::Cudnn {
             let cd = scratch.cudnn.as_ref().expect("selected cuDNN handle");
-            // SAFETY: one thread per K word; m*256 words.
-            km.rope_k16(stream, launch1((m * 256) as u32), &scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], &mut scratch.k16r, bands as u32, axis as u32)
-                .map_err(|e| e.to_string())?;
-            // SAFETY: one thread per Q word; m*256 words (in place).
-            km.rope_q16_inplace(stream, launch1((m * 256) as u32), &mut scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], bands as u32, axis as u32)
-                .map_err(|e| e.to_string())?;
+            if scratch.options.rope==inference_options::RopeMode::Fused {
+                km.rope_qk16(stream,launch1((m*256)as u32),&mut scratch.qkv16,&scratch.cos[axis],&scratch.sin[axis],&mut scratch.k16r,bands as u32,axis as u32).map_err(|e|e.to_string())?;
+            } else {
+                km.rope_k16(stream,launch1((m*256)as u32),&scratch.qkv16,&scratch.cos[axis],&scratch.sin[axis],&mut scratch.k16r,bands as u32,axis as u32).map_err(|e|e.to_string())?;
+                km.rope_q16_inplace(stream,launch1((m*256)as u32),&mut scratch.qkv16,&scratch.cos[axis],&scratch.sin[axis],bands as u32,axis as u32).map_err(|e|e.to_string())?;
+            }
             let base = scratch.qkv16.cu_deviceptr() as u64;
             // NOTE: pass t_frames as the "seq" arg — sdpa() derives
             // (b, s) = (bands, t) for the time axis and (t, bands) for the
@@ -5965,8 +6129,8 @@ unsafe fn transformer_step(
                 scratch.scaled16.cu_deviceptr() as u64)
                 .map_err(|e| e.to_string())?;
             // SAFETY: one thread per output word; m*256 words.
-            km.sdpa_gate(stream, launch1((m * 256) as u32), &mut scratch.scaled16, &scratch.gates)
-                .map_err(|e| e.to_string())?;
+            // Warp-broadcast sigmoid was slower in the paired profile; keep this pass.
+            km.sdpa_gate(stream,launch1((m*256)as u32),&mut scratch.scaled16,&scratch.gates).map_err(|e|e.to_string())?;
         } else if axis == 0 {
             // Time axis: cp.async double-buffered flash (K pre-roped by rope_k16,
             // attacking the measured 65% L1TEX-scoreboard stall). Freq axis keeps
@@ -5987,7 +6151,7 @@ unsafe fn transformer_step(
     // scaled. cuBLASLt hosts it: f32 out + bias epilogue + residual via
     // beta·C (C = x residual buffer, D = attn_out, C≠D).
     if let Some(lt) = scratch.lt.as_mut() {
-        lt.matmul_resid(stream.cu_stream() as usize, m as u64, 256, 512,
+        lt.matmul_resid(stream, m as u64, 256, 512,
             gw.out_w_h[idx].cu_deviceptr(), scratch.scaled16.cu_deviceptr(),
             gw.shared_out_bias.cu_deviceptr(), x.cu_deviceptr(), scratch.attn_out.cu_deviceptr())
             .map_err(|e| e.to_string())?;
@@ -6007,13 +6171,23 @@ unsafe fn transformer_step(
     // GELU_BIAS epilogue (tanh form) measured only ~0.2 ms faster per iter
     // but dropped the golden SNR by 0.5 dB — rejected on that trade.
     // SAFETY: 2-D tile grid over m x 1024.
-    unsafe {
-        km.gemm_f16_gelu_a16w(stream, tile_cfg_tf32_64(m, 1024), m as u32, 1024, 256, &scratch.h16, &gw.ff_w1_h[idx], &gw.ff_b1[idx], &mut scratch.ff1_16)
-    }.map_err(|e| e.to_string())?;
+    match scratch.options.ff1 {
+        inference_options::Ff1BackendRequest::CublasltErf=>{
+            let pre=scratch.ff1_pre.as_mut().expect("FF1 candidate buffer");
+            scratch.lt.as_mut().ok_or("cublaslt-erf requires cuBLASLt")?.matmul_f32out(stream,m as u64,1024,256,gw.ff_w1_h[idx].cu_deviceptr(),scratch.h16.cu_deviceptr(),gw.ff_b1[idx].cu_deviceptr(),pre.cu_deviceptr())?;
+            unsafe{km.erf_gelu_pack(stream,launch1((m*512)as u32),pre,&mut scratch.ff1_16)}.map_err(|e|e.to_string())?;
+        }
+        inference_options::Ff1BackendRequest::HandwrittenAsync=>{
+            unsafe{km.gemm_f16_gelu_async(stream,tile_cfg_tf32_64(m,1024),m as u32,1024,256,&scratch.h16,&gw.ff_w1_h[idx],&gw.ff_b1[idx],&mut scratch.ff1_16)}.map_err(|e|e.to_string())?;
+        }
+        _=>{
+            unsafe{km.gemm_f16_gelu_a16w(stream,tile_cfg_tf32_64(m,1024),m as u32,1024,256,&scratch.h16,&gw.ff_w1_h[idx],&gw.ff_b1[idx],&mut scratch.ff1_16)}.map_err(|e|e.to_string())?;
+        }
+    }
     // GELU is fused into the FF1 tensor-core epilogue. cuBLASLt FF2:
     // f32 out + bias + residual via beta·C (C = attn_out, D = x).
     if let Some(lt) = scratch.lt.as_mut() {
-        lt.matmul_resid(stream.cu_stream() as usize, m as u64, 256, 1024,
+        lt.matmul_resid(stream, m as u64, 256, 1024,
             gw.ff_w2_h[idx].cu_deviceptr(), scratch.ff1_16.cu_deviceptr(),
             gw.ff_b2[idx].cu_deviceptr(), scratch.attn_out.cu_deviceptr(), x.cu_deviceptr())
             .map_err(|e| e.to_string())?;
@@ -6185,6 +6359,8 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
     let st = weights::SafeTensors::open(&model_dir.join("model.safetensors")).unwrap();
     let w = weights::ModelWeights::load(&st, &cfg).unwrap();
     let gw = upload_weights(&ctx, &stream, &w).expect("weights upload");
+    let parity_weights=ParityWeights::upload(&stream,&w).expect("parity weights");
+    drop(w);drop(st);
     println!("weights load+upload: {:?}", weights_t0.elapsed());
     let forward_t0 = std::time::Instant::now();
 
@@ -6249,37 +6425,9 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
 
     // scratch
     let z = |n: usize| DeviceBuffer::<f32>::zeroed(&stream, n).unwrap();
-    let mut scr = E2eScratch {
-        h: z(m * 256),
-        h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
-        qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
-k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
-        scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
-        ff1_16: DeviceBuffer::<u32>::zeroed(&stream, m * 512).unwrap(),
-        qkv: z(m * 1536),
-        qkv_rope: z(m * 1536),
-        qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64), // max of both axes' layouts
-        v_flat: z(m * 512),
-        gates: z(m * 8),
-        scaled: z(m * 512),
-        oproj: z(m * 256),
-        attn_out: z(m * 256),
-        ffpre: z(m * 1024),
-        ff1: z(m * 1024),
-        ff2: z(m * 256),
-        p_big: z(62 * 8 * t_frames * t_frames),
-        attn_out_long: z(496 * t_frames * 64),
-        cos: [DeviceBuffer::from_host(&stream, &cos_t).unwrap(), DeviceBuffer::from_host(&stream, &cos_f).unwrap()],
-        sin: [DeviceBuffer::from_host(&stream, &sin_t).unwrap(), DeviceBuffer::from_host(&stream, &sin_f).unwrap()],
-        zero_bias_t: z(t_frames),
-        zero_bias_64: z(64),
-        attn_max: z(m * 8),
-        attn_scale: z(m * 8),
-        lt: None,
-        lt_ws: None,
-        lt_dummy: None,
-        lt_dead: false, cudnn: None, options: inference.clone(), attention: None,
-    };
+    let mut scr = RuntimeScratch::new(&stream, m, t_frames, bands, &cos_t, &sin_t, &cos_f, &sin_f, inference);
+
+    let mut parity=ParityScratch::new(&stream,m,t_frames);
 
     // staged references for bisection
     let stages = npz::Npz::open(&root.join("parity/e2e_stages.npz")).ok();
@@ -6328,40 +6476,40 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         let launch1 = |n: usize| cuda_core::simt::LaunchConfig::for_num_elems(n as u32);
         // rmsnorm
         // SAFETY: one warp per row.
-        unsafe { km.rmsnorm(&stream, launch1(m_ * 32), &x, &gw.norm_gamma[0], &mut scr.h, m_ as u32, 256) }.unwrap();
+        unsafe { km.rmsnorm(&stream, launch1(m_ * 32), &x, &gw.norm_gamma[0], &mut parity.h, m_ as u32, 256) }.unwrap();
         {
-            let hv = scr.h.to_host_vec(&stream).unwrap();
+            let hv = parity.h.to_host_vec(&stream).unwrap();
             let r = sub.f32("h_norm").unwrap();
             stage_check("L0.h_norm", &hv, r, true);
         }
         // qkv gemm
         // SAFETY: tile grid over m x 1536.
-        unsafe { km.gemm_bias_64(&stream, tile_cfg_64(m_, 1536), m_ as u32, 1536, 256, &scr.h, &gw.qkv_w[0], &gw.shared_qkv_bias, &mut scr.qkv) }.unwrap();
+        unsafe { km.gemm_bias_64(&stream, tile_cfg_64(m_, 1536), m_ as u32, 1536, 256, &parity.h, &parity_weights.qkv_w[0], &gw.shared_qkv_bias, &mut parity.qkv) }.unwrap();
         // rope (time axis)
         // SAFETY: one thread per (row, pair).
-        unsafe { km.rope_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 768) as u32), &scr.qkv, &scr.cos[0], &scr.sin[0], &mut scr.qkv_rope, t_frames as u32, bands as u32, 0) }.unwrap();
+        unsafe { km.rope_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 768) as u32), &parity.qkv, &scr.cos[0], &scr.sin[0], &mut parity.qkv_rope, t_frames as u32, bands as u32, 0) }.unwrap();
         // gates (uses h)
         // SAFETY: tile grid over m x 8.
-        unsafe { km.gemm_bias_64(&stream, tile_cfg_64(m_, 8), m_ as u32, 8, 256, &scr.h, &gw.gates_w[0], &gw.gates_b[0], &mut scr.gates) }.unwrap();
+        unsafe { km.gemm_bias_64(&stream, tile_cfg_64(m_, 8), m_ as u32, 8, 256, &parity.h, &gw.gates_w[0], &gw.gates_b[0], &mut scr.gates) }.unwrap();
         // SAFETY: elementwise reorder.
-        unsafe { km.qkv_to_attn(&stream, cuda_core::simt::LaunchConfig::for_num_elems((3 * 62 * 8 * t_frames * 64) as u32), &scr.qkv_rope, &mut scr.qkv_attn, t_frames as u32, bands as u32, 0) }.unwrap();
+        unsafe { km.qkv_to_attn(&stream, cuda_core::simt::LaunchConfig::for_num_elems((3 * 62 * 8 * t_frames * 64) as u32), &parity.qkv_rope, &mut parity.qkv_attn, t_frames as u32, bands as u32, 0) }.unwrap();
         {
             let (bh, n_len) = (62usize * 8, t_frames);
             for g in 0..bh {
-                let qseg = slice_view(&stream, &scr.qkv_attn, g * n_len * 64, n_len * 64).unwrap();
-                let kseg = slice_view(&stream, &scr.qkv_attn, bh * n_len * 64 + g * n_len * 64, n_len * 64).unwrap();
-                let mut pseg = mut_slice_view(&stream, &mut scr.p_big, g * n_len * n_len, n_len * n_len).unwrap();
+                let qseg = slice_view(&stream, &parity.qkv_attn, g * n_len * 64, n_len * 64).unwrap();
+                let kseg = slice_view(&stream, &parity.qkv_attn, bh * n_len * 64 + g * n_len * 64, n_len * 64).unwrap();
+                let mut pseg = mut_slice_view(&stream, &mut parity.p_big, g * n_len * n_len, n_len * n_len).unwrap();
                 // SAFETY: tile grid over n_len x n_len.
-                unsafe { km.gemm_bias_64(&stream, tile_cfg_64(n_len, n_len), n_len as u32, n_len as u32, 64, &*qseg, &*kseg, &scr.zero_bias_t, &mut *pseg) }.unwrap();
+                unsafe { km.gemm_bias_64(&stream, tile_cfg_64(n_len, n_len), n_len as u32, n_len as u32, 64, &*qseg, &*kseg, &parity.zero_bias_t, &mut *pseg) }.unwrap();
             }
             // SAFETY: one thread per row.
-            unsafe { km.softmax_rows(&stream, cuda_core::simt::LaunchConfig::for_num_elems((bh * n_len) as u32), &mut scr.p_big, (bh * n_len) as u32, n_len as u32) }.unwrap();
+            unsafe { km.softmax_rows(&stream, cuda_core::simt::LaunchConfig::for_num_elems((bh * n_len) as u32), &mut parity.p_big, (bh * n_len) as u32, n_len as u32) }.unwrap();
             {
                 let ps = npz::Npz::open(&root.join("parity/e2e_pspot.npz")).expect("pspot");
                 let p0 = ps.f32("p0").unwrap();
                 let q00 = ps.f32("q00").unwrap();
-                let pb = scr.p_big.to_host_vec(&stream).unwrap();
-                let qa = scr.qkv_attn.to_host_vec(&stream).unwrap();
+                let pb = parity.p_big.to_host_vec(&stream).unwrap();
+                let qa = parity.qkv_attn.to_host_vec(&stream).unwrap();
                 println!("P[0,0,:16] = {:?}", &pb[0..16]);
                 println!("ref P0[:16]  = {:?}", &p0[0..16]);
                 // also the peak position
@@ -6371,29 +6519,29 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
                 println!("q[bh0,t0,:4] = {:?} ref {:?}", &qa[0..4], &q00[0..4]);
             }
             for g in 0..bh {
-                let pseg = slice_view(&stream, &scr.p_big, g * n_len * n_len, n_len * n_len).unwrap();
-                let vseg = slice_view(&stream, &scr.qkv_attn, 2 * bh * n_len * 64 + g * n_len * 64, n_len * 64).unwrap();
-                let mut oseg = mut_slice_view(&stream, &mut scr.attn_out_long, g * n_len * 64, n_len * 64).unwrap();
+                let pseg = slice_view(&stream, &parity.p_big, g * n_len * n_len, n_len * n_len).unwrap();
+                let vseg = slice_view(&stream, &parity.qkv_attn, 2 * bh * n_len * 64 + g * n_len * 64, n_len * 64).unwrap();
+                let mut oseg = mut_slice_view(&stream, &mut parity.attn_out_long, g * n_len * 64, n_len * 64).unwrap();
                 // SAFETY: tile grid over n_len x 64.
-                unsafe { km.gemm_bias_bn(&stream, tile_cfg(n_len, 64), n_len as u32, 64, n_len as u32, &*pseg, &*vseg, &scr.zero_bias_64, &mut *oseg) }.unwrap();
+                unsafe { km.gemm_bias_bn(&stream, tile_cfg(n_len, 64), n_len as u32, 64, n_len as u32, &*pseg, &*vseg, &parity.zero_bias_64, &mut *oseg) }.unwrap();
             }
             {
-                let ol = scr.attn_out_long.to_host_vec(&stream).unwrap();
+                let ol = parity.attn_out_long.to_host_vec(&stream).unwrap();
                 let vfnpz = npz::Npz::open(&root.join("parity/e2e_vflat.npz")).expect("e2e_vflat");
                 let r = vfnpz.f32("v_flat").unwrap();
                 println!("ol[bh0,t0,:4] = {:?} ref_vflat[0..4] = {:?}", &ol[0..4], &r[0..4]);
                 println!("ol[bh1,t0,:4] = {:?} ref vflat(t0,f1,h0)= {:?}", &ol[259 * 64..259 * 64 + 4], &r[512..516]);
                 // host check: dot(P row0, V col0) should equal ol[0]
-                let pb2 = scr.p_big.to_host_vec(&stream).unwrap();
-                let qa2 = scr.qkv_attn.to_host_vec(&stream).unwrap();
+                let pb2 = parity.p_big.to_host_vec(&stream).unwrap();
+                let qa2 = parity.qkv_attn.to_host_vec(&stream).unwrap();
                 let vbase = 2 * 496usize * 259 * 64;
                 let mut dot = 0.0f32;
                 for j in 0..259usize {
                     dot += pb2[j] * qa2[vbase + j * 64];
                 }
                 println!("host dot(P0, V0col0) = {dot:.6} vs ol[0] = {:.6}", ol[0]);
-                let roped = scr.qkv_rope.to_host_vec(&stream).unwrap();
-                let raw_v0: Vec<f32> = scr.qkv.to_host_vec(&stream).unwrap()[1024..1028].to_vec();
+                let roped = parity.qkv_rope.to_host_vec(&stream).unwrap();
+                let raw_v0: Vec<f32> = parity.qkv.to_host_vec(&stream).unwrap()[1024..1028].to_vec();
                 println!("attV[0..4]={:?} ropeV={:?} rawqkv={:?}", &qa2[vbase..vbase + 4], &roped[1024..1028], &raw_v0);
                 {
                     let qa_ref = npz::Npz::open(&root.join("parity/e2e_qkv_attn.npz")).expect("qkv_attn ref");
@@ -6405,12 +6553,12 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
                 // v provenance: qkv_attn part2 first 4, and the raw qkv v segment for m=0
             }
             // SAFETY: elementwise un-reorder (time axis).
-            unsafe { km.attn_v_to_flat(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 512) as u32), &scr.attn_out_long, &scr.gates, &mut scr.v_flat, t_frames as u32, bands as u32, 0) }.unwrap();
+            unsafe { km.attn_v_to_flat(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 512) as u32), &parity.attn_out_long, &scr.gates, &mut parity.v_flat, t_frames as u32, bands as u32, 0) }.unwrap();
         }
         {
             let vfnpz = npz::Npz::open(&root.join("parity/e2e_vflat.npz")).expect("e2e_vflat");
             let r = vfnpz.f32("v_flat").unwrap();
-            let vv = scr.v_flat.to_host_vec(&stream).unwrap();
+            let vv = parity.v_flat.to_host_vec(&stream).unwrap();
             let mut me = 0.0f32;
             let mut dn = 0.0f32;
             for i in 0..vv.len() {
@@ -6420,7 +6568,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             println!("stage L0.v_flat: rel={:.3e}", me / dn);
         }
         // SAFETY: elementwise over m*512.
-        unsafe { km.gate_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 512) as u32), &scr.v_flat, &scr.gates, &mut scr.scaled) }.unwrap();
+        unsafe { km.gate_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 512) as u32), &parity.v_flat, &scr.gates, &mut parity.scaled) }.unwrap();
         {
             let sc = npz::Npz::open(&root.join("parity/e2e_scaled.npz")).expect("e2e_scaled");
             {
@@ -6429,7 +6577,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
                 stage_check("L0.gates", &gv, r, true);
             }
             {
-                let sv = scr.scaled.to_host_vec(&stream).unwrap();
+                let sv = parity.scaled.to_host_vec(&stream).unwrap();
                 let r = sc.f32("to_out_in").unwrap();
                 stage_check("L0.scaled", &sv, r, true);
                 println!("scaled[(t0,f0)0..4] = {:?}", &sv[0..4]);
@@ -6439,9 +6587,9 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             }
         }
         // SAFETY: tile grid over m x 256.
-        unsafe { km.gemm_bias_64(&stream, tile_cfg_64(m_, 256), m_ as u32, 256, 512, &scr.scaled, &gw.out_w[0], &gw.shared_out_bias, &mut scr.oproj) }.unwrap();
+        unsafe { km.gemm_bias_64(&stream, tile_cfg_64(m_, 256), m_ as u32, 256, 512, &parity.scaled, &parity_weights.out_w[0], &gw.shared_out_bias, &mut parity.oproj) }.unwrap();
         // SAFETY: elementwise over m*256.
-        unsafe { km.add_resid(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 256) as u32), &scr.oproj, &x, &mut scr.attn_out) }.unwrap();
+        unsafe { km.add_resid(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 256) as u32), &parity.oproj, &x, &mut scr.attn_out) }.unwrap();
         {
             let av = scr.attn_out.to_host_vec(&stream).unwrap();
             let r = sub.f32("attn_out").unwrap();
@@ -6459,7 +6607,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         unsafe { km.rmsnorm_gates(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * 32) as u32), &x0, &gw.norm_gamma[0], &gw.gates_w[0], &gw.gates_b[0], &mut h0, &mut g0b, m as u32, 256) }.unwrap();
         let mut qkv0 = DeviceBuffer::<f32>::zeroed(&stream, m * 1536).unwrap();
         // SAFETY: tile grid over m x 1536.
-        unsafe { km.gemm_f16_128x64(&stream, tile_cfg_tf32_64(m, 1536), m as u32, 1536, 256, &h0, &gw.qkv_w[0], &gw.shared_qkv_bias, &mut qkv0) }.unwrap();
+        unsafe { km.gemm_f16_128x64(&stream, tile_cfg_tf32_64(m, 1536), m as u32, 1536, 256, &h0, &parity_weights.qkv_w[0], &gw.shared_qkv_bias, &mut qkv0) }.unwrap();
         let mut s_old = DeviceBuffer::<f32>::zeroed(&stream, m * 512).unwrap();
         let mut s_new = DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap();
         let mut a_max = DeviceBuffer::<f32>::zeroed(&stream, m * 8).unwrap();
@@ -6467,11 +6615,11 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         let bh_t = bands * 8;
         // old chain
         // SAFETY: 64x128 FP16 tiles over [BH, N, N].
-        unsafe { km.attn_qk_rope_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (t_frames.div_ceil(64) as u32, t_frames.div_ceil(64) as u32, bh_t as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, t_frames as u32, 64, &qkv0, &scr.cos[0], &scr.sin[0], &scr.zero_bias_t, bands as u32, 0, &mut scr.p_big) }.unwrap();
+        unsafe { km.attn_qk_rope_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (t_frames.div_ceil(64) as u32, t_frames.div_ceil(64) as u32, bh_t as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, t_frames as u32, 64, &qkv0, &scr.cos[0], &scr.sin[0], &parity.zero_bias_t, bands as u32, 0, &mut parity.p_big) }.unwrap();
         // SAFETY: one warp per score row.
-        unsafe { km.softmax_stats(&stream, cuda_core::simt::LaunchConfig::for_num_elems((bh_t * t_frames * 32) as u32), &scr.p_big, (bh_t * t_frames) as u32, t_frames as u32, &mut a_max, &mut a_scale) }.unwrap();
+        unsafe { km.softmax_stats(&stream, cuda_core::simt::LaunchConfig::for_num_elems((bh_t * t_frames * 32) as u32), &parity.p_big, (bh_t * t_frames) as u32, t_frames as u32, &mut a_max, &mut a_scale) }.unwrap();
         // SAFETY: one 64-column FP16 tile per row block and BH group.
-        unsafe { km.attn_pv_raw_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (1, t_frames.div_ceil(128) as u32, bh_t as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, 64, t_frames as u32, &scr.p_big, &qkv0, &scr.zero_bias_64, &g0b, bands as u32, 0, &a_max, &a_scale, &mut s_old) }.unwrap();
+        unsafe { km.attn_pv_raw_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (1, t_frames.div_ceil(128) as u32, bh_t as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, 64, t_frames as u32, &parity.p_big, &qkv0, &parity.zero_bias_64, &g0b, bands as u32, 0, &a_max, &a_scale, &mut s_old) }.unwrap();
         // new flash
         // SAFETY: one 128-thread block per (BH group, 64-row query tile).
         let mut f_max = DeviceBuffer::<f32>::zeroed(&stream, bh_t * t_frames).unwrap();
@@ -6524,7 +6672,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
                 }
                 let mut l_host = 0.0f32;
                 for kc in 0..t_frames { l_host += ((s_host[kc] - m_host) as f32).exp(); }
-                let pb = scr.p_big.to_host_vec(&stream).unwrap();
+                let pb = parity.p_big.to_host_vec(&stream).unwrap();
                 let prow = grp_ * t_frames * t_frames + row_ * t_frames;
                 println!("DIAG host-vs-old scores[:8]: {:?}", &s_host[0..8]);
                 println!("DIAG pbig              [:8]: {:?}", &pb[prow..prow + 8]);
@@ -6617,14 +6765,14 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
     }.expect("transpose");
 
     // ---- MaskEstimator: grouped per-stem launches ----
-    // glu_all: (stem, band, t, dim_in) padded to max_dim.
+    // Compact glu_all: [stem][band][t][dim_in], total width 4100.
     let max_dim = 2 * 129 * 2; // 516
-    let mut glu_all = DeviceBuffer::<f32>::zeroed(&stream, 6 * bands * t_frames * max_dim).unwrap();
+    let mut glu_all = DeviceBuffer::<f32>::zeroed(&stream, 6 * t_frames * 4100).unwrap();
     let hidden_words = 6 * bands * t_frames * 512;
     let mut hidden_t = DeviceBuffer::<u32>::zeroed(&stream, hidden_words).unwrap();
-    // GEMM2 output rows are padded to 2*max_dim so GLU can read both halves.
-    let pre_width = 2 * max_dim;
-    let mut pre2_all = DeviceBuffer::<f32>::zeroed(&stream, 6 * bands * t_frames * pre_width).unwrap();
+    // Each band stores its two GLU halves with exactly 2*dim_in columns.
+    let mut pre2_all = DeviceBuffer::<f32>::zeroed(&stream, 6 * t_frames * 8200).unwrap();
+    let mask2_tiles_dev=DeviceBuffer::from_host(&stream,&mask2_tile_table(&offs)).unwrap();
 
     for s in 0..6usize {
         // SAFETY: 16 column tiles x ceil(T/128) row tiles x 62 bands.
@@ -6638,12 +6786,12 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
     for s in 0..6usize {
         // SAFETY: worst-case 17 column tiles; invalid per-band tiles return.
         unsafe {
-            km.mask_gemm2_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (pre_width.div_ceil(64) as u32, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, (s * bands) as u32, pre_width as u32, &offs_dev, &hidden_t, &gw.mask_w2_h[s], &gw.mask_b2[s], &mut pre2_all)
+            km.mask_gemm2_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (1, t_frames.div_ceil(128) as u32, mask2_tiles_dev.len() as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, (s * bands) as u32, &offs_dev, &mask2_tiles_dev, &hidden_t, &gw.mask_w2_h[s], &gw.mask_b2[s], &mut pre2_all)
         }.expect("grouped mask gemm2");
     }
     // SAFETY: one thread per padded GLU output element.
     unsafe {
-        km.glu_scatter(&stream, cuda_core::simt::LaunchConfig::for_num_elems(glu_all.len() as u32), &pre2_all, &offs_dev, &mut glu_all, t_frames as u32, bands as u32, max_dim as u32)
+        km.glu_scatter(&stream, LaunchConfig {grid_dim:(t_frames as u32,bands as u32,6),block_dim:(128,1,1),shared_mem_bytes:0}, &pre2_all, &offs_dev, &mut glu_all, t_frames as u32, bands as u32)
     }.expect("grouped glu");
 
     // Keep scratch alive through C2R: freeing 1+ GiB mid-forward stalls the
@@ -6670,7 +6818,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
                         for cc in 0..2usize {
                             let ref_idx = ((s * 2050 + fpos * 2 + ch) * t_frames + t) * 2 + cc;
                             let gcol = fi * 4 + ch * 2 + cc;
-                            let got = ga[((s * 62 + band) * t_frames + t) * 516 + gcol];
+                            let got = ga[s*t_frames*4100+t_frames*offs[band]as usize+t*(offs[band+1]-offs[band])as usize+gcol];
                             me = me.max((got - mask_ref[ref_idx]).abs());
                             dn = dn.max(mask_ref[ref_idx].abs());
                         }
@@ -6689,7 +6837,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
                 let fi = gc / 4;
                 let ch = (gc % 4) / 2;
                 let cc = gc % 2;
-                let got_v = ga[((0 * 62 + b24) * t_frames + 0) * 516 + gc];
+                let got_v = ga[t_frames * offs[b24] as usize + gc];
                 let ref_idx = ((0 * 2050 + (f0_24 + fi) * 2 + ch) * t_frames + 0) * 2 + cc;
                 let ref_v = mask_ref[ref_idx];
                 println!("  b24 glu[{}] = {got_v:.6} ref={ref_v:.6}", gc);
@@ -6699,7 +6847,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             let band0 = 0usize;
             let t0 = 0usize;
             let s0 = 0usize;
-            let got_v = ga[((s0 * 62 + band0) * t_frames + t0) * 516 + gc];
+            let got_v = ga[s0*t_frames*4100+t_frames*offs[band0]as usize+t0*(offs[band0+1]-offs[band0])as usize+gc];
             let fpos = 0usize;
             let ch = gc / 4;
             let cc = gc % 2;
@@ -6782,9 +6930,8 @@ struct BenchBufs {
     xin_dev: DeviceBuffer<f32>,
     bsnorm: DeviceBuffer<f32>,
     x: DeviceBuffer<f32>,
-    scr: E2eScratch,
+    scr: RuntimeScratch,
     x_final: DeviceBuffer<f32>,
-    xb: DeviceBuffer<f32>,       // f32 band-major (diagnostic dumps only)
     xb16: DeviceBuffer<u32>,     // packed f16x2 band-major (mask GEMM1 A)
     glu_all: DeviceBuffer<f32>,
     hidden_t: DeviceBuffer<u32>,   // packed f16x2
@@ -6794,6 +6941,7 @@ struct BenchBufs {
     offs_dev: DeviceBuffer<u32>,
     dims_dev: DeviceBuffer<u32>,
     f0_dev: DeviceBuffer<u32>,
+    mask2_tiles_dev: DeviceBuffer<u32>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6894,7 +7042,6 @@ unsafe fn bench_forward(
         km.transpose_band_major_h16(stream, elems(m * 128), &b.x_final, &mut b.xb16, t_frames as u32, bands as u32)
     }.map_err(|e| e.to_string())?;
     // 7. MaskEstimator grouped GEMMs
-    let pre_width = 2 * max_dim;
     for s in 0..6usize {
         // SAFETY: 16 column tiles x ceil(T/128) row tiles x 62 bands.
         unsafe {
@@ -6905,13 +7052,13 @@ unsafe fn bench_forward(
     for s in 0..6usize {
         // SAFETY: worst-case 17 column tiles; invalid per-band tiles return.
         unsafe {
-            km.mask_gemm2_f16(stream, LaunchConfig { grid_dim: (pre_width.div_ceil(64) as u32, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
-                t_frames as u32, (s * bands) as u32, pre_width as u32, &b.offs_dev, &b.hidden_t, &gw.mask_w2_h[s], &gw.mask_b2[s], &mut b.pre2_all)
+            km.mask_gemm2_f16(stream, LaunchConfig { grid_dim: (1, t_frames.div_ceil(128) as u32, b.mask2_tiles_dev.len() as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                t_frames as u32, (s * bands) as u32, &b.offs_dev, &b.mask2_tiles_dev, &b.hidden_t, &gw.mask_w2_h[s], &gw.mask_b2[s], &mut b.pre2_all)
         }.map_err(|e| e.to_string())?;
     }
     // SAFETY: one thread per padded GLU output element.
     unsafe {
-        km.glu_scatter(stream, elems(b.glu_all.len()), &b.pre2_all, &b.offs_dev, &mut b.glu_all, t_frames as u32, bands as u32, max_dim as u32)
+        km.glu_scatter(stream, LaunchConfig {grid_dim:(t_frames as u32,bands as u32,6),block_dim:(128,1,1),shared_mem_bytes:0}, &b.pre2_all, &b.offs_dev, &mut b.glu_all, t_frames as u32, bands as u32)
     }.map_err(|e| e.to_string())?;
     if trunk_dump.is_some() {
         {
@@ -6923,8 +7070,9 @@ unsafe fn bench_forward(
         {
             // xb (f32) is only produced on demand for this diagnostic dump.
             // SAFETY: elementwise transpose.
-            km.transpose_band_major(stream, elems(b.xb.len()), &b.x_final, &mut b.xb, t_frames as u32, bands as u32).unwrap();
-            let v = b.xb.to_host_vec(&stream).unwrap();
+            let mut xb=DeviceBuffer::<f32>::zeroed(stream,m*256).unwrap();
+            km.transpose_band_major(stream, elems(xb.len()), &b.x_final, &mut xb, t_frames as u32, bands as u32).unwrap();
+            let v = xb.to_host_vec(&stream).unwrap();
             let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
             std::fs::write("x_xb.bin", bytes).unwrap();
             println!("dump x_xb.bin ({} floats)", v.len());
@@ -6947,6 +7095,10 @@ unsafe fn bench_forward(
     Ok(())
 }
 
+fn mask2_tile_table(offs:&[u32])->Vec<u32> {
+    (0..offs.len()-1).flat_map(|band| (0..(2*(offs[band+1]-offs[band])).div_ceil(64)).map(move|col|((band as u32)<<16)|col)).collect()
+}
+
 fn make_bench_bufs(
     st: &Arc<CudaStream>,
     xi: &[f32], win: &[f32],
@@ -6963,66 +7115,31 @@ fn make_bench_bufs(
         xin_dev: zt(t_frames * 4100),
         bsnorm: zt(bands * t_frames * 516),
         x: zt(m * 256),
-        scr: E2eScratch {
-            h: zt(m * 256),
-            h16: DeviceBuffer::<u32>::zeroed(st, m * 128).unwrap(),
-        qkv16: DeviceBuffer::<u32>::zeroed(st, m * 768).unwrap(),
-k16r: DeviceBuffer::<u32>::zeroed(st, m * 256).unwrap(),
-        scaled16: DeviceBuffer::<u32>::zeroed(st, m * 256).unwrap(),
-        ff1_16: DeviceBuffer::<u32>::zeroed(st, m * 512).unwrap(),
-            qkv: zt(m * 1536),
-            qkv_rope: zt(m * 1536),
-            qkv_attn: zt(3 * 62 * 8 * t_frames.max(bands) * 64),
-            v_flat: zt(m * 512),
-            gates: zt(m * 8),
-            scaled: zt(m * 512),
-            oproj: zt(m * 256),
-            attn_out: zt(m * 256),
-            ffpre: zt(m * 1024),
-            ff1: zt(m * 1024),
-            ff2: zt(m * 256),
-            p_big: zt(62 * 8 * t_frames * t_frames),
-            attn_out_long: zt(496 * t_frames * 64),
-            cos: [DeviceBuffer::from_host(st, &cos_t).unwrap(), DeviceBuffer::from_host(st, &cos_f).unwrap()],
-            sin: [DeviceBuffer::from_host(st, &sin_t).unwrap(), DeviceBuffer::from_host(st, &sin_f).unwrap()],
-            zero_bias_t: zt(t_frames),
-            zero_bias_64: zt(64),
-            attn_max: zt(m * 8),
-            attn_scale: zt(m * 8),
-            lt: None,
-            lt_ws: None,
-            lt_dummy: None,
-            lt_dead: false, cudnn: None, options: inference.clone(), attention: None,
-        },
+        scr: RuntimeScratch::new(st, m, t_frames, bands, &cos_t, &sin_t, &cos_f, &sin_f, inference),
         x_final: zt(m * 256),
-        xb: zt(m * 256),
         xb16: DeviceBuffer::<u32>::zeroed(st, m * 128).unwrap(),
-        glu_all: zt(6 * bands * t_frames * 516),
+        glu_all: zt(6 * t_frames * 4100),
         hidden_t: DeviceBuffer::<u32>::zeroed(st, 6 * bands * t_frames * 512).unwrap(),
-        pre2_all: zt(6 * bands * t_frames * 2 * 516),
+        pre2_all: zt(6 * t_frames * 8200),
         c2r_in: zt(12 * t_frames * stft::FREQ_BINS * 2),
         pcm: zt(12 * t_frames * 2048),
         offs_dev: DeviceBuffer::from_host(st, offs).unwrap(),
         dims_dev: DeviceBuffer::from_host(st, dims).unwrap(),
         f0_dev: DeviceBuffer::from_host(st, f0).unwrap(),
+        mask2_tiles_dev: DeviceBuffer::from_host(st, &mask2_tile_table(offs)).unwrap(),
     }
 }
 
 fn bench_memory(gw: &GpuWeights, b: &BenchBufs, extra: usize) -> serde_json::Value {
-    let weights = gw.qkv_w.iter().map(|b|b.len()*4).sum::<usize>() +
-        gw.qkv_w_h.iter().map(|b|b.len()*4).sum::<usize>() +
+    let weights = gw.qkv_w_h.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.out_w_h.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.ff_w1_h.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.ff_w2_h.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.gates_w.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.gates_b.iter().map(|b|b.len()*4).sum::<usize>() +
-        gw.out_w.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.norm_gamma.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.ff_gamma.iter().map(|b|b.len()*4).sum::<usize>() +
-        gw.ff_w1.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.ff_b1.iter().map(|b|b.len()*4).sum::<usize>() +
-        gw.ff_b1_h.iter().map(|b|b.len()*4).sum::<usize>() +
-        gw.ff_w2.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.ff_b2.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.shared_qkv_bias.len()*4 +
         gw.shared_qkv_bias_h.len()*4 +
@@ -7031,9 +7148,7 @@ fn bench_memory(gw: &GpuWeights, b: &BenchBufs, extra: usize) -> serde_json::Val
         gw.band_gamma.len()*4 +
         gw.band_w.len()*4 +
         gw.band_b.len()*4 +
-        gw.mask_w1.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.mask_b1.iter().map(|b|b.len()*4).sum::<usize>() +
-        gw.mask_w2.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.mask_b2.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.mask_w1_h.iter().map(|b|b.len()*4).sum::<usize>() +
         gw.mask_w2_h.iter().map(|b|b.len()*4).sum::<usize>();
@@ -7045,7 +7160,6 @@ fn bench_memory(gw: &GpuWeights, b: &BenchBufs, extra: usize) -> serde_json::Val
         b.bsnorm.len()*4 +
         b.x.len()*4 +
         b.x_final.len()*4 +
-        b.xb.len()*4 +
         b.xb16.len()*4 +
         b.glu_all.len()*4 +
         b.hidden_t.len()*4 +
@@ -7054,32 +7168,21 @@ fn bench_memory(gw: &GpuWeights, b: &BenchBufs, extra: usize) -> serde_json::Val
         b.pcm.len()*4 +
         b.offs_dev.len()*4 +
         b.dims_dev.len()*4 +
-        b.f0_dev.len()*4 + b.scr.h.len()*4 +
+        b.f0_dev.len()*4 + b.mask2_tiles_dev.len()*4 +
         b.scr.h16.len()*4 +
-        b.scr.qkv.len()*4 +
         b.scr.qkv16.len()*4 +
         b.scr.k16r.len()*4 +
-        b.scr.qkv_rope.len()*4 +
-        b.scr.qkv_attn.len()*4 +
-        b.scr.v_flat.len()*4 +
         b.scr.gates.len()*4 +
-        b.scr.scaled.len()*4 +
         b.scr.scaled16.len()*4 +
-        b.scr.oproj.len()*4 +
         b.scr.attn_out.len()*4 +
-        b.scr.ffpre.len()*4 +
-        b.scr.ff1.len()*4 +
         b.scr.ff1_16.len()*4 +
-        b.scr.ff2.len()*4 +
-        b.scr.p_big.len()*4 +
-        b.scr.attn_out_long.len()*4 +
-        b.scr.zero_bias_t.len()*4 +
-        b.scr.zero_bias_64.len()*4 +
         b.scr.attn_max.len()*4 +
         b.scr.attn_scale.len()*4 + b.scr.cos.iter().chain(b.scr.sin.iter()).map(|v|v.len()*4).sum::<usize>();
     let workspace = b.scr.lt_ws.as_ref().map_or(0,|v|v.len()) + b.scr.cudnn.as_ref().map_or(0,|c|c.workspace_bytes());
-    let tuning = b.scr.lt_dummy.as_ref().map_or(0,|v|v.len());
-    serde_json::json!({"weights":weights,"scratch":scratch,"workspace":workspace,"tuning_temporary":tuning,"tracked_resident":weights+scratch+workspace+tuning,"tracked_peak":weights+scratch+workspace+tuning,"external_peak":null,"accounting":"explicit device allocations; driver/library internal memory is recorded by external telemetry"})
+    let scratch=scratch+b.scr.ff1_pre.as_ref().map_or(0,|v|v.len()*4);
+    let tuning=0usize;
+    let tuning_peak=b.scr.lt.as_ref().map_or(0,|lt|lt.tuning_peak_bytes());
+    serde_json::json!({"weights":weights,"scratch":scratch,"workspace":workspace,"tuning_temporary":tuning,"tracked_resident":weights+scratch+workspace+tuning,"tuning_peak":tuning_peak,"tracked_peak":weights+scratch+workspace+tuning_peak,"external_peak":null,"accounting":"explicit device allocations; driver/library internal memory is recorded by external telemetry"})
 }
 
 fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bool, options: &benchmark::Options, inference: &InferenceOptions) {
@@ -7107,6 +7210,8 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bo
     let parse=Instant::now(); let w=weights::ModelWeights::load(&st,&cfg).unwrap();
     let parse_ms=parse.elapsed().as_secs_f64()*1000.0;
     let upload=Instant::now(); let gw=upload_weights(&ctx,&stream,&w).expect("weights upload");
+    stream.synchronize().expect("weights ready");
+    drop(w);drop(st);
     stream.synchronize().expect("upload sync");
     let upload_ms=upload.elapsed().as_secs_f64()*1000.0;
     let mut xi=vec![0.0f32;2*len]; for i in 0..len { xi[2*i]=inp[i];xi[2*i+1]=inp[len+i]; }
@@ -7167,9 +7272,9 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bo
         let report=json!({"schema_version":1,"identity":benchmark::identity(model_dir,&reference,&name,sm).expect("benchmark identity"),
             "shape":{"batch":1,"channels":2,"stems":6,"samples":len,"T":t_frames,"bands":bands,"sample_rate":cfg.sample_rate},
             "pipeline":options.stage.name(),
-            "backend":{"attention_time":bufs.scr.attention.as_ref().map(|a|&a[0]),"attention_freq":bufs.scr.attention.as_ref().map(|a|&a[1]),"ff1":"handwritten","qk_rope":inference.rope,"cublaslt":bufs.scr.lt.is_some(),"cudnn_version":bufs.scr.cudnn.as_ref().map(|c|c.version()),"cudnn_plans":bufs.scr.cudnn.as_ref().map(|c|c.plans_json())},
-            "precision":{"matrix_input":"fp16","accumulation":"fp32","residual":"fp32","tf32":false,"input_resident_gpu":true,"output_resident_gpu":options.stage==benchmark::Stage::Waveform},
-            "timing_ms":{"context_kernels":context_ms,"weights_read":read_ms,"weights_parse":parse_ms,"weights_pack_h2d":upload_ms,"fft_plan":fft_plan_ms,"allocation_input_h2d":allocation_ms,"prepare_algorithms":prepare_ms,"warmup":options.warmup,"iterations":iters,"host_total":host_ms,"host_per_iteration":avg,"cuda_event":gpu_ms,"download_and_host_ola_check":download_check_ms,"process_before_hashes":wall.elapsed().as_secs_f64()*1000.0,"rtf":avg/(len as f64/cfg.sample_rate as f64*1000.0)},
+            "backend":{"attention_time":bufs.scr.attention.as_ref().map(|a|&a[0]),"attention_freq":bufs.scr.attention.as_ref().map(|a|&a[1]),"ff1":{"requested":inference.ff1,"selected":inference.selected_ff1()},"qk_rope":inference.rope,"cublaslt":bufs.scr.lt.is_some(),"cublaslt_version":bufs.scr.lt.as_ref().map(|lt|lt.version()),"cublaslt_algorithms":bufs.scr.lt.as_ref().map(|lt|lt.algorithms_json()),"cudnn_version":bufs.scr.cudnn.as_ref().map(|c|c.version()),"cudnn_plans":bufs.scr.cudnn.as_ref().map(|c|c.plans_json())},
+            "precision":{"matrix_input":"fp16","accumulation":"fp32","residual":"fp32","tf32":false,"input_resident_gpu":true,"output_resident_gpu":true,"output_kind":options.stage.name()},
+            "timing_ms":{"context_kernels":context_ms,"weights_read":read_ms,"weights_parse":parse_ms,"weights_pack_h2d":upload_ms,"weights_conversion":gw.pack_ms,"weights_h2d_and_alloc":gw.h2d_ms,"fft_plan":fft_plan_ms,"allocation_input_h2d":allocation_ms,"prepare_algorithms":prepare_ms,"warmup":options.warmup,"iterations":iters,"host_total":host_ms,"host_per_iteration":avg,"cuda_event":gpu_ms,"download_and_host_ola_check":download_check_ms,"process_before_hashes":wall.elapsed().as_secs_f64()*1000.0,"rtf":avg/(len as f64/cfg.sample_rate as f64*1000.0)},
             "memory_bytes":bench_memory(&gw,&bufs,12*len*4+inverse.len()*4),
             "correctness":correct,"ola_vs_host":ola,"mfu":benchmark::mfu(&name,t_frames,benchmark::median(&gpu_ms))});
         benchmark::write_json(path,&report).expect("write benchmark JSON");
@@ -7364,6 +7469,8 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
     let st = weights::SafeTensors::open(&model_dir.join("model.safetensors")).unwrap();
     let w = weights::ModelWeights::load(&st, &cfg).unwrap();
     let gw = upload_weights(&ctx, &stream, &w).expect("weights upload");
+    stream.synchronize().expect("weights ready");
+    drop(w);drop(st);
     println!("weights  : load+upload {:.2}s", t0.elapsed().as_secs_f64());
 
     let fft = std::sync::Arc::new(cufft::Cufft::load().expect("cufft"));
@@ -7386,9 +7493,6 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
         offs[i + 1] = offs[i] + dims[i];
         f0[i] = freqs[..i].iter().sum::<usize>() as u32;
     }
-    let offs_dev = DeviceBuffer::from_host(&stream, &offs).unwrap();
-    let dims_dev = DeviceBuffer::from_host(&stream, &dims).unwrap();
-    let f0_dev = DeviceBuffer::from_host(&stream, &f0).unwrap();
 
     let cos_t: Vec<f32> = (0..t_frames).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).cos())).collect();
     let sin_t: Vec<f32> = (0..t_frames).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).sin())).collect();
@@ -7396,61 +7500,11 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
     let sin_f: Vec<f32> = (0..bands).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).sin())).collect();
 
     let z = |n: usize| DeviceBuffer::<f32>::zeroed(&stream, n).unwrap();
-    let mut bufs = BenchBufs {
-        x_dev: z(C * 2),
-        win_dev: DeviceBuffer::from_host(&stream, sp.window()).unwrap(),
-        frames_dev: z(2 * t_frames * stft::N_FFT),
-        spec_dev: z(2 * t_frames * stft::FREQ_BINS * 2),
-        xin_dev: z(t_frames * 4100),
-        bsnorm: z(bands * t_frames * 516),
-        x: z(m * 256),
-        scr: E2eScratch {
-            h: z(m * 256),
-            h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
-            qkv: z(m * 1536),
-            qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
-k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
-            scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
-            qkv_rope: z(m * 1536),
-            qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64),
-            v_flat: z(m * 512),
-            gates: z(m * 8),
-            scaled: z(m * 512),
-            oproj: z(m * 256),
-            attn_out: z(m * 256),
-            ffpre: z(m * 1024),
-            ff1: z(m * 1024),
-            ff1_16: DeviceBuffer::<u32>::zeroed(&stream, m * 512).unwrap(),
-            ff2: z(m * 256),
-            p_big: z(62 * 8 * t_frames * t_frames),
-            attn_out_long: z(496 * t_frames * 64),
-            cos: [DeviceBuffer::from_host(&stream, &cos_t).unwrap(), DeviceBuffer::from_host(&stream, &cos_f).unwrap()],
-            sin: [DeviceBuffer::from_host(&stream, &sin_t).unwrap(), DeviceBuffer::from_host(&stream, &sin_f).unwrap()],
-            zero_bias_t: z(t_frames),
-            zero_bias_64: z(64),
-            attn_max: z(m * 8),
-            attn_scale: z(m * 8),
-            lt: None,
-            lt_ws: None,
-            lt_dummy: None,
-            lt_dead: false, cudnn: None, options: inference.clone(), attention: None,
-        },
-        x_final: z(m * 256),
-        xb: z(m * 256),
-        xb16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
-        glu_all: z(6 * bands * t_frames * 516),
-        hidden_t: DeviceBuffer::<u32>::zeroed(&stream, 6 * bands * t_frames * 512).unwrap(),
-        pre2_all: z(6 * bands * t_frames * 2 * 516),
-        c2r_in: z(12 * t_frames * stft::FREQ_BINS * 2),
-        pcm: z(12 * t_frames * 2048),
-        offs_dev,
-        dims_dev,
-        f0_dev,
-    };
+    let mut bufs = make_bench_bufs(&stream,&vec![0.0;C*2],sp.window(),&cos_t,&sin_t,&cos_f,&sin_f,&offs,&dims,&f0,m,t_frames,bands,inference);
     let _ = &mut bufs;
     cudnn_ready(&ctx, &stream, &mut bufs.scr, bands, t_frames).expect("prepare attention");
-    let attn_engine = if bufs.scr.cudnn.is_some() { "cudnn fused SDPA" } else { "hand-written flash (cudnn unavailable)" };
-    println!("engine   : cuBLASLt GEMMs + {attn_engine}");
+    let selected=bufs.scr.attention.as_ref().expect("attention prepared");
+    println!("engine   : attention time={:?}, freq={:?}",selected[0].selected,selected[1].selected);
 
     // Per-chunk ISTFT window-energy counter: identical for every chunk (same
     // frame layout), so computed once and uploaded once. The GPU OLA kernel
@@ -7538,6 +7592,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
     let dl_t0 = std::time::Instant::now();
     let result = result_dev.to_host_vec(&stream).unwrap();
     let demix_counter = counter_dev.to_host_vec(&stream).unwrap();
+    assert!(demix_counter[BORDER..BORDER+len].iter().all(|c|c.is_finite()&&*c>1e-8), "demix has uncovered output samples");
     let dl_ms = dl_t0.elapsed().as_secs_f64() * 1000.0;
     if tty { println!(); }
     println!("gpu      : wall {:.2}s, download {:.0}ms, RTF {:.4}",
@@ -7587,8 +7642,12 @@ fn forward_only(device: usize, model_dir: &std::path::Path, input: &std::path::P
     let st = weights::SafeTensors::open(&model_dir.join("model.safetensors")).unwrap();
     let w = weights::ModelWeights::load(&st, &cfg).unwrap();
     let gw = upload_weights(&ctx, &stream, &w).expect("weights");
+    stream.synchronize().expect("weights ready");
+    drop(w);drop(st);
     let fft = std::sync::Arc::new(cufft::Cufft::load().expect("cufft"));
+    assert!(len>stft::N_FFT/2,"single-block input must exceed n_fft/2");
     let sp = stft::Stft::new(fft.clone(), t_frames).expect("stft");
+    sp.set_stream(&stream).expect("stft stream");
     let c2r_plan = {
         let r: &cufft::Cufft = &fft;
         unsafe {
@@ -7605,65 +7664,12 @@ fn forward_only(device: usize, model_dir: &std::path::Path, input: &std::path::P
         offs[i + 1] = offs[i] + dims[i];
         f0[i] = freqs[..i].iter().sum::<usize>() as u32;
     }
-    let offs_dev = DeviceBuffer::from_host(&stream, &offs).unwrap();
-    let dims_dev = DeviceBuffer::from_host(&stream, &dims).unwrap();
-    let f0_dev = DeviceBuffer::from_host(&stream, &f0).unwrap();
     let cos_t: Vec<f32> = (0..t_frames).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).cos())).collect();
     let sin_t: Vec<f32> = (0..t_frames).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).sin())).collect();
     let cos_f: Vec<f32> = (0..bands).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).cos())).collect();
     let sin_f: Vec<f32> = (0..bands).flat_map(|p| (0..32).map(move |i| ((p as f64 * (1.0 / 10000.0f64.powf(2.0 * i as f64 / 64.0))) as f32).sin())).collect();
     let z = |n: usize| DeviceBuffer::<f32>::zeroed(&stream, n).unwrap();
-    let mut bufs = BenchBufs {
-        x_dev: DeviceBuffer::from_host(&stream, &wav.samples).unwrap(),
-        win_dev: DeviceBuffer::from_host(&stream, sp.window()).unwrap(),
-        frames_dev: z(2 * t_frames * stft::N_FFT),
-        spec_dev: z(2 * t_frames * stft::FREQ_BINS * 2),
-        xin_dev: z(t_frames * 4100),
-        bsnorm: z(bands * t_frames * 516),
-        x: z(m * 256),
-        scr: E2eScratch {
-            h: z(m * 256),
-            h16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
-            qkv: z(m * 1536),
-            qkv16: DeviceBuffer::<u32>::zeroed(&stream, m * 768).unwrap(),
-k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
-            scaled16: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
-            qkv_rope: z(m * 1536),
-            qkv_attn: z(3 * 62 * 8 * t_frames.max(bands) * 64),
-            v_flat: z(m * 512),
-            gates: z(m * 8),
-            scaled: z(m * 512),
-            oproj: z(m * 256),
-            attn_out: z(m * 256),
-            ffpre: z(m * 1024),
-            ff1: z(m * 1024),
-            ff1_16: DeviceBuffer::<u32>::zeroed(&stream, m * 512).unwrap(),
-            ff2: z(m * 256),
-            p_big: z(62 * 8 * t_frames * t_frames),
-            attn_out_long: z(496 * t_frames * 64),
-            cos: [DeviceBuffer::from_host(&stream, &cos_t).unwrap(), DeviceBuffer::from_host(&stream, &cos_f).unwrap()],
-            sin: [DeviceBuffer::from_host(&stream, &sin_t).unwrap(), DeviceBuffer::from_host(&stream, &sin_f).unwrap()],
-            zero_bias_t: z(t_frames),
-            zero_bias_64: z(64),
-            attn_max: z(m * 8),
-            attn_scale: z(m * 8),
-            lt: None,
-            lt_ws: None,
-            lt_dummy: None,
-            lt_dead: false, cudnn: None, options: inference.clone(), attention: None,
-        },
-        x_final: z(m * 256),
-        xb: z(m * 256),
-        xb16: DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap(),
-        glu_all: z(6 * bands * t_frames * 516),
-        hidden_t: DeviceBuffer::<u32>::zeroed(&stream, 6 * bands * t_frames * 512).unwrap(),
-        pre2_all: z(6 * bands * t_frames * 2 * 516),
-        c2r_in: z(12 * t_frames * stft::FREQ_BINS * 2),
-        pcm: z(12 * t_frames * 2048),
-        offs_dev,
-        dims_dev,
-        f0_dev,
-    };
+    let mut bufs = make_bench_bufs(&stream,&wav.samples,sp.window(),&cos_t,&sin_t,&cos_f,&sin_f,&offs,&dims,&f0,m,t_frames,bands,inference);
     let t0 = std::time::Instant::now();
     unsafe { bench_forward(&km, &ctx, &stream, &gw, &sp, &c2r_plan, &mut bufs, len, t_frames, bands, Some(std::path::Path::new("trunk0.bin"))).expect("forward"); }
     stream.synchronize().expect("sync");
@@ -7701,6 +7707,152 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         audio::write_wav_f32(&path, &audio::WavData { sample_rate: wav.sample_rate, channels: 2, samples: out_samples }).expect("write stem");
         println!("wrote {}", path.display());
     }
+}
+
+/// Synthetic boundary checks need no checkpoint or Python reference files.
+fn kernel_regression(device:usize, report:Option<&std::path::Path>) {
+    let ctx=CudaContext::new(device).expect("ctx");let stream=ctx.new_stream().unwrap();let km=gpu_kernels::load(&ctx).unwrap();
+    for frames in [1usize,37,62,63,64,65,259,1151] {
+        let bands=62usize;let m=frames*bands;
+        let raw:Vec<u32>=(0..m*768).map(|i|{let a=((i%127)as f32-63.0)/64.0;let b=((i%93)as f32-46.0)/48.0;(f32_to_f16_bits(a)as u32)|((f32_to_f16_bits(b)as u32)<<16)}).collect();
+        for axis in 0..2usize {
+            let length=if axis==0{frames}else{bands};
+            let cos:Vec<f32>=(0..length*32).map(|i|((i/32)as f32*(1.0/10000.0f32.powf(2.0*(i%32)as f32/64.0))).cos()).collect();
+            let sin:Vec<f32>=(0..length*32).map(|i|((i/32)as f32*(1.0/10000.0f32.powf(2.0*(i%32)as f32/64.0))).sin()).collect();
+            let c=DeviceBuffer::from_host(&stream,&cos).unwrap();let s=DeviceBuffer::from_host(&stream,&sin).unwrap();
+            let mut split=DeviceBuffer::from_host(&stream,&raw).unwrap();let mut fused=DeviceBuffer::from_host(&stream,&raw).unwrap();
+            let mut ks=DeviceBuffer::<u32>::zeroed(&stream,m*256).unwrap();let mut kf=DeviceBuffer::<u32>::zeroed(&stream,m*256).unwrap();
+            let launch=LaunchConfig::for_num_elems((m*256)as u32);
+            unsafe {
+                km.rope_k16(&stream,launch,&split,&c,&s,&mut ks,bands as u32,axis as u32).unwrap();
+                km.rope_q16_inplace(&stream,launch,&mut split,&c,&s,bands as u32,axis as u32).unwrap();
+                km.rope_qk16(&stream,launch,&mut fused,&c,&s,&mut kf,bands as u32,axis as u32).unwrap();
+            }
+            assert_eq!(split.to_host_vec(&stream).unwrap(),fused.to_host_vec(&stream).unwrap(),"Q/K/V boundary T={frames} axis={axis}");
+            assert_eq!(ks.to_host_vec(&stream).unwrap(),kf.to_host_vec(&stream).unwrap(),"K boundary T={frames} axis={axis}");
+            let gates:Vec<f32>=(0..m*8).map(|i|((i%73)as f32-36.0)/7.0).collect();let gates=DeviceBuffer::from_host(&stream,&gates).unwrap();
+            unsafe {km.sdpa_gate(&stream,launch,&mut ks,&gates).unwrap();km.sdpa_gate_broadcast(&stream,launch,&mut kf,&gates).unwrap();}
+            assert_eq!(ks.to_host_vec(&stream).unwrap(),kf.to_host_vec(&stream).unwrap(),"gate boundary T={frames} axis={axis}");
+        }
+        println!("KERNEL_REGRESSION RoPE/gate T={frames} axes=2 bit_equal=true");
+    }
+    ola_regression(&km,&stream);
+    mask_layout_regression(&km,&stream);
+    let ff1=ff1_kernel_regression(&km,&ctx,&stream);
+    if let Some(path)=report {benchmark::write_json(path,&serde_json::json!({"schema_version":1,"ff1":ff1,"rope_gate_boundaries":"bit_equal"})).unwrap();}
+    println!("KERNEL_REGRESSION_OK");
+}
+
+/// One-hot weights make every mask row/column identifiable without a checkpoint.
+fn ola_regression(km:&gpu_kernels::LoadedModule,stream:&Arc<CudaStream>) {
+    let fft=Arc::new(cufft::Cufft::load().unwrap());
+    for len in [1025usize,18944,132300,588800] {
+        let frames=stft::num_frames(len);let sp=stft::Stft::new(fft.clone(),frames).unwrap();sp.set_stream(stream).unwrap();
+        let inverse=fft.plan(2048,2*frames,false).unwrap();inverse.set_stream(stream).unwrap();
+        let win=DeviceBuffer::from_host(stream,sp.window()).unwrap();
+        for silent in [false,true] {
+            let mut input=vec![0.0f32;2*len];
+            if !silent {input[0]=0.5;input[2*(len-1)]=1.0;input[2*31+1]=-0.25;input[2*(len-1)+1]=0.125;}
+            let x=DeviceBuffer::from_host(stream,&input).unwrap();let mut frame_buf=DeviceBuffer::<f32>::zeroed(stream,2*frames*2048).unwrap();let mut spectrum=DeviceBuffer::<f32>::zeroed(stream,2*frames*1025*2).unwrap();let mut pcm2=DeviceBuffer::<f32>::zeroed(stream,2*frames*2048).unwrap();
+            unsafe{km.frame_hann_reflect(stream,LaunchConfig::for_num_elems(frame_buf.len()as u32),&x,&win,&mut frame_buf,2048,512,len as u32,frames as u32).unwrap();}
+            sp.exec_fwd(&frame_buf,&mut spectrum).unwrap();inverse.exec_c2r(spectrum.cu_deviceptr(),pcm2.cu_deviceptr()).unwrap();
+            let pcm=DeviceBuffer::from_host(stream,&pcm2.to_host_vec(stream).unwrap().repeat(6)).unwrap();
+            let inv=DeviceBuffer::from_host(stream,&benchmark::istft_inverse(sp.window(),len,frames)).unwrap();let mut result=DeviceBuffer::from_host(stream,&vec![f32::NAN;12*len]).unwrap();
+            for pass in 0..2 {
+                unsafe{km.istft_ola(stream,LaunchConfig::for_num_elems((12*len)as u32),&pcm,&win,&inv,&mut result,len as u32,frames as u32).unwrap();}
+                let out=result.to_host_vec(stream).unwrap();
+                for sc in 0..12 {for i in 0..len {let value=out[sc*len+i];let expected=input[2*i+sc%2];assert!(value.is_finite()&&(value-expected).abs()<=1e-6,"OLA L={len} silent={silent} pass={pass} sc={sc} i={i}: {value} != {expected}");}}
+            }
+        }
+        println!("KERNEL_REGRESSION STFT/OLA L={len} impulse_channels=2 silence=true overwrite=true");
+    }
+}
+
+fn mask_layout_regression(km:&gpu_kernels::LoadedModule,stream:&Arc<CudaStream>) {
+    let dims:Vec<usize>=[(8,24),(16,12),(48,8),(96,8),(192,8),(512,1),(516,1)].into_iter().flat_map(|(d,n)|std::iter::repeat_n(d,n)).collect();
+    let mut offs=vec![0u32];for &d in &dims {offs.push(offs.last().unwrap()+d as u32);}
+    assert_eq!(*offs.last().unwrap(),4100);
+    let f0:Vec<u32>=offs[..62].iter().map(|x|x/4).collect();
+    let offsets=DeviceBuffer::from_host(stream,&offs).unwrap();let f0_dev=DeviceBuffer::from_host(stream,&f0).unwrap();
+    let table=mask2_tile_table(&offs);assert_eq!(table.len(),157);assert_eq!(table.iter().copied().collect::<std::collections::BTreeSet<_>>().len(),157);
+    let tiles=DeviceBuffer::from_host(stream,&table).unwrap();
+    let mut weights=vec![0u32;8200*512];for col in 0..8200 {weights[col*512]=0x3c00;}
+    let weights=DeviceBuffer::from_host(stream,&weights).unwrap();
+    let biases:Vec<Vec<f32>>=(0..6).map(|s|(0..8200).map(|i|i as f32*0.00003+s as f32/16.0).collect()).collect();
+    let bias_dev:Vec<_>=biases.iter().map(|b|DeviceBuffer::from_host(stream,b).unwrap()).collect();
+    for frames in [259usize,1151] {
+        let mut hidden=vec![0u32;6*62*frames*512];
+        for s in 0..6 {for band in 0..62 {for t in 0..frames {
+            let x=t as f32/2048.0+band as f32/256.0+s as f32/32.0;
+            hidden[((s*62+band)*frames+t)*512]=f32_to_f16_bits(x)as u32;
+        }}}
+        let hidden=DeviceBuffer::from_host(stream,&hidden).unwrap();
+        let mut pre=DeviceBuffer::from_host(stream,&vec![f32::NAN;6*frames*8200]).unwrap();
+        for s in 0..6 {unsafe {km.mask_gemm2_f16(stream,LaunchConfig{grid_dim:(1,frames.div_ceil(128)as u32,table.len()as u32),block_dim:(256,1,1),shared_mem_bytes:0},frames as u32,(s*62)as u32,&offsets,&tiles,&hidden,&weights,&bias_dev[s],&mut pre).unwrap();}}
+        let pre_host=pre.to_host_vec(stream).unwrap();
+        for s in 0..6 {for band in 0..62 {for t in 0..frames {for d in 0..2*dims[band] {
+            let x=f16_bits_to_f32(f32_to_f16_bits(t as f32/2048.0+band as f32/256.0+s as f32/32.0));
+            let expected=x+biases[s][2*offs[band]as usize+d];let index=s*frames*8200+frames*2*offs[band]as usize+t*2*dims[band]+d;
+            assert_eq!(pre_host[index].to_bits(),expected.to_bits(),"mask2 T={frames} s={s} b={band} t={t} d={d}");
+        }}}}
+        let mut glu=DeviceBuffer::from_host(stream,&vec![f32::NAN;6*frames*4100]).unwrap();
+        unsafe{km.glu_scatter(stream,LaunchConfig{grid_dim:(frames as u32,62,6),block_dim:(128,1,1),shared_mem_bytes:0},&pre,&offsets,&mut glu,frames as u32,62).unwrap();}
+        let gl=glu.to_host_vec(stream).unwrap();
+        for s in 0..6 {for band in 0..62 {for t in 0..frames {for d in 0..dims[band] {
+            let src=s*frames*8200+frames*2*offs[band]as usize+t*2*dims[band];let expected=pre_host[src+d]/(1.0+(-pre_host[src+dims[band]+d]).exp());
+            let index=s*frames*4100+frames*offs[band]as usize+t*dims[band]+d;
+            assert!(gl[index].is_finite()&&(gl[index]-expected).abs()<=1e-6,"GLU mapping T={frames} s={s} b={band} t={t} d={d}");
+        }}}}
+        drop(pre_host);
+        let spec:Vec<f32>=(0..2*frames*1025*2).map(|i|((i%101)as f32-50.0)/128.0).collect();let spec_dev=DeviceBuffer::from_host(stream,&spec).unwrap();
+        let mut masked=DeviceBuffer::<f32>::zeroed(stream,12*frames*1025*2).unwrap();
+        unsafe{km.mask_apply(stream,LaunchConfig::for_num_elems(masked.len()as u32),&spec_dev,&glu,&f0_dev,&mut masked,frames as u32,62).unwrap();}
+        let masked=masked.to_host_vec(stream).unwrap();
+        for s in 0..6 {for band in 0..62 {for t in 0..frames {for fi in 0..dims[band]/4 {for ch in 0..2 {
+            let p=s*frames*4100+frames*offs[band]as usize+t*dims[band]+fi*4+ch*2;let f=f0[band]as usize+fi;let sp=((ch*frames+t)*1025+f)*2;
+            let dst=(((s*2+ch)*frames+t)*1025+f)*2;
+            let real=spec[sp]*gl[p]-spec[sp+1]*gl[p+1];let imag=spec[sp]*gl[p+1]+spec[sp+1]*gl[p];
+            assert!((masked[dst]-real).abs()<=1e-6&&(masked[dst+1]-imag).abs()<=1e-6,"mask spectrum T={frames} s={s} b={band} t={t} fi={fi} ch={ch}");
+        }}}}}
+        println!("KERNEL_REGRESSION compact_mask T={frames} bands=62 stems=6 all_slots_written=true");
+    }
+}
+
+fn ff1_kernel_regression(km:&gpu_kernels::LoadedModule,ctx:&Arc<CudaContext>,stream:&Arc<CudaStream>)->serde_json::Value {
+    let ws=DeviceBuffer::<u8>::zeroed(stream,32<<20).unwrap();
+    let mut lt=cublaslt::CublasLt::load(ctx,ws.cu_deviceptr(),ws.len()).expect("FF1 regression requires cuBLASLt");
+    let weight:Vec<f32>=(0..1024*256).map(|i|((i%19)as f32-9.0)/64.0).collect();
+    let wh=DeviceBuffer::from_host(stream,&pack_f16x2(&weight)).unwrap();
+    let bias:Vec<f32>=(0..1024).map(|i|((i%13)as f32-6.0)/128.0).collect();let bias=DeviceBuffer::from_host(stream,&bias).unwrap();
+    let mut rows=Vec::new();
+    for m in [1usize,37,127,129,16058,71362] {
+        let input:Vec<f32>=(0..m*256).map(|i|((i%31)as f32-15.0)/32.0).collect();let words=pack_f16x2(&input);drop(input);
+        let x=DeviceBuffer::from_host(stream,&words).unwrap();
+        let mut output=DeviceBuffer::<u32>::zeroed(stream,m*512).unwrap();let mut pre=DeviceBuffer::<f32>::zeroed(stream,m*1024).unwrap();
+        let mut reference=None;
+        for mode in ["handwritten","handwritten-async","cublaslt-erf"] {
+            let mut launch=||{
+                unsafe {match mode {
+                    "handwritten"=>km.gemm_f16_gelu_a16w(stream,tile_cfg_tf32_64(m,1024),m as u32,1024,256,&x,&wh,&bias,&mut output).unwrap(),
+                    "handwritten-async"=>km.gemm_f16_gelu_async(stream,tile_cfg_tf32_64(m,1024),m as u32,1024,256,&x,&wh,&bias,&mut output).unwrap(),
+                    _=>{lt.matmul_f32out(stream,m as u64,1024,256,wh.cu_deviceptr(),x.cu_deviceptr(),bias.cu_deviceptr(),pre.cu_deviceptr()).unwrap();km.erf_gelu_pack(stream,LaunchConfig::for_num_elems((m*512)as u32),&pre,&mut output).unwrap();}
+                }}
+            };
+            for _ in 0..3{launch();}stream.synchronize().unwrap();
+            let mut times=Vec::new();
+            for _ in 0..3 {
+                let a=ctx.new_event(Some(0)).unwrap();let b=ctx.new_event(Some(0)).unwrap();a.record(stream).unwrap();
+                for _ in 0..10{launch();}b.record(stream).unwrap();b.synchronize().unwrap();times.push(a.elapsed_ms(&b).unwrap()as f64/10.0);
+            }
+            drop(launch);
+            let got=output.to_host_vec(stream).unwrap();
+            if let Some(ref expected)=reference{assert_eq!(expected,&got,"FF1 M={m} mode={mode}");}else{reference=Some(got);}
+            assert_eq!(x.to_host_vec(stream).unwrap(),words,"autotune changed production X");
+            let ms=benchmark::median(&times);println!("KERNEL_REGRESSION FF1 M={m} mode={mode} median={ms:.5}ms bit_equal=true");
+            rows.push(serde_json::json!({"m":m,"n":1024,"k":256,"mode":mode,"median_ms":ms,"groups_ms":times,"bit_equal":true}));
+        }
+    }
+    serde_json::json!(rows)
 }
 
 fn self_test(device: usize) {

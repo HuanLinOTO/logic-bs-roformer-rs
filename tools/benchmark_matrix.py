@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import statistics
+import signal
 import subprocess
 import sys
 import time
@@ -92,6 +93,7 @@ def run(a):
     extra={'B0':json.loads(a.baseline_args),'candidate':json.loads(a.candidate_args)}
     if not all(isinstance(v,list) and all(isinstance(x,str) for x in v) for v in extra.values()): raise ValueError('extra args must be JSON string arrays')
     rows=[];telemetry=(a.out/'gpu-telemetry.csv').open('w');sampler=None
+    previous_term=signal.signal(signal.SIGTERM,lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     try:
         sampler=subprocess.Popen(['nvidia-smi','--query-gpu=timestamp,name,clocks.sm,clocks.mem,power.draw,temperature.gpu,utilization.gpu,memory.used','--format=csv','--loop-ms=200'],stdout=telemetry,stderr=subprocess.STDOUT)
         for case in cases:
@@ -134,6 +136,7 @@ def run(a):
             try: sampler.wait(timeout=10)
             except subprocess.TimeoutExpired: sampler.kill();sampler.wait()
         telemetry.close()
+        signal.signal(signal.SIGTERM,previous_term)
 
 def main():
     ap=argparse.ArgumentParser();sub=ap.add_subparsers(dest='action',required=True)

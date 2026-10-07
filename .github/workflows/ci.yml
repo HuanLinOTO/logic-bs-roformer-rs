@@ -68,12 +68,20 @@ jobs:
             echo 'no GPU on this runner — skipping GPU validation'
             exit 0
           fi
+          export PATH="$HOME/.cargo/bin:${CUDA_HOME}/bin:${PATH}"
+          export LIBCLANG_PATH=/usr/lib/llvm-18/lib
+          cargo oxide build -- --release --tests
+          python3 tools/run_unit_tests.py target/release/deps
           ./target/release/lbrr --self-test
+          ./target/release/lbrr --kernel-regression --bench-json kernel-regressions.json
           if [ -d /opt/lbrr-assets ]; then
             mkdir -p assets && cp -rn /opt/lbrr-assets/. assets/
-            ./target/release/lbrr --bench --iters 1 --model-dir assets | tee bench.log
+            ./target/release/lbrr --bench --bench-stage waveform --warmup 5 --iters 1 --model-dir assets --bench-json benchmark.json | tee bench.log
+            python3 tools/check_benchmark.py benchmark.json --min-snr 60
             snr=$(grep -oP 'BENCH final SNR vs ref_output: \K[0-9.]+' bench.log)
             test -n "$snr" && awk -v s="$snr" 'BEGIN { if (s+0 < 60) { printf "FAIL: SNR %s < 60\n", s; exit 1 } else printf "PASS: SNR %s >= 60\n", s }'
+          else
+            echo "SKIP: model assets absent; waveform numerical gate needs /opt/lbrr-assets"
           fi
   build-windows:
     name: windows-latest MSVC no-GPU canary
