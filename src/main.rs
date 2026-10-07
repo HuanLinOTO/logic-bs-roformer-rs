@@ -118,6 +118,16 @@ fn print_usage() {
     eprintln!("         --qk-rope split|fused");
 }
 
+fn die<T>(r: Result<T, String>, what: &str) -> T {
+    match r {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("lbrr: {what}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn load_config(model_dir: &std::path::Path) -> Result<config::ModelConfig, String> {
     let yaml_path = model_dir.join("logic_bs_roformer.yaml");
     let yaml_text = std::fs::read_to_string(&yaml_path)
@@ -166,14 +176,22 @@ fn main() {
     }
 
     if args.forward_only {
-        let input = args.input.clone().expect("--input required");
+        let Some(input) = args.input.clone() else {
+            eprintln!("lbrr: --input required for --forward-only");
+            print_usage();
+            std::process::exit(2);
+        };
         let outdir = args.outdir.clone().unwrap_or_else(|| PathBuf::from("separated"));
         forward_only(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), &input, &outdir, &args.inference);
         return;
     }
 
     if args.separate {
-        let input = args.input.clone().expect("--input required for --separate");
+        let Some(input) = args.input.clone() else {
+            eprintln!("lbrr: --input required for --separate");
+            print_usage();
+            std::process::exit(2);
+        };
         let outdir = args.outdir.clone().unwrap_or_else(|| PathBuf::from("separated"));
         separate(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), &input, &outdir, &args.inference);
         return;
@@ -6350,7 +6368,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
     let inp = golden.f32("inp").expect("inp"); // (2, L) planar
     let ref_out = golden.f32("out").expect("out"); // (6, 2, L)
 
-    let cfg = config::ModelConfig::parse(&std::fs::read_to_string(model_dir.join("logic_bs_roformer.yaml")).unwrap()).unwrap();
+    let cfg = die(load_config(model_dir), "model");
     let t_frames = stft::num_frames(inp.len() / 2); // 259
     let bands = cfg.num_bands(); // 62
     let m = t_frames * bands;
@@ -6363,8 +6381,8 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
 
     // weights
     let weights_t0 = std::time::Instant::now();
-    let st = weights::SafeTensors::open(&model_dir.join("model.safetensors")).unwrap();
-    let w = weights::ModelWeights::load(&st, &cfg).unwrap();
+    let st = die(weights::SafeTensors::open(&model_dir.join("model.safetensors")), "weights");
+    let w = die(weights::ModelWeights::load(&st, &cfg), "weights");
     let gw = upload_weights(&ctx, &stream, &w).expect("weights upload");
     let parity_weights=ParityWeights::upload(&stream,&w).expect("parity weights");
     drop(w);drop(st);
@@ -7205,16 +7223,16 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bo
     assert!(golden.shapes["inp"] == [1,2,len] || golden.shapes["inp"] == [2,len], "inp shape must be [1,2,L] or [2,L]");
     assert!(golden.shapes["out"] == [1,6,2,len] || golden.shapes["out"] == [6,2,len], "out shape must be [1,6,2,L] or [6,2,L]");
     assert!(inp.iter().chain(ref_out).all(|v|v.is_finite()), "fixture contains nonfinite values");
-    let cfg = config::ModelConfig::parse(&std::fs::read_to_string(model_dir.join("logic_bs_roformer.yaml")).unwrap()).unwrap();
+    let cfg = die(load_config(model_dir), "model");
     let t_frames = stft::num_frames(len); let bands = cfg.num_bands(); let m=t_frames*bands;
     println!("bench: L={len} T={t_frames} bands={bands} M={m} iters={iters} pipeline={}",options.stage.name());
     let init = Instant::now();
     let ctx = CudaContext::new(device).expect("ctx");
     let stream=ctx.default_stream(); let km=gpu_kernels::load(&ctx).expect("kernels");
     let context_ms=init.elapsed().as_secs_f64()*1000.0;
-    let load=Instant::now(); let st=weights::SafeTensors::open(&model_dir.join("model.safetensors")).unwrap();
+    let load=Instant::now(); let st=die(weights::SafeTensors::open(&model_dir.join("model.safetensors")),"weights");
     let read_ms=load.elapsed().as_secs_f64()*1000.0;
-    let parse=Instant::now(); let w=weights::ModelWeights::load(&st,&cfg).unwrap();
+    let parse=Instant::now(); let w=die(weights::ModelWeights::load(&st,&cfg),"weights");
     let parse_ms=parse.elapsed().as_secs_f64()*1000.0;
     let upload=Instant::now(); let gw=upload_weights(&ctx,&stream,&w).expect("weights upload");
     stream.synchronize().expect("weights ready");
@@ -7434,7 +7452,7 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
         None => println!("input    : {} [44.1kHz stereo, {:.1}s]", input.display(), len as f64 / 44100.0),
     }
 
-    let cfg = config::ModelConfig::parse(&std::fs::read_to_string(model_dir.join("logic_bs_roformer.yaml")).unwrap()).unwrap();
+    let cfg = die(load_config(model_dir), "model");
     let bands = cfg.num_bands();
     let t_frames = stft::num_frames(588800); // 1151
     let m = t_frames * bands;
@@ -7473,8 +7491,8 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
     let km = gpu_kernels::load(&ctx).expect("kernels");
 
     let t0 = std::time::Instant::now();
-    let st = weights::SafeTensors::open(&model_dir.join("model.safetensors")).unwrap();
-    let w = weights::ModelWeights::load(&st, &cfg).unwrap();
+    let st = die(weights::SafeTensors::open(&model_dir.join("model.safetensors")), "weights");
+    let w = die(weights::ModelWeights::load(&st, &cfg), "weights");
     let gw = upload_weights(&ctx, &stream, &w).expect("weights upload");
     stream.synchronize().expect("weights ready");
     drop(w);drop(st);
@@ -7605,7 +7623,7 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
     println!("gpu      : wall {:.2}s, download {:.0}ms, RTF {:.4}",
         gpu_wall.as_secs_f64(), dl_ms, gpu_wall.as_secs_f64() / (len as f64 / 44100.0));
 
-    std::fs::create_dir_all(outdir).unwrap();
+    die(std::fs::create_dir_all(outdir).map_err(|e| e.to_string()), "outdir");
     let names: Vec<String> = cfg.instruments.clone();
     // The OLA accumulators live in reflect-padded xp coordinates: xp holds
     // BORDER left-pad samples before the source. Read [BORDER, BORDER+len)
@@ -7624,7 +7642,10 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
             }
         }
         let path = outdir.join(format!("{s_idx}_{name}.wav"));
-        audio::write_wav_f32(&path, &audio::WavData { sample_rate: wav.sample_rate, channels: 2, samples: out_samples }).expect("write stem");
+        audio::write_wav_f32(&path, &audio::WavData { sample_rate: wav.sample_rate, channels: 2, samples: out_samples }).unwrap_or_else(|e| {
+            eprintln!("lbrr: write {}: {e}", path.display());
+            std::process::exit(1);
+        });
         wrote_bytes += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     }
     println!("output   : {} stems -> {}/ ({}, {:.1} MB total)",
@@ -7635,10 +7656,10 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
 // Single-input forward: no reflect padding, no chunk loop. Apples-to-apples
 // against a bare pymss model() call on the same file.
 fn forward_only(device: usize, model_dir: &std::path::Path, input: &std::path::Path, outdir: &std::path::Path, inference: &InferenceOptions) {
-    let wav = audio::read_wav(input).expect("read wav");
+    let wav = die(audio::read_wav(input), "input");
     assert_eq!(wav.channels, 2, "stereo input required");
     let len = wav.samples.len() / 2;
-    let cfg = config::ModelConfig::parse(&std::fs::read_to_string(model_dir.join("logic_bs_roformer.yaml")).unwrap()).unwrap();
+    let cfg = die(load_config(model_dir), "model");
     let bands = cfg.num_bands();
     let t_frames = stft::num_frames(len);
     let m = t_frames * bands;
@@ -7646,8 +7667,8 @@ fn forward_only(device: usize, model_dir: &std::path::Path, input: &std::path::P
     let ctx = CudaContext::new(device).expect("ctx");
     let stream = ctx.default_stream();
     let km = gpu_kernels::load(&ctx).expect("kernels");
-    let st = weights::SafeTensors::open(&model_dir.join("model.safetensors")).unwrap();
-    let w = weights::ModelWeights::load(&st, &cfg).unwrap();
+    let st = die(weights::SafeTensors::open(&model_dir.join("model.safetensors")), "weights");
+    let w = die(weights::ModelWeights::load(&st, &cfg), "weights");
     let gw = upload_weights(&ctx, &stream, &w).expect("weights");
     stream.synchronize().expect("weights ready");
     drop(w);drop(st);
@@ -7698,7 +7719,7 @@ fn forward_only(device: usize, model_dir: &std::path::Path, input: &std::path::P
             }
         }
     }
-    std::fs::create_dir_all(outdir).unwrap();
+    die(std::fs::create_dir_all(outdir).map_err(|e| e.to_string()), "outdir");
     let names: Vec<String> = cfg.instruments.clone();
     for s_idx in 0..6usize {
         let name = names.get(s_idx).map(|s| s.as_str()).unwrap_or("stem");
@@ -7711,7 +7732,10 @@ fn forward_only(device: usize, model_dir: &std::path::Path, input: &std::path::P
             }
         }
         let path = outdir.join(format!("{s_idx}_{name}.wav"));
-        audio::write_wav_f32(&path, &audio::WavData { sample_rate: wav.sample_rate, channels: 2, samples: out_samples }).expect("write stem");
+        audio::write_wav_f32(&path, &audio::WavData { sample_rate: wav.sample_rate, channels: 2, samples: out_samples }).unwrap_or_else(|e| {
+            eprintln!("lbrr: write {}: {e}", path.display());
+            std::process::exit(1);
+        });
         println!("wrote {}", path.display());
     }
 }
