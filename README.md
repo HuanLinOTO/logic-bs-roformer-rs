@@ -24,9 +24,12 @@ RTX 3080 20GB，完整波形（包括 GPU ISTFT overlap-add），5轮交替配�
 
 ~~~powershell
 powershell scripts/build_win.ps1
+powershell scripts/lbrr.ps1 --input song.mp3 --outdir separated   # 分离（--input 不带模式标志时默认进入）
 powershell scripts/lbrr.ps1 --separate --model-dir assets --input song.wav --outdir separated
 powershell scripts/lbrr.ps1 --bench --model-dir assets --warmup 5 --iters 20 --bench-json output/short.json
 ~~~
+
+输入接受 wav 及任意 ffmpeg 可解码格式（mp3/flac/ogg 等）：非 44.1kHz/stereo 的输入自动经 ffmpeg 转成临时 wav，读完即删（ffmpeg 取自 PATH 或 LBRR_FFMPEG）。
 
 运行库布局与 shim 编译说明在[Windows 构建脚本](scripts/build_win.ps1)。现有本机 cuDNN/cfe/shim 位于 D:/Projects/lbrr-win-libs。
 

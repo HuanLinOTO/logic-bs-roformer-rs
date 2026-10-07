@@ -49,7 +49,6 @@ struct Args {
     bench: bool,
     dualbench: bool,
     iters: usize,
-    stems: Option<usize>,
     benchmark: benchmark::Options,
     inference: InferenceOptions,
 }
@@ -66,7 +65,6 @@ fn parse_args() -> Result<Args, String> {
             "--input" => args.input = Some(PathBuf::from(need("--input")?)),
             "--outdir" => args.outdir = Some(PathBuf::from(need("--outdir")?)),
             "--device" => args.device = need("--device")?.parse().map_err(|_| "bad --device")?,
-            "--stems" => args.stems = Some(need("--stems")?.parse().map_err(|_| "bad --stems")?),
             "--self-test" => args.self_test = true,
             "--kernel-regression" => args.kernel_regression = true,
             "--print-config" => args.print_config = true,
@@ -104,13 +102,35 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
+fn print_usage() {
+    eprintln!("usage: lbrr [options] --input song.[wav|mp3|flac|...] [--outdir DIR]   separation (default when --input is given)");
+    eprintln!("       lbrr --separate --model-dir DIR --input AUDIO --outdir DIR       same, explicit");
+    eprintln!("       lbrr --forward-only --model-dir DIR --input AUDIO               forward pass only");
+    eprintln!("       lbrr --bench --model-dir DIR [--warmup N --iters N --bench-stage waveform]");
+    eprintln!("                    [--bench-ref F --bench-json F --bench-output D]");
+    eprintln!("       lbrr --kernel-regression [--bench-json F]");
+    eprintln!("       lbrr --self-test | --print-config | --check-weights   (with --model-dir DIR)");
+    eprintln!("       dev parity gates: --fft-test --stft-test --rmsnorm-test --bandsplit-test --gemm-test");
+    eprintln!("                         --qkvrope-test --attn-test --gateff-test --e2e-test --reorder-test");
+    eprintln!("options: --model-dir DIR (default assets)  --device N (default 0)  --outdir DIR (default separated)");
+    eprintln!("         --iters N (bench, default 10)  --warmup N (bench)");
+    eprintln!("         --attn-time|--attn-freq auto|cudnn|handwritten  --ff1-backend auto|handwritten|cublaslt-erf");
+    eprintln!("         --qk-rope split|fused");
+}
+
+fn load_config(model_dir: &std::path::Path) -> Result<config::ModelConfig, String> {
+    let yaml_path = model_dir.join("logic_bs_roformer.yaml");
+    let yaml_text = std::fs::read_to_string(&yaml_path)
+        .map_err(|e| format!("cannot read {}: {e}", yaml_path.display()))?;
+    config::ModelConfig::parse(&yaml_text).map_err(|e| format!("bad config: {e}"))
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("lbrr: {e}");
-            eprintln!("usage: lbrr --model-dir DIR --input song.[wav|mp3|flac|...] --outdir out/ [--device N] [--bench]");
-            eprintln!("       lbrr --self-test | --print-config --model-dir DIR");
+            print_usage();
             std::process::exit(2);
         }
     };
@@ -195,28 +215,26 @@ fn main() {
     }
 
     let model_dir = args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets"));
-    let yaml_path = model_dir.join("logic_bs_roformer.yaml");
-    let yaml_text = match std::fs::read_to_string(&yaml_path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("lbrr: cannot read {}: {e}", yaml_path.display());
-            std::process::exit(1);
-        }
-    };
-    let cfg = match config::ModelConfig::parse(&yaml_text) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("lbrr: bad config: {e}");
-            std::process::exit(1);
-        }
-    };
 
     if args.print_config {
-        println!("{cfg:#?}");
+        match load_config(&model_dir) {
+            Ok(cfg) => println!("{cfg:#?}"),
+            Err(e) => {
+                eprintln!("lbrr: {e}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
 
     if args.check_weights {
+        let cfg = match load_config(&model_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("lbrr: {e}");
+                std::process::exit(1);
+            }
+        };
         let st_path = model_dir.join("model.safetensors");
         let t0 = std::time::Instant::now();
         let st = match weights::SafeTensors::open(&st_path) {
@@ -246,26 +264,15 @@ fn main() {
         return;
     }
 
-    let Some(input) = args.input.clone() else {
-        eprintln!("lbrr: --input required for inference");
-        std::process::exit(2);
-    };
-    let wav = match audio::read_wav(&input) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("lbrr: {e}");
-            std::process::exit(1);
-        }
-    };
-    println!(
-        "input: {} Hz, {} ch, {} frames ({:.1}s)",
-        wav.sample_rate,
-        wav.channels,
-        wav.samples.len() / wav.channels,
-        wav.samples.len() as f64 / wav.channels as f64 / wav.sample_rate as f64
-    );
-    println!("model: dim {} depth {} bands {} stems {:?}", cfg.dim, cfg.depth, cfg.num_bands(), cfg.instruments);
-    eprintln!("lbrr: inference not implemented yet (Phase 3)");
+    // No explicit mode flag: --input alone means separation (the common case).
+    if let Some(input) = args.input.clone() {
+        let outdir = args.outdir.clone().unwrap_or_else(|| PathBuf::from("separated"));
+        separate(args.device, &model_dir, &input, &outdir, &args.inference);
+        return;
+    }
+
+    print_usage();
+    std::process::exit(2);
 }
 
 // ---------------------------------------------------------------------------
