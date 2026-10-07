@@ -7,6 +7,7 @@
 **/*.cubin
 **/*.ptx
 **/*.nvvm
+*.ll
 
 # Model weights & parity data (large binaries, not for git)
 /assets/
@@ -25,8 +26,6 @@ __pycache__/
 .codegraph/
 
 cudnn_sdpa_wrap.obj
-*.linked.ll
 
 target-win/
-lbrr.ll
 
