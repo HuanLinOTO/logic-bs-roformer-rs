@@ -7,6 +7,8 @@
 
 mod audio;
 mod benchmark;
+mod inference_options;
+use inference_options::{InferenceOptions, AttentionBackendRequest, AttentionSelection};
 mod config;
 mod cublas;
 mod cublaslt;
@@ -48,6 +50,7 @@ struct Args {
     iters: usize,
     stems: Option<usize>,
     benchmark: benchmark::Options,
+    inference: InferenceOptions,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -81,6 +84,10 @@ fn parse_args() -> Result<Args, String> {
             "--bench" => args.bench = true,
             "--dualbench" => args.dualbench = true,
             "--iters" => { args.iters = need("--iters")?.parse().map_err(|_| "bad --iters")?; if args.iters == 0 { return Err("--iters must be positive".into()); } },
+            "--attn-time" => args.inference.attention[0] = Some(need("--attn-time")?.parse()?),
+            "--attn-freq" => args.inference.attention[1] = Some(need("--attn-freq")?.parse()?),
+            "--ff1-backend" => args.inference.ff1 = need("--ff1-backend")?.parse()?,
+            "--qk-rope" => args.inference.rope = need("--qk-rope")?.parse()?,
             "--bench-ref" => args.benchmark.reference = Some(need("--bench-ref")?.into()),
             "--bench-stage" => args.benchmark.stage = benchmark::Stage::parse(&need("--bench-stage")?)?,
             "--warmup" => args.benchmark.warmup = need("--warmup")?.parse().map_err(|_| "bad --warmup")?,
@@ -127,26 +134,26 @@ fn main() {
     }
 
     if args.e2e_test {
-        e2e_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        e2e_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), &args.inference);
         return;
     }
 
     if args.forward_only {
         let input = args.input.clone().expect("--input required");
         let outdir = args.outdir.clone().unwrap_or_else(|| PathBuf::from("separated"));
-        forward_only(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), &input, &outdir);
+        forward_only(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), &input, &outdir, &args.inference);
         return;
     }
 
     if args.separate {
         let input = args.input.clone().expect("--input required for --separate");
         let outdir = args.outdir.clone().unwrap_or_else(|| PathBuf::from("separated"));
-        separate(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), &input, &outdir);
+        separate(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), &input, &outdir, &args.inference);
         return;
     }
 
     if args.bench || args.dualbench {
-        bench_warm(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), args.iters, args.dualbench, &args.benchmark);
+        bench_warm(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), args.iters, args.dualbench, &args.benchmark, &args.inference);
         return;
     }
 
@@ -5723,7 +5730,8 @@ struct E2eScratch {
     // cudnn fused SDPA accelerator (lazily created; on any load failure the
     // hand-written flash kernels keep running — see cudnn_ready).
     cudnn: Option<cudnn::CudnnSdpa>,
-    cudnn_dead: bool,
+    options: InferenceOptions,
+    attention: Option<[AttentionSelection;2]>,
 }
 
 fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights::ModelWeights) -> Result<GpuWeights, String> {
@@ -5818,20 +5826,33 @@ fn upload_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights:
 /// Lazily create the cudnn SDPA accelerator inside `scratch`. On
 /// unavailability (LBRR_NO_CUDNN set, dlopen failure) the callers keep the
 /// hand-written flash kernels; failure is sticky.
-fn cudnn_ready(ctx: &Arc<CudaContext>, scratch: &mut E2eScratch) {
-    if scratch.cudnn_dead || scratch.cudnn.is_some() || std::env::var_os("LBRR_NO_CUDNN").is_some() {
-        return;
-    }
-    match cudnn::CudnnSdpa::load(ctx) {
-        Ok(c) => {
-            eprintln!("[cudnn] fused SDPA ready");
-            scratch.cudnn = Some(c);
+fn cudnn_ready(ctx: &Arc<CudaContext>, stream:&Arc<CudaStream>, scratch: &mut E2eScratch, bands:usize, frames:usize) -> Result<(),String> {
+    if scratch.attention.is_some() { return Ok(()); }
+    let disabled=std::env::var_os("LBRR_NO_CUDNN").is_some();
+    let mut choices=std::array::from_fn(|axis|scratch.options.attention_request(axis,disabled));
+    if choices.iter().any(|c|c.selected!=AttentionBackendRequest::Handwritten) {
+        match cudnn::CudnnSdpa::load(ctx) {
+            Ok(mut cd)=>{
+                for (axis,choice) in choices.iter_mut().enumerate() {
+                    if choice.selected==AttentionBackendRequest::Handwritten {continue;}
+                    match cd.prepare(stream,axis,bands as i64,frames as i64) {
+                        Ok(())=>choice.selected=AttentionBackendRequest::Cudnn,
+                        Err(e)=>{
+                            if choice.requested==AttentionBackendRequest::Cudnn {return Err(format!("explicit cuDNN axis {axis}: {e}"));}
+                            choice.selected=AttentionBackendRequest::Handwritten;choice.fallback_reason=Some(e);
+                        }
+                    }
+                }
+                scratch.cudnn=Some(cd);
+            }
+            Err(e)=>{
+                if choices.iter().any(|c|c.requested==AttentionBackendRequest::Cudnn) {return Err(format!("explicit cuDNN: {e}"));}
+                for choice in &mut choices { if choice.selected!=AttentionBackendRequest::Handwritten {choice.selected=AttentionBackendRequest::Handwritten;choice.fallback_reason=Some(e.clone());} }
+            }
         }
-        Err(e) => {
-            eprintln!("[cudnn] load failed: {e}; using hand-written flash kernels");
-            scratch.cudnn_dead = true;
-        }
     }
+    for (axis,c) in choices.iter().enumerate() {eprintln!("[attention {}] requested={:?} selected={:?} source={}{}",if axis==0 {"time"}else{"freq"},c.requested,c.selected,c.source,c.fallback_reason.as_ref().map(|r|format!("; {r}")).unwrap_or_default());}
+    scratch.attention=Some(choices);Ok(())
 }
 /// Lazily create the cuBLASLt handle + workspace inside `scratch`. On
 /// unavailability (LBRR_NO_LT set, alloc or dlopen failure) the callers keep
@@ -5892,7 +5913,7 @@ unsafe fn transformer_step(
     let m = t_frames * bands; // 71342
     let idx = layer_idx * 2 + axis;
     lt_ready(_ctx, stream, scratch, m);
-    cudnn_ready(_ctx, scratch);
+    cudnn_ready(_ctx, stream, scratch, bands, t_frames)?;
     let launch1 = |n: u32| cuda_core::simt::LaunchConfig::for_num_elems(n);
     // 1. pre-attention RMSNorm
     // SAFETY: one warp per row over m rows.
@@ -5927,7 +5948,8 @@ unsafe fn transformer_step(
         // written straight into the folded scaled16 layout, gates applied by
         // a cheap elementwise epilogue (62 TFLOPs vs ~15 hand-written on the
         // song shapes; output verified bit-exact against torch cudnn sdpa).
-        if let Some(cd) = scratch.cudnn.as_mut() {
+        if scratch.attention.as_ref().expect("attention prepared")[axis].selected == AttentionBackendRequest::Cudnn {
+            let cd = scratch.cudnn.as_ref().expect("selected cuDNN handle");
             // SAFETY: one thread per K word; m*256 words.
             km.rope_k16(stream, launch1((m * 256) as u32), &scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], &mut scratch.k16r, bands as u32, axis as u32)
                 .map_err(|e| e.to_string())?;
@@ -5938,7 +5960,7 @@ unsafe fn transformer_step(
             // NOTE: pass t_frames as the "seq" arg — sdpa() derives
             // (b, s) = (bands, t) for the time axis and (t, bands) for the
             // freq axis from it.
-            cd.sdpa(stream.cu_stream() as usize, axis, bands as i64, t_frames as i64,
+            cd.execute(stream, axis, bands as i64, t_frames as i64,
                 base, scratch.k16r.cu_deviceptr() as u64, base + 2048,
                 scratch.scaled16.cu_deviceptr() as u64)
                 .map_err(|e| e.to_string())?;
@@ -6139,7 +6161,7 @@ fn reorder_test(device: usize, model_dir: &std::path::Path) {
     println!("OK");
 }
 
-fn e2e_test(device: usize, model_dir: &std::path::Path) {
+fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOptions) {
     let root = model_dir.parent().unwrap_or(model_dir);
     let mid = npz::Npz::open(&root.join("parity/e2e_mid.npz")).unwrap_or_else(|e| panic!("{e}"));
     let ref_mid = mid.f32("x_final").expect("x_final");
@@ -6256,7 +6278,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         lt: None,
         lt_ws: None,
         lt_dummy: None,
-        lt_dead: false, cudnn: None, cudnn_dead: false,
+        lt_dead: false, cudnn: None, options: inference.clone(), attention: None,
     };
 
     // staged references for bisection
@@ -6930,7 +6952,7 @@ fn make_bench_bufs(
     xi: &[f32], win: &[f32],
     cos_t: &[f32], sin_t: &[f32], cos_f: &[f32], sin_f: &[f32],
     offs: &[u32], dims: &[u32], f0: &[u32],
-    m: usize, t_frames: usize, bands: usize,
+    m: usize, t_frames: usize, bands: usize, inference: &InferenceOptions,
 ) -> BenchBufs {
     let zt = |n: usize| DeviceBuffer::<f32>::zeroed(st, n).unwrap();
     BenchBufs {
@@ -6970,7 +6992,7 @@ k16r: DeviceBuffer::<u32>::zeroed(st, m * 256).unwrap(),
             lt: None,
             lt_ws: None,
             lt_dummy: None,
-            lt_dead: false, cudnn: None, cudnn_dead: false,
+            lt_dead: false, cudnn: None, options: inference.clone(), attention: None,
         },
         x_final: zt(m * 256),
         xb: zt(m * 256),
@@ -7055,12 +7077,12 @@ fn bench_memory(gw: &GpuWeights, b: &BenchBufs, extra: usize) -> serde_json::Val
         b.scr.zero_bias_64.len()*4 +
         b.scr.attn_max.len()*4 +
         b.scr.attn_scale.len()*4 + b.scr.cos.iter().chain(b.scr.sin.iter()).map(|v|v.len()*4).sum::<usize>();
-    let workspace = b.scr.lt_ws.as_ref().map_or(0,|v|v.len());
+    let workspace = b.scr.lt_ws.as_ref().map_or(0,|v|v.len()) + b.scr.cudnn.as_ref().map_or(0,|c|c.workspace_bytes());
     let tuning = b.scr.lt_dummy.as_ref().map_or(0,|v|v.len());
     serde_json::json!({"weights":weights,"scratch":scratch,"workspace":workspace,"tuning_temporary":tuning,"tracked_resident":weights+scratch+workspace+tuning,"tracked_peak":weights+scratch+workspace+tuning,"external_peak":null,"accounting":"explicit device allocations; driver/library internal memory is recorded by external telemetry"})
 }
 
-fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bool, options: &benchmark::Options) {
+fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bool, options: &benchmark::Options, inference: &InferenceOptions) {
     use serde_json::json;
     use std::time::Instant;
     let wall = Instant::now();
@@ -7100,7 +7122,7 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bo
     let table=|n:usize,sine:bool|->Vec<f32>{(0..n).flat_map(|p|(0..32).map(move|i|{let a=(p as f64*(1.0/10000.0f64.powf(2.0*i as f64/64.0)))as f32;if sine {a.sin()} else {a.cos()}})).collect()};
     let (cos_t,sin_t,cos_f,sin_f)=(table(t_frames,false),table(t_frames,true),table(bands,false),table(bands,true));
     let allocation=Instant::now();
-    let mut bufs=make_bench_bufs(&stream,&xi,sp.window(),&cos_t,&sin_t,&cos_f,&sin_f,&offs,&dims,&f0,m,t_frames,bands);
+    let mut bufs=make_bench_bufs(&stream,&xi,sp.window(),&cos_t,&sin_t,&cos_f,&sin_f,&offs,&dims,&f0,m,t_frames,bands,inference);
     let inverse=benchmark::istft_inverse(sp.window(),len,t_frames);
     assert!(inverse[1024..1024+len].iter().all(|x|*x>0.0),"ISTFT has uncovered samples");
     let inv_dev=DeviceBuffer::from_host(&stream,&inverse).unwrap();
@@ -7145,7 +7167,7 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bo
         let report=json!({"schema_version":1,"identity":benchmark::identity(model_dir,&reference,&name,sm).expect("benchmark identity"),
             "shape":{"batch":1,"channels":2,"stems":6,"samples":len,"T":t_frames,"bands":bands,"sample_rate":cfg.sample_rate},
             "pipeline":options.stage.name(),
-            "backend":{"attention_time":if bufs.scr.cudnn.is_some(){"cudnn"}else{"handwritten"},"attention_freq":if bufs.scr.cudnn.is_some(){"cudnn"}else{"handwritten"},"ff1":"handwritten","qk_rope":"split","cublaslt":bufs.scr.lt.is_some()},
+            "backend":{"attention_time":bufs.scr.attention.as_ref().map(|a|&a[0]),"attention_freq":bufs.scr.attention.as_ref().map(|a|&a[1]),"ff1":"handwritten","qk_rope":inference.rope,"cublaslt":bufs.scr.lt.is_some(),"cudnn_version":bufs.scr.cudnn.as_ref().map(|c|c.version()),"cudnn_plans":bufs.scr.cudnn.as_ref().map(|c|c.plans_json())},
             "precision":{"matrix_input":"fp16","accumulation":"fp32","residual":"fp32","tf32":false,"input_resident_gpu":true,"output_resident_gpu":options.stage==benchmark::Stage::Waveform},
             "timing_ms":{"context_kernels":context_ms,"weights_read":read_ms,"weights_parse":parse_ms,"weights_pack_h2d":upload_ms,"fft_plan":fft_plan_ms,"allocation_input_h2d":allocation_ms,"prepare_algorithms":prepare_ms,"warmup":options.warmup,"iterations":iters,"host_total":host_ms,"host_per_iteration":avg,"cuda_event":gpu_ms,"download_and_host_ola_check":download_check_ms,"process_before_hashes":wall.elapsed().as_secs_f64()*1000.0,"rtf":avg/(len as f64/cfg.sample_rate as f64*1000.0)},
             "memory_bytes":bench_memory(&gw,&bufs,12*len*4+inverse.len()*4),
@@ -7155,7 +7177,7 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bo
     if dual {
         let stream2=ctx.new_stream().unwrap();let sp2=stft::Stft::new(fft.clone(),t_frames).unwrap();let c2r2=fft.plan(2048,t_frames,false).unwrap();
         sp2.set_stream(&stream2).unwrap();c2r2.set_stream(&stream2).unwrap();
-        let mut b2=make_bench_bufs(&stream2,&xi,sp2.window(),&cos_t,&sin_t,&cos_f,&sin_f,&offs,&dims,&f0,m,t_frames,bands);
+        let mut b2=make_bench_bufs(&stream2,&xi,sp2.window(),&cos_t,&sin_t,&cos_f,&sin_f,&offs,&dims,&f0,m,t_frames,bands,inference);
         unsafe { bench_forward(&km,&ctx,&stream2,&gw,&sp2,&c2r2,&mut b2,len,t_frames,bands,None).unwrap(); }
         stream2.synchronize().unwrap();stream.synchronize().unwrap();
         let start=Instant::now();let pairs=(iters/2).max(2);
@@ -7288,7 +7310,7 @@ fn prepare_via_ffmpeg(input: &std::path::Path, desc: &str) -> Result<(audio::Wav
     Ok((wav?, Some(desc.to_string())))
 }
 
-fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path, outdir: &std::path::Path) {
+fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path, outdir: &std::path::Path, inference: &InferenceOptions) {
     let wall_t0 = std::time::Instant::now();
     let (wav, conv) = match prepare_input(input) {
         Ok(v) => v,
@@ -7411,7 +7433,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             lt: None,
             lt_ws: None,
             lt_dummy: None,
-            lt_dead: false, cudnn: None, cudnn_dead: false,
+            lt_dead: false, cudnn: None, options: inference.clone(), attention: None,
         },
         x_final: z(m * 256),
         xb: z(m * 256),
@@ -7426,7 +7448,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
         f0_dev,
     };
     let _ = &mut bufs;
-    cudnn_ready(&ctx, &mut bufs.scr);
+    cudnn_ready(&ctx, &stream, &mut bufs.scr, bands, t_frames).expect("prepare attention");
     let attn_engine = if bufs.scr.cudnn.is_some() { "cudnn fused SDPA" } else { "hand-written flash (cudnn unavailable)" };
     println!("engine   : cuBLASLt GEMMs + {attn_engine}");
 
@@ -7550,7 +7572,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
 
 // Single-input forward: no reflect padding, no chunk loop. Apples-to-apples
 // against a bare pymss model() call on the same file.
-fn forward_only(device: usize, model_dir: &std::path::Path, input: &std::path::Path, outdir: &std::path::Path) {
+fn forward_only(device: usize, model_dir: &std::path::Path, input: &std::path::Path, outdir: &std::path::Path, inference: &InferenceOptions) {
     let wav = audio::read_wav(input).expect("read wav");
     assert_eq!(wav.channels, 2, "stereo input required");
     let len = wav.samples.len() / 2;
@@ -7628,7 +7650,7 @@ k16r: DeviceBuffer::<u32>::zeroed(&stream, m * 256).unwrap(),
             lt: None,
             lt_ws: None,
             lt_dummy: None,
-            lt_dead: false, cudnn: None, cudnn_dead: false,
+            lt_dead: false, cudnn: None, options: inference.clone(), attention: None,
         },
         x_final: z(m * 256),
         xb: z(m * 256),
