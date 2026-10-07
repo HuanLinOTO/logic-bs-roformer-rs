@@ -276,4 +276,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" bundles/* --title "lbrr ${GITHUB_REF_NAME}" --generate-notes
+          gh release create "${GITHUB_REF_NAME}" bundles/* --repo "${GITHUB_REPOSITORY}" --title "lbrr ${GITHUB_REF_NAME}" --generate-notes
