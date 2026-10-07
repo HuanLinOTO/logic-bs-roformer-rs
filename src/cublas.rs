@@ -27,6 +27,18 @@ unsafe impl Sync for Cublas {}
 impl Cublas {
     pub fn load() -> Result<Cublas, String> {
         let mut candidates: Vec<String> = Vec::new();
+        // Portable bundle first: libraries shipped next to the executable.
+        if let Some(d) = crate::exepath::exe_dir_str() {
+            if cfg!(windows) {
+                for name in ["cublas64_13.dll", "cublas64_12.dll"] {
+                    candidates.push(format!("{d}/{name}"));
+                }
+            } else {
+                for name in ["libcublas.so.12", "libcublas.so.11", "libcublas.so"] {
+                    candidates.push(format!("{d}/{name}"));
+                }
+            }
+        }
         if cfg!(windows) {
             for var in ["CUDA_HOME", "CUDA_PATH", "CUDA_TOOLKIT_PATH"] {
                 if let Ok(p) = std::env::var(var) {

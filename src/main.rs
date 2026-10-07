@@ -7,6 +7,7 @@
 
 mod audio;
 mod benchmark;
+mod exepath;
 mod inference_options;
 use inference_options::{InferenceOptions, AttentionBackendRequest, AttentionSelection};
 mod config;

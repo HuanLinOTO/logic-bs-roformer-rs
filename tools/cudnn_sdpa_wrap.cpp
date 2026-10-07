@@ -89,13 +89,13 @@ WRAP_API int wrap_init(const char* cudnn_lib_dir) {
         "cudnn_engines_precompiled64_9.dll", "cudnn_engines_runtime_compiled64_9.dll",
         "cudnn_ext64_9.dll", "cudnn_engines_tensor_ir64_9.dll"};
     static const char* main_lib = "cudnn64_9.dll";
-    static const char* cudart_lib = "cudart64_13.dll";
+    static const char* cudart_candidates[] = {"cudart64_13.dll", "cudart64_12.dll"};
 #else
     static const char* children[] = {"libcudnn_ops.so.9", "libcudnn_cnn.so.9",
         "libcudnn_adv.so.9", "libcudnn_graph.so.9", "libcudnn_heuristic.so.9",
         "libcudnn_engines_precompiled.so.9", "libcudnn_engines_runtime_compiled.so.9"};
     static const char* main_lib = "libcudnn.so.9";
-    static const char* cudart_lib = "libcudart.so.13";
+    static const char* cudart_candidates[] = {"libcudart.so.13", "libcudart.so.12"};
 #endif
     char path[512];
     for (auto* c : children) {
@@ -122,7 +122,27 @@ WRAP_API int wrap_init(const char* cudnn_lib_dir) {
         return -12;
     }
     // Help the frontend's own shim find a cudart it is happy with.
-    my_setenv_default("CUDNN_FRONTEND_CUDART_LIB_NAME", cudart_lib);
+    // CUDA 13.x names the runtime cudart64_130_0.dll while 12.x uses
+    // cudart64_12.dll. Probe beside the cudnn libraries first (portable
+    // bundle layout; an absolute path also survives bare-name loader
+    // searches that skip the exe dir on Linux), then bare names through
+    // the loader. Note the env roundtrip must stay on this side of the
+    // FFI: MSVC getenv reads the CRT snapshot, which does not see Win32
+    // SetEnvironmentVariable writes done by the Rust host.
+    for (auto* cand : cudart_candidates) {
+        snprintf(path, sizeof path, "%s/%s", cudnn_lib_dir, cand);
+        if (my_dlopen(path)) {
+            my_setenv_default("CUDNN_FRONTEND_CUDART_LIB_NAME", path);
+            return 0;
+        }
+    }
+    for (auto* cand : cudart_candidates) {
+        if (my_dlopen(cand)) {
+            my_setenv_default("CUDNN_FRONTEND_CUDART_LIB_NAME", cand);
+            return 0;
+        }
+    }
+    my_setenv_default("CUDNN_FRONTEND_CUDART_LIB_NAME", cudart_candidates[0]);
     return 0;
 }
 

@@ -52,13 +52,22 @@ if (-not $SkipShim) {
         Write-Host "== cl 不在 PATH，经 vcvars 构建环境编译 shim =="
         $shimOut = Join-Path $LibsDir "cudnn_sdpa_wrap.dll"
         $shortInclude = (New-Object -ComObject Scripting.FileSystemObject).GetFolder("$cudaHome\include").ShortPath
+        # cudnn_frontend_utils.h 以引号形式 include 同目录的 shim 头，
+        # MSVC 引号搜索先于 -I，所以 -I tools/cfe-win-override 无法覆盖
+        # 官方副本。把官方 include 树拷到 staging 目录（必须名为 include，
+        # 官方头使用 ../include/ 自引用），再用 lbrr patch 版覆盖 shim 头。
+        $cfeStage = Join-Path $LibsDir "cfe-stage\include"
+        Remove-Item -Recurse -Force (Join-Path $LibsDir "cfe-stage") -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Force -Path $cfeStage | Out-Null
+        Copy-Item "$cfeInclude\*" $cfeStage -Recurse -Force
+        Copy-Item "$repo\tools\cfe-win-override\cudnn_frontend_shim.h" $cfeStage -Force
         # vcvars 内的 cl 必须赢过 PATH 上可能存在的 LLVM clang-cl：
         # 临时摘掉 LLVM 目录再起子进程。
         $savedPath = $env:PATH
         $env:PATH = (($env:PATH -split ';') | Where-Object { $_ -and $_ -ne $env:LIBCLANG_PATH }) -join ';'
-        cmd /c "`"$($vcvars.FullName)`" >nul 2>&1 && cl /LD /O2 /EHsc /std:c++17 /utf-8 /DWIN32_LEAN_AND_MEAN /DNV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING=1 -I$repo\tools\cfe-win-override -I$cfeInclude -I$cudnnBin\..\include -I$shortInclude $repo\tools\cudnn_sdpa_wrap.cpp /Fe:$shimOut"
+        cmd /c "`"$($vcvars.FullName)`" >nul 2>&1 && cl /LD /O2 /EHsc /std:c++17 /utf-8 /DWIN32_LEAN_AND_MEAN /DNV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING=1 -I$cfeStage -I$cudnnBin\..\include -I$shortInclude $repo\tools\cudnn_sdpa_wrap.cpp /Fe:$shimOut"
         $env:PATH = $savedPath
-        if ($LASTEXITCODE -ne 0) { throw "shim compile failed" }
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $shimOut)) { throw "shim compile failed" }
         Write-Host "shim -> $shimOut"
     } else {
         Write-Warning "未找到 vcvars64.bat，跳过 shim 编译（SDPA 将回退手写 kernel）"

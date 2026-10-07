@@ -90,10 +90,21 @@ load_cudart_so() {
     // Clear any existing error
     dlerror();
 
+    // lbrr patch: an absolute path exported by the host (portable bundle
+    // layout keeps cudart beside the executable, which bare-name dlopen
+    // cannot reach on Linux) wins before any candidate list.
+    if (const char *forced = getenv("CUDNN_FRONTEND_CUDART_LIB_NAME")) {
+        HMODULE forced_handle = dlopen(forced, RTLD_NOW);
+        if (forced_handle) {
+            return forced_handle;
+        }
+    }
+
     // List of potential libcudart libraries (Adding major version to support python package)
-    // lbrr patch: Windows wheels/toolkit name them cudart64_<major>.dll; the
-    // .so names simply fail to load there and fall through.
-    constexpr const char *libs[] = {"cudart64_13.dll", "cudart64_12.dll", "libcudart.so.12", "libcudart.so.13"};
+    // lbrr patch: Windows wheels/toolkit name them cudart64_<major>.dll;
+    // CUDA 13.x actually ships cudart64_130_0.dll. The .so names simply
+    // fail to load on Windows and fall through.
+    constexpr const char *libs[] = {"cudart64_13.dll", "cudart64_12.dll", "libcudart.so.13", "libcudart.so.12"};
     constexpr size_t num_libs    = sizeof(libs) / sizeof(libs[0]);
 
     HMODULE lib_handle = nullptr;

@@ -133,6 +133,18 @@ fn chk(rc: c_int, what: &str) -> Result<(), String> {
 impl CublasLt {
     pub fn load(ctx: &Arc<CudaContext>, ws: u64, ws_size: usize) -> Result<Self, String> {
         let mut candidates: Vec<String> = Vec::new();
+        // Portable bundle first: libraries shipped next to the executable.
+        if let Some(d) = crate::exepath::exe_dir_str() {
+            if cfg!(windows) {
+                for name in ["cublasLt64_13.dll", "cublasLt64_12.dll"] {
+                    candidates.push(format!("{d}/{name}"));
+                }
+            } else {
+                for name in ["libcublasLt.so.12", "libcublasLt.so.11", "libcublasLt.so"] {
+                    candidates.push(format!("{d}/{name}"));
+                }
+            }
+        }
         if cfg!(windows) {
             // CUDA 12.x/13.x on Windows: DLLs live in bin\x64 (13.x) or bin
             // (12.x); names carry the CUDA major version.

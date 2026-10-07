@@ -125,6 +125,22 @@ fn first_existing(paths: &[String]) -> Option<String> {
         .cloned()
 }
 
+/// Does the directory hold any nvrtc library (Windows nvrtc*.dll or
+/// Linux libnvrtc*.so*)? Used to detect a portable bundle layout.
+fn dir_has_nvrtc(d: &std::path::Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(d) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if cfg!(windows) {
+            n.starts_with("nvrtc") && n.ends_with(".dll")
+        } else {
+            n.starts_with("libnvrtc") && n.contains(".so")
+        }
+    })
+}
+
 fn cstr_to_string(p: *const c_char) -> String {
     if p.is_null() {
         return "(null)".into();
@@ -134,6 +150,14 @@ fn cstr_to_string(p: *const c_char) -> String {
 impl CudnnSdpa {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<CudnnSdpa, String> {
         let cudnn_dir = std::env::var("LBRR_CUDNN_DIR").unwrap_or_else(|_| {
+            // Portable bundle: the cuDNN family ships next to the
+            // executable and wrap_init(cudnn_dir) resolves through it.
+            if let Some(d) = crate::exepath::exe_dir() {
+                let probe = if cfg!(windows) { "cudnn64_9.dll" } else { "libcudnn.so.9" };
+                if d.join(probe).exists() {
+                    return d.display().to_string();
+                }
+            }
             if cfg!(windows) {
                 "D:/Projects/lbrr-win-libs/cudnn/bin".into()
             } else {
@@ -141,8 +165,14 @@ impl CudnnSdpa {
             }
         });
         let nvrtc_dir = std::env::var("LBRR_NVRTC_DIR").unwrap_or_else(|_| {
+            // Portable bundle: any nvrtc library next to the executable.
+            if let Some(d) = crate::exepath::exe_dir() {
+                if dir_has_nvrtc(&d) {
+                    return d.display().to_string();
+                }
+            }
             if cfg!(windows) {
-                // CUDA 13.4 ships nvrtc64_130_0.dll + builtins in bin/x64.
+                // CUDA 13.x ships nvrtc64_130_0.dll + builtins in bin/x64.
                 std::env::var("CUDA_HOME")
                     .map(|h| format!("{h}/bin/x64"))
                     .unwrap_or_default()
@@ -162,7 +192,10 @@ impl CudnnSdpa {
         } else {
             "libcudnn_sdpa_wrap.so"
         };
-        let wrap = first_existing(&[wrap_env.clone(), wrap_fallback.into()])
+        let wrap_beside_exe = crate::exepath::exe_dir()
+            .map(|d| d.join(wrap_fallback).display().to_string())
+            .unwrap_or_default();
+        let wrap = first_existing(&[wrap_env.clone(), wrap_beside_exe, wrap_fallback.into()])
             .ok_or_else(|| format!("sdpa wrapper not found: {}", wrap_env))?;
         if cfg!(windows) {
             // LoadLibrary 解析依赖 DLL 时只搜应用目录/System32/PATH，不含
@@ -192,21 +225,64 @@ impl CudnnSdpa {
                 unsafe { std::env::set_var("PATH", full) };
             }
         }
-        // The sm86 sdpa engine runtime-compiles kernels via libnvrtc.so.12;
-        // pre-register it (plus its builtins dependency) under absolute paths
-        // so cudnn internal dlopen("libnvrtc.so.12") hits a loaded SONAME.
-        let nvrtc_names: &[&str] = if cfg!(windows) {
-            &["nvrtc-builtins64_134.dll", "nvrtc64_130_0.dll"]
-        } else {
-            &["libnvrtc-builtins.so.12", "libnvrtc.so.12"]
-        };
+        // The sm86 sdpa engine runtime-compiles kernels via nvrtc;
+        // pre-register it (plus its builtins dependency) under absolute
+        // paths so cudnn's internal dlopen hits a loaded SONAME. The
+        // directory is globbed so CUDA minor-version naming
+        // (nvrtc64_130_0.dll / nvrtc64_124_0.dll / libnvrtc.so.12 ...)
+        // needs no per-version table.
+        let mut nvrtc_names: Vec<String> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&nvrtc_dir) {
+            let mut found: Vec<String> = rd
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| {
+                    if cfg!(windows) {
+                        n.starts_with("nvrtc") && n.ends_with(".dll")
+                    } else {
+                        n.starts_with("libnvrtc") && n.contains(".so")
+                    }
+                })
+                .collect();
+            found.sort_by_key(|n| !n.contains("builtins"));
+            nvrtc_names = found;
+        }
+        if nvrtc_names.is_empty() {
+            nvrtc_names = if cfg!(windows) {
+                ["nvrtc-builtins64_134.dll", "nvrtc64_130_0.dll"]
+            } else {
+                ["libnvrtc-builtins.so.12", "libnvrtc.so.12"]
+            }
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        }
         let mut nvrtc_libs = Vec::new();
-        for name in nvrtc_names {
+        for name in &nvrtc_names {
             let cand = format!("{nvrtc_dir}/{name}");
             if std::path::Path::new(&cand).exists() {
                 match unsafe { Library::new(&cand) } {
                     Ok(l) => nvrtc_libs.push(l),
                     Err(e) => return Err(format!("dlopen {}: {}", cand, e)),
+                }
+            }
+        }
+        // Portable bundle: hand the frontend shim an absolute cudart path
+        // from beside the executable (Linux dlopen ignores the exe dir).
+        // SAFETY: single-threaded init path (first CudnnSdpa::load).
+        if std::env::var("CUDNN_FRONTEND_CUDART_LIB_NAME").is_err() {
+            if let Some(d) = crate::exepath::exe_dir() {
+                let names: &[&str] = if cfg!(windows) {
+                    &["cudart64_13.dll", "cudart64_12.dll"]
+                } else {
+                    &["libcudart.so.13", "libcudart.so.12"]
+                };
+                for n in names {
+                    let p = d.join(n);
+                    if p.exists() {
+                        unsafe { std::env::set_var("CUDNN_FRONTEND_CUDART_LIB_NAME", p.display().to_string()) };
+                        break;
+                    }
                 }
             }
         }

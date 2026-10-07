@@ -50,6 +50,18 @@ impl Cufft {
     /// dlopen libcufft: explicit toolkit paths first, then the loader.
     pub fn load() -> Result<Cufft, String> {
         let mut candidates: Vec<String> = Vec::new();
+        // Portable bundle first: libraries shipped next to the executable.
+        if let Some(d) = crate::exepath::exe_dir_str() {
+            if cfg!(windows) {
+                for name in ["cufft64_12.dll", "cufft64_11.dll"] {
+                    candidates.push(format!("{d}/{name}"));
+                }
+            } else {
+                for name in ["libcufft.so.12", "libcufft.so.11", "libcufft.so"] {
+                    candidates.push(format!("{d}/{name}"));
+                }
+            }
+        }
         let mut try_paths: Vec<std::path::PathBuf> = Vec::new();
         for var in ["CUDA_HOME", "CUDA_PATH", "CUDA_TOOLKIT_PATH"] {
             if let Ok(p) = std::env::var(var) {
