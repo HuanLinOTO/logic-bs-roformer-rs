@@ -10,7 +10,9 @@
 *.ll
 
 # Model weights & parity data (large binaries, not for git)
-/assets/
+# The model config is small, required at runtime, and needed by CI dry runs.
+/assets/*
+!/assets/logic_bs_roformer.yaml
 *.ckpt
 *.safetensors
 *.npz

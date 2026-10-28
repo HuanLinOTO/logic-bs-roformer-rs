@@ -17,8 +17,11 @@ mod cudnn;
 mod cufft;
 mod kernels;
 mod npz;
+mod plan;
 mod stft;
+mod tui;
 mod weights;
+mod fp16;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,7 +32,17 @@ use cuda_core::CudaStream;
 struct Args {
     model_dir: Option<PathBuf>,
     input: Option<PathBuf>,
+    /// Positional audio paths: what Explorer passes when a file is dropped
+    /// onto the executable (also `lbrr song.mp3` from a shell).
+    drop_inputs: Vec<PathBuf>,
     outdir: Option<PathBuf>,
+    /// `--mode stems|vocals` — skips the interactive picker.
+    mode: Option<plan::Mode>,
+    /// `--stems vocals,drums` / `all` / `0,1` — skips the picker.
+    stems: Option<String>,
+    no_tui: bool,
+    no_pause: bool,
+    dry_run: bool,
     device: usize,
     self_test: bool,
     kernel_regression: bool,
@@ -65,6 +78,15 @@ fn parse_args() -> Result<Args, String> {
             "--model-dir" => args.model_dir = Some(PathBuf::from(need("--model-dir")?)),
             "--input" => args.input = Some(PathBuf::from(need("--input")?)),
             "--outdir" => args.outdir = Some(PathBuf::from(need("--outdir")?)),
+            "--mode" | "--output-mode" => args.mode = Some(plan::Mode::parse(&need("--mode")?)?),
+            "--stems" | "--tracks" => args.stems = Some(need("--stems")?),
+            "--no-tui" => args.no_tui = true,
+            "--no-pause" => args.no_pause = true,
+            "--dry-run" | "--plan" => args.dry_run = true,
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
             "--device" => args.device = need("--device")?.parse().map_err(|_| "bad --device")?,
             "--self-test" => args.self_test = true,
             "--kernel-regression" => args.kernel_regression = true,
@@ -94,17 +116,23 @@ fn parse_args() -> Result<Args, String> {
             "--warmup" => args.benchmark.warmup = need("--warmup")?.parse().map_err(|_| "bad --warmup")?,
             "--bench-json" => args.benchmark.json = Some(need("--bench-json")?.into()),
             "--bench-output" => args.benchmark.output = Some(need("--bench-output")?.into()),
+            other if !other.starts_with('-') => args.drop_inputs.push(PathBuf::from(other)),
             other => return Err(format!("unknown argument {other}")),
         }
     }
     if args.iters == 0 {
         args.iters = 10;
     }
+    if args.input.is_some() && !args.drop_inputs.is_empty() {
+        return Err("give either --input or a positional audio path, not both".into());
+    }
     Ok(args)
 }
 
 fn print_usage() {
-    eprintln!("usage: lbrr [options] --input song.[wav|mp3|flac|...] [--outdir DIR]   separation (default when --input is given)");
+    eprintln!("usage: lbrr song.[wav|mp3|flac|...]                                 drag-and-drop separation (picker)");
+    eprintln!("       lbrr [options] --input song.[wav|mp3|flac|...] [--outdir DIR]   separation (default when --input is given)");
+    eprintln!("       lbrr --dry-run song.mp3 [--mode vocals|stems] [--stems a,b]     print the output plan, no GPU");
     eprintln!("       lbrr --separate --model-dir DIR --input AUDIO --outdir DIR       same, explicit");
     eprintln!("       lbrr --forward-only --model-dir DIR --input AUDIO               forward pass only");
     eprintln!("       lbrr --bench --model-dir DIR [--warmup N --iters N --bench-stage waveform]");
@@ -113,7 +141,10 @@ fn print_usage() {
     eprintln!("       lbrr --self-test | --print-config | --check-weights   (with --model-dir DIR)");
     eprintln!("       dev parity gates: --fft-test --stft-test --rmsnorm-test --bandsplit-test --gemm-test");
     eprintln!("                         --qkvrope-test --attn-test --gateff-test --e2e-test --reorder-test");
-    eprintln!("options: --model-dir DIR (default assets)  --device N (default 0)  --outdir DIR (default separated)");
+    eprintln!("options: --model-dir DIR (default: ./assets, then next to the executable)");
+    eprintln!("         --device N (default 0)  --outdir DIR (default separated, or <input>_separated)");
+    eprintln!("         --mode stems|vocals (skip the picker)  --stems all|vocals,drums|0,1");
+    eprintln!("         --no-tui  --no-pause  --dry-run");
     eprintln!("         --iters N (bench, default 10)  --warmup N (bench)");
     eprintln!("         --attn-time|--attn-freq auto|cudnn|handwritten  --ff1-backend auto|handwritten|cublaslt-erf");
     eprintln!("         --qk-rope split|fused");
@@ -136,6 +167,58 @@ fn load_config(model_dir: &std::path::Path) -> Result<config::ModelConfig, Strin
     config::ModelConfig::parse(&yaml_text).map_err(|e| format!("bad config: {e}"))
 }
 
+/// Candidate model directories when `--model-dir` is absent: the working
+/// directory (historical default), the portable-bundle layout next to the
+/// executable, then up to two parents (`target/release/lbrr` -> repo root).
+fn model_dir_candidates() -> Vec<PathBuf> {
+    let mut out = vec![PathBuf::from("assets")];
+    if let Some(dir) = exepath::exe_dir() {
+        out.push(dir.join("assets"));
+        let mut cur = dir.as_path();
+        for _ in 0..2 {
+            match cur.parent() {
+                Some(parent) => {
+                    cur = parent;
+                    out.push(cur.join("assets"));
+                }
+                None => break,
+            }
+        }
+    }
+    out
+}
+
+fn resolve_model_dir(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = explicit {
+        return dir;
+    }
+    for candidate in model_dir_candidates() {
+        if candidate.join("model.safetensors").is_file()
+            || candidate.join("logic_bs_roformer.yaml").is_file()
+        {
+            return candidate;
+        }
+    }
+    PathBuf::from("assets")
+}
+
+/// Instrument names for the picker/plan. Missing assets are not fatal here:
+/// dry runs and the picker still work with the bundled default order.
+fn load_instrument_names(model_dir: &std::path::Path) -> Vec<String> {
+    match load_config(model_dir) {
+        Ok(cfg) => cfg.instruments,
+        Err(_) => plan::DEFAULT_INSTRUMENTS.iter().map(|s| (*s).to_string()).collect(),
+    }
+}
+
+fn collect_inputs(args: &Args) -> Vec<PathBuf> {
+    let mut inputs = args.drop_inputs.clone();
+    if let Some(input) = args.input.clone() {
+        inputs.insert(0, input);
+    }
+    inputs
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(a) => a,
@@ -145,6 +228,8 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    let model_dir = resolve_model_dir(args.model_dir.clone());
 
     if args.kernel_regression {
         kernel_regression(args.device, args.benchmark.json.as_deref());
@@ -162,17 +247,17 @@ fn main() {
     }
 
     if args.stft_test {
-        stft_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        stft_parity_test(args.device, &model_dir);
         return;
     }
 
     if args.reorder_test {
-        reorder_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        reorder_test(args.device, &model_dir);
         return;
     }
 
     if args.e2e_test {
-        e2e_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), &args.inference);
+        e2e_test(args.device, &model_dir, &args.inference);
         return;
     }
 
@@ -183,57 +268,55 @@ fn main() {
             std::process::exit(2);
         };
         let outdir = args.outdir.clone().unwrap_or_else(|| PathBuf::from("separated"));
-        forward_only(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), &input, &outdir, &args.inference);
+        forward_only(args.device, &model_dir, &input, &outdir, &args.inference);
         return;
     }
 
     if args.separate {
-        let Some(input) = args.input.clone() else {
+        let inputs = collect_inputs(&args);
+        if inputs.is_empty() {
             eprintln!("lbrr: --input required for --separate");
             print_usage();
             std::process::exit(2);
-        };
-        let outdir = args.outdir.clone().unwrap_or_else(|| PathBuf::from("separated"));
-        separate(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), &input, &outdir, &args.inference);
+        }
+        run_separations(&args, &model_dir, &inputs);
         return;
     }
 
     if args.bench || args.dualbench {
-        bench_warm(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")), args.iters, args.dualbench, &args.benchmark, &args.inference);
+        bench_warm(args.device, &model_dir, args.iters, args.dualbench, &args.benchmark, &args.inference);
         return;
     }
 
     if args.gateff_test {
-        gateff_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        gateff_parity_test(args.device, &model_dir);
         return;
     }
 
     if args.attn_test {
-        attn_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        attn_parity_test(args.device, &model_dir);
         return;
     }
 
     if args.qkvrope_test {
-        qkvrope_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        qkvrope_parity_test(args.device, &model_dir);
         return;
     }
 
     if args.gemm_test {
-        gemm_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        gemm_parity_test(args.device, &model_dir);
         return;
     }
 
     if args.bandsplit_test {
-        bandsplit_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        bandsplit_parity_test(args.device, &model_dir);
         return;
     }
 
     if args.rmsnorm_test {
-        rmsnorm_parity_test(args.device, &args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets")));
+        rmsnorm_parity_test(args.device, &model_dir);
         return;
     }
-
-    let model_dir = args.model_dir.clone().unwrap_or_else(|| PathBuf::from("assets"));
 
     if args.print_config {
         match load_config(&model_dir) {
@@ -283,10 +366,10 @@ fn main() {
         return;
     }
 
-    // No explicit mode flag: --input alone means separation (the common case).
-    if let Some(input) = args.input.clone() {
-        let outdir = args.outdir.clone().unwrap_or_else(|| PathBuf::from("separated"));
-        separate(args.device, &model_dir, &input, &outdir, &args.inference);
+    // Positional paths (drag-and-drop) or --input alone mean separation.
+    let inputs = collect_inputs(&args);
+    if !inputs.is_empty() {
+        run_separations(&args, &model_dir, &inputs);
         return;
     }
 
@@ -5832,49 +5915,7 @@ fn fft_roundtrip_test(device: usize) {
 // End-to-end single-chunk forward (Phase 3)
 // ---------------------------------------------------------------------------
 
-/// f32 -> f16 bits (round to nearest even), no external crates.
-fn f32_to_f16_bits(x: f32) -> u16 {
-    let b = x.to_bits();
-    let sign = ((b >> 16) & 0x8000) as u16;
-    let exp = ((b >> 23) & 0xFF) as i32;
-    let mant = b & 0x7F_FFFF;
-    if exp == 0xFF {
-        return sign | 0x7C00 | if mant != 0 { 1 } else { 0 };
-    }
-    let e = exp - 127 + 15;
-    if e >= 0x1F {
-        return sign | 0x7C00;
-    }
-    if e <= 0 {
-        if e < -10 {
-            return sign;
-        }
-        let m = mant | 0x80_0000;
-        let shift = (14 - e) as u32;
-        let half = m >> shift;
-        let rem = m & ((1 << shift) - 1);
-        let halfway = 1u32 << (shift - 1);
-        let mut hm = half as u16;
-        if rem > halfway || (rem == halfway && (half & 1) == 1) {
-            hm += 1;
-        }
-        return sign | hm;
-    }
-    let mut hm = ((e as u32) << 10) | (mant >> 13);
-    let rem = mant & 0x1FFF;
-    if rem > 0x1000 || (rem == 0x1000 && (hm & 1) == 1) {
-        hm += 1;
-    }
-    sign | hm as u16
-}
-
-/// Pack an even-length f32 slice into f16x2 words (little half = first).
-fn pack_f16x2(v: &[f32]) -> Vec<u32> {
-    assert!(v.len() % 2 == 0);
-    v.chunks(2)
-        .map(|c| (f32_to_f16_bits(c[0]) as u32) | ((f32_to_f16_bits(c[1]) as u32) << 16))
-        .collect()
-}
+use fp16::{f32_to_f16_bits, pack_f16x2};
 
 /// f16 bits -> f32 (exact), the DIAG-side inverse of cvt_f16x2_f32.
 fn f16_bits_to_f32(h: u16) -> f32 {
@@ -6007,8 +6048,7 @@ fn upload_weights(_ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, w: &weights
     let up=|v:&[f32]| {let t=Instant::now();let b=DeviceBuffer::from_host(stream,v).map_err(|e|e.to_string());h2d_ms.set(h2d_ms.get()+t.elapsed().as_secs_f64()*1000.0);b};
     let packed=|parts:&[&[f32]]| {
         let t=Instant::now();
-        let mut words=Vec::with_capacity(parts.iter().map(|p|p.len()/2).sum());
-        for part in parts {assert!(part.len()%2==0);words.extend(part.chunks_exact(2).map(|c|(f32_to_f16_bits(c[0])as u32)|((f32_to_f16_bits(c[1])as u32)<<16)));}
+        let words=fp16::pack_parts(parts);
         pack_ms.set(pack_ms.get()+t.elapsed().as_secs_f64()*1000.0);
         let t=Instant::now();let b=DeviceBuffer::from_host(stream,&words).map_err(|e|e.to_string());h2d_ms.set(h2d_ms.get()+t.elapsed().as_secs_f64()*1000.0);b
     };
@@ -7441,7 +7481,92 @@ fn prepare_via_ffmpeg(input: &std::path::Path, desc: &str) -> Result<(audio::Wav
     Ok((wav?, Some(desc.to_string())))
 }
 
-fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path, outdir: &std::path::Path, inference: &InferenceOptions) {
+/// Separation front-end shared by `--input`, `--separate` and drag-and-drop.
+/// Positional paths additionally get the interactive picker (when a terminal
+/// is attached) and a pause before an Explorer-launched console window closes.
+fn run_separations(args: &Args, model_dir: &std::path::Path, inputs: &[PathBuf]) {
+    let instruments = load_instrument_names(model_dir);
+    let drag = !args.drop_inputs.is_empty();
+    if drag {
+        tui::force_utf8_console();
+    }
+    let interactive =
+        drag && !args.no_tui && !args.dry_run && args.mode.is_none() && args.stems.is_none() && tui::available();
+
+    let outdir_of = |input: &std::path::Path| -> PathBuf {
+        args.outdir.clone().unwrap_or_else(|| plan::default_outdir(input, drag))
+    };
+
+    let chosen = if interactive {
+        let preview = outdir_of(&inputs[0]);
+        match tui::choose(inputs, &preview, &instruments) {
+            Ok(Some(choice)) => Some(choice),
+            Ok(None) => {
+                println!("lbrr: 已取消");
+                return;
+            }
+            Err(e) => {
+                eprintln!("lbrr: 无法启动交互界面（{e}），改用命令行设置");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let output_plan = match chosen {
+        Some(choice) => choice,
+        None => {
+            let mode = args.mode.unwrap_or(plan::Mode::Stems);
+            if args.stems.is_some() && mode == plan::Mode::Vocals {
+                eprintln!("lbrr: --stems is ignored in vocals mode");
+            }
+            match mode {
+                plan::Mode::Vocals => plan::Plan::vocals(&instruments),
+                plan::Mode::Stems => match args.stems.as_deref() {
+                    Some(spec) => plan::Plan {
+                        mode,
+                        stems: die(plan::parse_stems(spec, &instruments), "--stems"),
+                    },
+                    None => plan::Plan::all_stems(&instruments),
+                },
+            }
+        }
+    };
+
+    for input in inputs {
+        let outdir = outdir_of(input);
+        if args.dry_run {
+            print_plan(input, model_dir, &outdir, &output_plan, &instruments);
+            continue;
+        }
+        separate(args.device, model_dir, input, &outdir, &args.inference, &output_plan);
+    }
+
+    if drag && !args.dry_run && !args.no_pause && !args.no_tui {
+        tui::pause();
+    }
+}
+
+fn print_plan(
+    input: &std::path::Path,
+    model_dir: &std::path::Path,
+    outdir: &std::path::Path,
+    output_plan: &plan::Plan,
+    instruments: &[String],
+) {
+    println!("dry-run  : plan only, no audio decoded and no GPU work");
+    println!("input    : {}", input.display());
+    println!("model    : {}", model_dir.display());
+    println!("mode     : {}", output_plan.mode.label());
+    println!("outdir   : {}", outdir.display());
+    for target in output_plan.targets(instruments) {
+        let sources: Vec<String> = target.sources().iter().map(|i| i.to_string()).collect();
+        println!("output   : {} (stem {})", outdir.join(target.file()).display(), sources.join("+"));
+    }
+}
+
+fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path, outdir: &std::path::Path, inference: &InferenceOptions, output_plan: &plan::Plan) {
     let wall_t0 = std::time::Instant::now();
     let (wav, conv) = match prepare_input(input) {
         Ok(v) => v,
@@ -7458,6 +7583,7 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
     let t_frames = stft::num_frames(588800); // 1151
     let m = t_frames * bands;
     println!("model    : dim={} depth={} bands={} stems=[{}]", cfg.dim, cfg.depth, bands, cfg.instruments.join(" "));
+    println!("plan     : {}", output_plan.summary(&cfg.instruments));
 
     const C: usize = 588800;
     const STEP: usize = 559360;
@@ -7630,27 +7756,36 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
     // BORDER left-pad samples before the source. Read [BORDER, BORDER+len)
     // so stems align with the input (was [0, out_len) — a +29440-sample
     // shift caught by cross-correlation against the source).
+    let targets = output_plan.targets(&names);
     let mut wrote_bytes = 0u64;
-    for s_idx in 0..6usize {
-        let name = names.get(s_idx).map(|s| s.as_str()).unwrap_or("stem");
-        // interleaved stereo, normalized by counter
+    let mut wrote_files = Vec::new();
+    for target in &targets {
         let mut out_samples = vec![0.0f32; len * 2];
         for ch in 0..2usize {
             for i in 0..len {
                 let c = demix_counter[BORDER + i];
-                let v = if c > 1e-8 { result[(s_idx * 2 + ch) * out_len + BORDER + i] / c } else { 0.0 };
+                let mut v = 0.0f32;
+                if c > 1e-8 {
+                    // A mix is the stem sum divided once by the same counter:
+                    // every stem of a chunk shares that chunk's window energy.
+                    for &s_idx in target.sources() {
+                        v += result[(s_idx * 2 + ch) * out_len + BORDER + i];
+                    }
+                    v /= c;
+                }
                 out_samples[i * 2 + ch] = v;
             }
         }
-        let path = outdir.join(format!("{s_idx}_{name}.wav"));
+        let path = outdir.join(target.file());
         audio::write_wav_f32(&path, &audio::WavData { sample_rate: wav.sample_rate, channels: 2, samples: out_samples }).unwrap_or_else(|e| {
             eprintln!("lbrr: write {}: {e}", path.display());
             std::process::exit(1);
         });
         wrote_bytes += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        wrote_files.push(target.file().to_string());
     }
-    println!("output   : {} stems -> {}/ ({}, {:.1} MB total)",
-        names.len(), outdir.display(), names.join(", "), wrote_bytes as f64 / 1e6);
+    println!("output   : {} tracks -> {}/ ({}, {:.1} MB total)",
+        wrote_files.len(), outdir.display(), wrote_files.join(", "), wrote_bytes as f64 / 1e6);
     println!("total    : {:.1}s wall", wall_t0.elapsed().as_secs_f64());
 }
 

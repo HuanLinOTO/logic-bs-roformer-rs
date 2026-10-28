@@ -136,6 +136,29 @@ jobs:
           rustup show active-toolchain
           cargo oxide build -- --release
 
+      # ---------- CLI contract (no GPU, no model weights) ----------
+      - name: CLI dry-run smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+          ./target/release/lbrr --dry-run --input demo.mp3 --outdir out-check
+          ./target/release/lbrr --dry-run "demo song.flac" --mode vocals
+          ./target/release/lbrr --dry-run "demo song.flac" --stems vocals,drums
+          test "$(./target/release/lbrr --dry-run "demo song.flac" --stems all | grep -c '^output')" -eq 6
+          ./target/release/lbrr --help > /dev/null
+
+      - name: CLI dry-run smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ./target/release/lbrr.exe --dry-run --input demo.mp3 --outdir out-check
+          ./target/release/lbrr.exe --dry-run "demo song.flac" --mode vocals
+          ./target/release/lbrr.exe --dry-run "demo song.flac" --stems vocals,drums
+          test "$(./target/release/lbrr.exe --dry-run "demo song.flac" --stems all | grep -c '^output')" -eq 6
+          ./target/release/lbrr.exe --help > /dev/null
+
       - name: Upload lbrr binary
         uses: actions/upload-artifact@v4
         with:
@@ -231,7 +254,7 @@ jobs:
           cp -L "${CUDA_HOME}/lib64/libnvrtc-builtins.so."* $dist/ 2>/dev/null || true
           cp -L "${CUDA_HOME}/lib64/libcudart.so."* $dist/
           cp -L third_party/cudnn/nvidia/cudnn/lib/*.so* $dist/
-          printf 'lbrr portable bundle (Linux x86-64, CUDA ${{ matrix.cuda_major }})\nRequirements: NVIDIA driver; ffmpeg on PATH for non-wav input.\nUsage: ./lbrr --input song.mp3 --outdir out --model-dir <model dir>\nEvery runtime library lives next to the executable; no CUDA toolkit install is needed. Model weights are not bundled.\n' > $dist/README.txt
+          printf 'lbrr portable bundle (Linux x86-64, CUDA ${{ matrix.cuda_major }})\nRequirements: NVIDIA driver; ffmpeg on PATH for non-wav input.\nUsage: drop an audio file onto lbrr (or ./lbrr song.mp3) and choose the outputs in the picker.\n       ./lbrr --input song.mp3 --mode vocals --outdir out    (non-interactive)\nModel: unzip lbrr-assets.zip into this directory so assets/ sits next to lbrr.\nEvery runtime library lives next to the executable; no CUDA toolkit install is needed.\n' > $dist/README.txt
           tar -C third_party/dist -czf "${{ matrix.bundle }}.tar.gz" .
           ls -lh "${{ matrix.bundle }}.tar.gz"
 
@@ -248,9 +271,47 @@ jobs:
             Get-ChildItem "$bin/$pat" -ErrorAction SilentlyContinue | Copy-Item -Destination $dist/
           }
           Get-ChildItem third_party/cudnn/nvidia/cudnn/bin/*.dll | Copy-Item -Destination $dist/
-          "lbrr portable bundle (Windows x64, CUDA ${{ matrix.cuda_major }})", "Requirements: NVIDIA driver; ffmpeg on PATH for non-wav input.", "Usage: lbrr --input song.mp3 --outdir out --model-dir <model dir>", "Every runtime DLL lives next to the executable; no CUDA toolkit install is needed. Model weights are not bundled." | Set-Content $dist/README.txt
+          "lbrr portable bundle (Windows x64, CUDA ${{ matrix.cuda_major }})", "Requirements: NVIDIA driver; ffmpeg on PATH for non-wav input.", "Usage: drop an audio file onto lbrr.exe and choose the outputs in the picker.", "       lbrr --input song.mp3 --mode vocals --outdir out    (non-interactive)", "Model: unzip lbrr-assets.zip into this directory so assets/ sits next to lbrr.exe.", "Every runtime DLL lives next to the executable; no CUDA toolkit install is needed." | Set-Content $dist/README.txt
           Compress-Archive -Path "$dist/*" -DestinationPath "${{ matrix.bundle }}.zip"
           Get-Item "${{ matrix.bundle }}.zip" | Select-Object Name, Length
+
+      # ---------- Model assets (weights + config), separate from the binaries ----------
+      # The Linux bundle is already close to GitHub's 2 GiB per-release-file
+      # limit; the ~700 MB checkpoint ships as its own archive that unpacks to
+      # assets/ next to the executable.
+      - name: Stage model assets
+        if: runner.os == 'Linux'
+        env:
+          LBRR_ASSETS_URL: ${{ vars.LBRR_ASSETS_URL }}
+        run: bash scripts/stage_assets.sh third_party/assets
+
+      - name: Pack model assets archive
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          if [ ! -f third_party/assets/assets/model.safetensors ]; then
+            echo '::warning::no model weights staged; skipping lbrr-assets.zip'
+            exit 0
+          fi
+          python3 - <<'PY'
+          import pathlib
+          import zipfile
+          root = pathlib.Path('third_party/assets')
+          with zipfile.ZipFile('lbrr-assets.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted((root / 'assets').rglob('*')):
+                  if path.is_file():
+                      archive.write(path, path.relative_to(root).as_posix())
+          print('lbrr-assets.zip bytes:', pathlib.Path('lbrr-assets.zip').stat().st_size)
+          PY
+
+      - name: Upload model assets bundle
+        if: runner.os == 'Linux' && hashFiles('lbrr-assets.zip') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-lbrr-assets
+          path: lbrr-assets.zip
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload portable bundle
         uses: actions/upload-artifact@v4

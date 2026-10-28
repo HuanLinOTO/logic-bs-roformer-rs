@@ -22,6 +22,8 @@ cuda-core = { path = "vendor/cuda-rust/cuda-core" }
 libloading = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Interactive front-end for drag-and-drop launches (raw mode, key events).
+crossterm = "0.29"
 
 [profile.release]
 debug = 1

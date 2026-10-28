@@ -18,7 +18,7 @@ pub fn read_wav(path: &std::path::Path) -> Result<WavData, String> {
         return Err("not a RIFF/WAVE file".into());
     }
     let mut fmt: Option<Fmt> = None;
-    let mut data: Option<(u16, Vec<u8>)> = None;
+    let mut data: Option<(u16, &[u8])> = None;
     while r.remaining() >= 8 {
         let mut id = [0u8; 4];
         r.take(&mut id)?;
@@ -64,7 +64,11 @@ pub fn read_wav(path: &std::path::Path) -> Result<WavData, String> {
             .collect(),
         (f, b) => return Err(format!("unsupported wav: format {f}, {b} bits")),
     };
-    Ok(WavData { sample_rate: fmt.sample_rate, channels: fmt.channels, samples })
+    Ok(WavData {
+        sample_rate: fmt.sample_rate,
+        channels: fmt.channels,
+        samples,
+    })
 }
 
 #[derive(Default)]
@@ -76,25 +80,63 @@ struct Fmt {
 }
 
 pub fn write_wav_f32(path: &std::path::Path, wav: &WavData) -> Result<(), String> {
-    let data_len = wav.samples.len() * 4;
-    let mut out = Vec::with_capacity(44 + data_len);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
-    out.extend_from_slice(&(wav.channels as u16).to_le_bytes());
-    out.extend_from_slice(&wav.sample_rate.to_le_bytes());
-    out.extend_from_slice(&((wav.channels * 4 * wav.sample_rate as usize) as u32).to_le_bytes());
-    out.extend_from_slice(&((wav.channels * 4) as u16).to_le_bytes());
-    out.extend_from_slice(&32u16.to_le_bytes());
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&(data_len as u32).to_le_bytes());
-    for s in &wav.samples {
-        out.extend_from_slice(&s.to_le_bytes());
+    use std::io::Write;
+    let channels = u16::try_from(wav.channels).map_err(|_| "WAV channel count overflow")?;
+    if channels == 0 || wav.sample_rate == 0 || wav.samples.len() % wav.channels != 0 {
+        return Err("invalid WAV sample rate, channel count or incomplete frame".into());
     }
-    std::fs::write(path, out).map_err(|e| format!("write {}: {e}", path.display()))
+    let block_align = channels
+        .checked_mul(4)
+        .ok_or("WAV block alignment overflow")?;
+    let byte_rate = wav
+        .sample_rate
+        .checked_mul(u32::from(block_align))
+        .ok_or("WAV byte rate overflow")?;
+    let data_len = wav
+        .samples
+        .len()
+        .checked_mul(4)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or("WAV data size overflow")?;
+    let riff_len = data_len.checked_add(36).ok_or("WAV RIFF size overflow")?;
+    let mut header = [0u8; 44];
+    header[0..4].copy_from_slice(b"RIFF");
+    header[4..8].copy_from_slice(&riff_len.to_le_bytes());
+    header[8..16].copy_from_slice(b"WAVEfmt ");
+    header[16..20].copy_from_slice(&16u32.to_le_bytes());
+    header[20..22].copy_from_slice(&3u16.to_le_bytes());
+    header[22..24].copy_from_slice(&channels.to_le_bytes());
+    header[24..28].copy_from_slice(&wav.sample_rate.to_le_bytes());
+    header[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+    header[32..34].copy_from_slice(&block_align.to_le_bytes());
+    header[34..36].copy_from_slice(&32u16.to_le_bytes());
+    header[36..40].copy_from_slice(b"data");
+    header[40..44].copy_from_slice(&data_len.to_le_bytes());
+    let write = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(&header)?;
+        #[cfg(target_endian = "little")]
+        {
+            // SAFETY: f32 has no padding, all bit patterns are valid, and the
+            // immutable byte view cannot outlive the samples it borrows.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(wav.samples.as_ptr().cast::<u8>(), data_len as usize)
+            };
+            file.write_all(bytes)?;
+        }
+        #[cfg(target_endian = "big")]
+        {
+            let mut bytes = [0u8; 16 * 1024];
+            for chunk in wav.samples.chunks(bytes.len() / 4) {
+                for (sample, dst) in chunk.iter().zip(bytes.chunks_exact_mut(4)) {
+                    dst.copy_from_slice(&sample.to_le_bytes());
+                }
+                file.write_all(&bytes[..chunk.len() * 4])?;
+            }
+        }
+        Ok(())
+    };
+    write().map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 struct Reader<'a> {
@@ -102,7 +144,7 @@ struct Reader<'a> {
     pos: usize,
 }
 
-impl Reader<'_> {
+impl<'a> Reader<'a> {
     fn take(&mut self, out: &mut [u8]) -> Result<(), String> {
         if self.pos + out.len() > self.b.len() {
             return Err("unexpected EOF".into());
@@ -111,11 +153,11 @@ impl Reader<'_> {
         self.pos += out.len();
         Ok(())
     }
-    fn take_bytes(&mut self, n: usize) -> Result<Vec<u8>, String> {
+    fn take_bytes(&mut self, n: usize) -> Result<&'a [u8], String> {
         if self.pos + n > self.b.len() {
             return Err("unexpected EOF in data chunk".into());
         }
-        let v = self.b[self.pos..self.pos + n].to_vec();
+        let v = &self.b[self.pos..self.pos + n];
         self.pos += n;
         Ok(v)
     }
@@ -139,5 +181,124 @@ impl Reader<'_> {
     }
     fn remaining(&self) -> usize {
         self.b.len().saturating_sub(self.pos)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Temp(std::path::PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "lbrr-audio-{}-{}.wav",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )))
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn legacy_bytes(wav: &WavData) -> Vec<u8> {
+        let data_len = wav.samples.len() * 4;
+        let mut out = Vec::with_capacity(44 + data_len);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&3u16.to_le_bytes());
+        out.extend_from_slice(&(wav.channels as u16).to_le_bytes());
+        out.extend_from_slice(&wav.sample_rate.to_le_bytes());
+        out.extend_from_slice(
+            &((wav.channels * 4 * wav.sample_rate as usize) as u32).to_le_bytes(),
+        );
+        out.extend_from_slice(&((wav.channels * 4) as u16).to_le_bytes());
+        out.extend_from_slice(&32u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data_len as u32).to_le_bytes());
+        for s in &wav.samples {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn float_wav_is_byte_compatible_and_roundtrips() {
+        let values: Vec<f32> = [
+            0, 0x80000000, 0x3f800000, 0xbf800000, 1, 0x7f800000, 0x7fc01234, 0xff800001,
+        ]
+        .into_iter()
+        .map(f32::from_bits)
+        .collect();
+        for channels in [1, 2] {
+            let wav = WavData {
+                sample_rate: 44100,
+                channels,
+                samples: values.clone(),
+            };
+            let path = Temp::new();
+            write_wav_f32(&path.0, &wav).unwrap();
+            assert_eq!(std::fs::read(&path.0).unwrap(), legacy_bytes(&wav));
+            let got = read_wav(&path.0).unwrap();
+            assert_eq!(got.sample_rate, wav.sample_rate);
+            assert_eq!(got.channels, wav.channels);
+            assert_eq!(
+                got.samples.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+                values.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn pcm16_and_pcm24_decode_unchanged() {
+        for bits in [16u16, 24] {
+            let path = Temp::new();
+            let mut bytes = legacy_bytes(&WavData {
+                sample_rate: 48000,
+                channels: 1,
+                samples: vec![0.0; 3],
+            });
+            let payload = if bits == 16 {
+                vec![0, 128, 0, 0, 255, 127]
+            } else {
+                vec![0, 0, 128, 0, 0, 0, 255, 255, 127]
+            };
+            bytes[20..22].copy_from_slice(&1u16.to_le_bytes());
+            bytes[34..36].copy_from_slice(&bits.to_le_bytes());
+            bytes[40..44].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.truncate(44);
+            bytes.extend(payload);
+            std::fs::write(&path.0, bytes).unwrap();
+            let got = read_wav(&path.0).unwrap();
+            assert_eq!(
+                got.samples,
+                vec![-1.0, 0.0, 1.0 - 2.0f32.powi(1 - bits as i32)]
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_metadata_is_rejected_before_creating_file() {
+        for (rate, channels, len) in [
+            (0, 2, 2),
+            (44100, 0, 0),
+            (44100, 2, 3),
+            (u32::MAX, 2, 2),
+            (44100, usize::MAX, 0),
+        ] {
+            let path = Temp::new();
+            let wav = WavData {
+                sample_rate: rate,
+                channels,
+                samples: vec![0.0; len],
+            };
+            assert!(write_wav_f32(&path.0, &wav).is_err());
+            assert!(!path.0.exists());
+        }
     }
 }

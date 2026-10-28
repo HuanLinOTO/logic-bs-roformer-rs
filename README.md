@@ -2,7 +2,13 @@
 
 BS-RoFormer 六 stem 音源分离的 Rust + cuda-oxide 实现，支持 Windows 原生和 Linux CUDA。模型权重、训练 YAML 与六个双声道 WAV 的输出格式保持兼容。
 
-## 当前结果
+## 本轮实测优化（2026-10-08）
+
+Windows RTX 4060 Ti / i5-12400F：CPU 权重 FP16 转换减少约 **76–77%**；63.7MB WAV 微基准写入/读取分别减少 **39.6% / 25.2%**。固定 GEMM 算术路径的180.48秒整曲三轮进程墙钟中位数 **6.89→6.42秒（快6.85%）**，六个输出 WAV 全部逐位一致。默认后端热推理基本持平，不把约0.1%的差异算成收益。
+
+整曲对照双方均设置 `LBRR_NO_LT=1` 以排除原有跨进程算法调优波动，不能当作默认 cuBLASLt 整曲加速。详见[本轮实测报告](<D:/Projects/logic-bs-roformer-rs/docs/benchmarks/2026-10-08-performance.md>)和[每轮结果与身份哈希](<D:/Projects/logic-bs-roformer-rs/docs/benchmarks/2026-10-08-results.json>)。旧3080报告保留为历史数据，不替代本机基线。
+
+## 历史结果（2026-10-07）
 
 RTX 3080 20GB，完整波形（包括 GPU ISTFT overlap-add），5轮交替配对、每轮预热5次/计时20次：
 
@@ -17,6 +23,26 @@ RTX 3080 20GB，完整波形（包括 GPU ISTFT overlap-add），5轮交替配�
 完整块配对收益为 **1.19%**；对初始 B0 158.97 ms 的收益为 **0.68%**。原定8%延迟目标未达到。输出在3080正式对照中逐位一致，九个固定 fixture 通过逐 stem 误差门槛。更充分的 GEMM 调优增加了冷启动时间，进程墙钟中位数约5.49→6.19秒；它与热推理延迟分别报告。
 
 方法、候选拒绝原因、冷启动、MFU和原始结果见[性能验收报告](docs/BENCHMARK.md)。Windows及WSL已完成编译、短golden和边界检查；本地繁忙时仅作数值验证，正式性能结论来自3080。
+
+## 拖入音频：交互式选择输出
+
+把音频文件拖到 `lbrr.exe` 上（或直接 `lbrr song.mp3`）会先进入交互界面，选完再开始分离：
+
+- **输出模式**：`详细音轨` 每个 stem 一个 WAV（默认 6 个），或 `人声 / 伴奏` 输出 `vocals.wav` 与 `instrumental.wav`（其余 stem 之和）。
+- **输出音轨**：详细模式下用空格勾选要写出的 stem，`a` 全选、`n` 全不选。
+- 结果写入音频旁边的 `<文件名>_separated/`，`--outdir` 可覆盖。
+
+键盘：`↑↓/jk` 移动，`←→` 切模式，`Enter/空格` 选择或开始，`Esc` 取消。终端不是 TTY 或加 `--no-tui` 时跳过界面；拖入多个文件时按同一份选择逐个处理。
+
+不需要界面时用等价参数：
+
+~~~bash
+lbrr song.mp3 --dry-run                        # 只打印输出计划，不跑 GPU
+lbrr --input song.mp3 --mode vocals            # vocals.wav + instrumental.wav
+lbrr --input song.mp3 --stems vocals,drums     # 只写选中的 stem
+~~~
+
+`--input` 的默认输出目录仍是 `separated/`，只有拖入文件才用输入旁边的目录；拖入启动的进程结束前会等一次回车（`--no-pause` 关闭），避免 Explorer 窗口闪退。`--model-dir` 缺省时依次探测 `./assets`、可执行文件旁的 `assets/` 与上两级目录下的 `assets/`，便携包解压后无需再设路径。
 
 ## Windows 原生构建与运行
 
@@ -92,5 +118,7 @@ LBRR_CARGO_ACTION=build bash scripts/build_wsl.sh -- --release
 [本地CI](scripts/ci.sh)运行GPU smoke、核函数边界回归、后端生命周期单元测试以及完整波形JSON门槛。LBRR_MODEL_DIR可指定模型目录，LBRR_CI_BASELINE_JSON可启用相对B0逐stem门槛。
 
 [GitHub workflow](.github/workflows/ci.yml)在托管 Linux/Windows runner验证构建；GPU步骤通过设备探测启用。缺GPU或权重会明确说明资源型检查被跳过。最终性能验收必须使用资源齐备的机器。
+
+打包会把 `lbrr-assets.zip`（`model.safetensors` + `logic_bs_roformer.yaml`）和两个平台的便携包一起上传，解压到 `lbrr` 同目录即可直接拖音频运行。权重不进二进制包：Linux 包本身已接近 GitHub Release 单文件 2 GiB 上限。CI 用仓库 variable `LBRR_ASSETS_URL`（压缩包或 `model.safetensors` 直链）下载权重，也可由 `LBRR_ASSETS_DIR`、`./assets` 或自托管 runner 的 `/opt/lbrr-assets` 提供；没有权重时只告警，不影响二进制包。构建后会先在两种 runner 上跑 `--dry-run`（不需要 GPU），校验位置参数、`--mode`、`--stems` 与输出计划。
 
 已有 --e2e-test、--stft-test、--attn-test 等诊断入口保留，所需参考可用[dump_refs.py](tools/dump_refs.py)生成。新增 --kernel-regression 不依赖模型权重，覆盖RoPE、FFT/OLA、Mask映射、FF1尾行和调优输入保护。
