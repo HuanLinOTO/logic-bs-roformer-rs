@@ -7490,6 +7490,35 @@ fn run_separations(args: &Args, model_dir: &std::path::Path, inputs: &[PathBuf])
     if drag {
         tui::force_utf8_console();
     }
+
+    // Fail before the picker when the prerequisites are missing: a
+    // drag-and-drop console window would otherwise close on the first error.
+    if !args.dry_run {
+        let weights = model_dir.join("model.safetensors");
+        let config = model_dir.join("logic_bs_roformer.yaml");
+        let absent_inputs: Vec<String> =
+            inputs.iter().filter(|p| !p.is_file()).map(|p| p.display().to_string()).collect();
+        if !weights.is_file() || !config.is_file() || !absent_inputs.is_empty() {
+            if !weights.is_file() || !config.is_file() {
+                eprintln!("lbrr: model assets incomplete in {}", model_dir.display());
+                if !weights.is_file() {
+                    eprintln!("       missing {}", weights.display());
+                }
+                if !config.is_file() {
+                    eprintln!("       missing {}", config.display());
+                }
+                eprintln!("       pass --model-dir DIR, or unzip lbrr-assets.zip next to the executable");
+            }
+            for item in &absent_inputs {
+                eprintln!("lbrr: input not found: {item}");
+            }
+            if drag {
+                tui::pause();
+            }
+            std::process::exit(1);
+        }
+    }
+
     let interactive =
         drag && !args.no_tui && !args.dry_run && args.mode.is_none() && args.stems.is_none() && tui::available();
 
