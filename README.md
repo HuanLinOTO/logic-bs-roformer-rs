@@ -44,6 +44,30 @@ lbrr --input song.mp3 --stems vocals,drums     # 只写选中的 stem
 
 `--input` 的默认输出目录仍是 `separated/`，只有拖入文件才用输入旁边的目录；拖入启动的进程结束前会等一次回车（`--no-pause` 关闭），避免 Explorer 窗口闪退。`--model-dir` 缺省时依次探测 `./assets`、可执行文件旁的 `assets/` 与上两级目录下的 `assets/`，便携包解压后无需再设路径。
 
+## HTTP API 外壳
+
+`api/lbrr_api.py` 提供 FastAPI 包装服务：`POST /separate` 接收 multipart 字段 `file`，先用 ffprobe 做快速时长检查，再实际解码成 44.1kHz stereo 临时 WAV 并按样本数确认时长严格小于 600 秒，之后才会调用 `lbrr` 分离。输出 WAV 只作临时中间文件；每个 stem 会先统一做防爆音增益，再转成 24-bit FLAC（ffmpeg `-compression_level 12`），只以 `ZIP_STORED` 方式打包（zip 不再二次压缩）并作为 `application/zip` 返回。可选表单字段 `mode=stems|vocals`（默认 `stems`）与 `stems=all|vocals,drums|0,1` 对应 CLI 参数。`GET /healthz` 返回二进制与模型资源是否就绪。
+
+~~~bash
+pip install -r api/requirements.txt
+LBRR_BIN=/opt/lbrr/bin/lbrr LBRR_MODEL_DIR=/opt/lbrr/bin/assets \
+LBRR_API_HOST=127.0.0.1 LBRR_API_PORT=10722 \
+python -m api.lbrr_api
+
+curl -H "Authorization: Bearer $TOKEN" \
+  -F "file=@song.mp3" -F "mode=stems" -F "stems=all" \
+  -o separated-flac.zip http://127.0.0.1:10722/separate
+~~~
+
+`/separate` 接受 `Authorization: Bearer ...` 或 `X-API-Key`。非 loopback 绑定时必须设置 `LBRR_API_TOKEN` 并配置 `LBRR_API_SSL_CERTFILE`/`LBRR_API_SSL_KEYFILE`（自签证书也可），除非显式设置 `LBRR_API_ALLOW_UNAUTHENTICATED=true` 或 `LBRR_API_ALLOW_INSECURE_HTTP=true` 覆盖保护。其他环境变量见 `api/lbrr_api.py`：`LBRR_API_CONCURRENCY`（默认 1，限制同时占用 GPU 的分离进程）、`LBRR_API_ENCODE_WORKERS`（FLAC 并行编码数）、`LBRR_API_TEMP_DIR`、`LBRR_API_MAX_UPLOAD_BYTES` 与 `LBRR_API_JOB_TIMEOUT_SECONDS`。`deploy/lbrr-api.service` 是 systemd 模板；将仓库放在 `/opt/lbrr-api/repo`、venv 放在 `/opt/lbrr-api/venv`、便携版 `lbrr` 与 `assets/` 放在 `/opt/lbrr/bin` 后可直接启用。
+
+Release 的便携包不含模型权重。公开上游 checkpoint 可由 [ChanTrail/BS-RoFormer](https://huggingface.co/ChanTrail/BS-RoFormer) 下载，再用已有 PyTorch 环境转成 Rust 端所需 safetensors：
+
+~~~bash
+python tools/export_weights.py logic_bs_roformer.ckpt /opt/lbrr/bin/assets/model.safetensors
+cp assets/logic_bs_roformer.yaml /opt/lbrr/bin/assets/
+~~~
+
 ## Windows 原生构建与运行
 
 [编译器子模块](vendor/cuda-rust) 使用 [cuda-rust-windows fork](https://github.com/ansidium/cuda-rust-windows)，现有 stable 1.99 工具链与构建入口保持不变。
