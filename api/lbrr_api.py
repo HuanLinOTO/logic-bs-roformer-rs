@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import hmac
+import ipaddress
 import json
 import logging
 import math
@@ -144,7 +145,12 @@ def load_settings() -> Settings:
 
 def is_loopback_host(host: str) -> bool:
     normalized = host.strip().lower().strip("[]")
-    return normalized in {"localhost", "::1"} or normalized.startswith("127.")
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def validate_network_security(settings: Settings) -> None:
