@@ -276,6 +276,54 @@ def wav_f32_duration(wav_path: Path, expected_rate: int = 44100, expected_channe
     return data_size / bytes_per_frame / expected_rate
 
 
+def simplify_extensible_float_wav(wav_path: Path) -> None:
+    """Rewrite ffmpeg's redundant stereo float extensible WAV as legacy float WAV."""
+    with wav_path.open("rb") as source:
+        source.seek(0)
+        riff = source.read(12)
+        if len(riff) != 12 or riff[:4] != b"RIFF" or riff[8:12] != b"WAVE":
+            raise ValueError("normalized audio is not a RIFF/WAVE file")
+        fmt = None
+        data_pos = data_size = None
+        while True:
+            header = source.read(8)
+            if not header:
+                break
+            if len(header) != 8:
+                raise ValueError("normalized WAV has a truncated chunk header")
+            chunk_id, chunk_size = header[:4], struct.unpack("<I", header[4:])[0]
+            pos = source.tell()
+            if chunk_id == b"fmt ":
+                fmt = source.read(min(chunk_size, 40))
+                source.seek(pos + chunk_size + (chunk_size % 2))
+            elif chunk_id == b"data":
+                data_pos, data_size = pos, chunk_size
+                source.seek(chunk_size + (chunk_size % 2), 1)
+            else:
+                source.seek(chunk_size + (chunk_size % 2), 1)
+        if fmt is None or data_pos is None or len(fmt) < 16:
+            raise ValueError("normalized WAV is missing fmt or data chunks")
+        tag, channels, rate, _byte_rate, block_align, bits = struct.unpack("<HHIIHH", fmt[:16])
+        if tag == 0xFFFE and len(fmt) >= 40:
+            tag = struct.unpack("<H", fmt[24:26])[0]
+        if tag != 3 or channels != 2 or rate != 44100 or bits != 32 or block_align != 8:
+            raise ValueError("normalized WAV is not 44.1kHz stereo float audio")
+        temp_path = wav_path.with_suffix(".rewrite.wav")
+        with temp_path.open("wb") as output:
+            output.write(b"RIFF" + struct.pack("<I", 36 + data_size) + b"WAVEfmt ")
+            output.write(struct.pack("<IHHIIHH", 16, 3, channels, rate, rate * 8, 8, 32))
+            output.write(b"data" + struct.pack("<I", data_size))
+            source.seek(data_pos)
+            remaining = data_size
+            while remaining:
+                block = source.read(min(1024 * 1024, remaining))
+                if not block:
+                    raise ValueError("normalized WAV data is truncated")
+                output.write(block)
+                remaining -= len(block)
+    temp_path.replace(wav_path)
+
+
 def normalize_input_audio(settings: Settings, source_path: Path, normalized_path: Path) -> float:
     """Decode the input exactly as lbrr would and return its real duration.
 
@@ -308,6 +356,7 @@ def normalize_input_audio(settings: Settings, source_path: Path, normalized_path
         _run_command(command, settings.job_timeout_seconds, "input decode")
     except JobError as exc:
         raise ValueError(str(exc)) from exc
+    simplify_extensible_float_wav(normalized_path)
     duration = wav_f32_duration(normalized_path)
     if duration <= 0:
         raise ValueError("audio duration is zero")
