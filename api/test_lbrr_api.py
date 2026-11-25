@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from api.lbrr_api import Settings, create_app
+from api.lbrr_api import Settings, convert_wav_to_flac, create_app, measure_peak_db, output_gain_db
 
 STEM_NAMES = ["0_bass", "1_drums", "2_other", "3_vocals", "4_guitar", "5_piano"]
 
@@ -100,11 +100,24 @@ def make_settings(tmp_path: Path, fake_lbrr: Path, **overrides) -> Settings:
     return Settings(**values)
 
 
-def post_tone(client: TestClient, seconds: float = 0.25, headers: dict[str, str] | None = None):
+def write_f32_wav(path: Path, amplitude: float = 1.5, frames: int = 4410) -> None:
+    samples = struct.pack(f"<{frames * 2}f", *([amplitude, amplitude] * frames))
+    data_len = len(samples)
+    with path.open("wb") as output:
+        output.write(b"RIFF")
+        output.write(struct.pack("<I", 36 + data_len))
+        output.write(b"WAVEfmt ")
+        output.write(struct.pack("<IHHIIHH", 16, 3, 2, 44100, 44100 * 2 * 4, 8, 32))
+        output.write(b"data")
+        output.write(struct.pack("<I", data_len))
+        output.write(samples)
+
+
+def post_tone(client: TestClient, seconds: float = 0.25, headers: dict[str, str] | None = None, stems: str = "all"):
     return client.post(
         "/separate",
         files={"file": ("tone.wav", wav_bytes(seconds), "audio/wav")},
-        data={"mode": "stems", "stems": "all"},
+        data={"mode": "stems", "stems": stems},
         headers=headers or {},
     )
 
@@ -159,6 +172,27 @@ def test_rejects_audio_at_or_over_duration_limit(tmp_path: Path, fake_lbrr: Path
 
     assert response.status_code == 422
     assert "not less than" in response.json()["detail"]
+
+
+def test_invalid_stem_selection_is_client_error(tmp_path: Path, fake_lbrr: Path) -> None:
+    settings = make_settings(tmp_path, fake_lbrr)
+    with TestClient(create_app(settings)) as client:
+        response = post_tone(client, stems="kazoo")
+
+    assert response.status_code == 422
+    assert "unknown stem" in response.json()["detail"]
+
+
+def test_overfull_float_output_is_scaled_before_flac(tmp_path: Path, fake_lbrr: Path) -> None:
+    settings = make_settings(tmp_path, fake_lbrr)
+    wav_path = tmp_path / "hot.wav"
+    flac_path = tmp_path / "hot.flac"
+    write_f32_wav(wav_path, amplitude=1.5)
+
+    gain_db = output_gain_db(settings, [wav_path], workers=1)
+    assert gain_db < 0
+    convert_wav_to_flac(settings, wav_path, flac_path, gain_db)
+    assert measure_peak_db(settings, flac_path) <= 0
 
 
 def test_token_is_required_when_configured(tmp_path: Path, fake_lbrr: Path) -> None:

@@ -65,6 +65,7 @@ class Settings:
 class JobResult:
     zip_path: Path
     output_files: tuple[str, ...]
+    gain_db: float
 
 
 class JobError(RuntimeError):
@@ -262,9 +263,50 @@ def normalize_input_audio(settings: Settings, source_path: Path, normalized_path
     return duration
 
 
-def convert_wav_to_flac(settings: Settings, wav_path: Path, flac_path: Path) -> None:
+def measure_peak_db(settings: Settings, audio_path: Path) -> float:
+    command = [
+        settings.ffmpeg,
+        "-hide_banner",
+        "-nostdin",
+        "-i",
+        str(audio_path),
+        "-map",
+        "0:a:0",
+        "-af",
+        "astats=measure_overall=Peak_level",
+        "-f",
+        "null",
+        "-",
+    ]
+    proc = _run_command(command, settings.job_timeout_seconds, f"peak analysis {audio_path.name}")
+    match = re.search(r"Peak level dB:\s*(-inf|-?\d+(?:\.\d+)?)", proc.stderr + proc.stdout)
+    if not match:
+        raise JobError(f"could not measure peak for {audio_path.name}")
+    if match.group(1) == "-inf":
+        return -math.inf
+    return float(match.group(1))
+
+
+def output_gain_db(settings: Settings, wavs: Sequence[Path], workers: int) -> float:
+    """Gain shared by every output, preserving stem balance without clipping."""
+    if workers == 1:
+        peaks = [measure_peak_db(settings, wav) for wav in wavs]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            peaks = list(pool.map(lambda wav: measure_peak_db(settings, wav), wavs))
+    peak = max(peaks)
+    if peak <= 0:
+        return 0.0
+    # volumedetect prints hundredths of a dB; leave one extra cent as headroom.
+    return -(peak + 0.01)
+
+
+def convert_wav_to_flac(settings: Settings, wav_path: Path, flac_path: Path, gain_db: float = 0.0) -> None:
     # FLAC cannot represent float samples. s32 with 24 raw bits is the highest
     # bit depth FLAC supports; compression level 12 is ffmpeg's maximum.
+    volume_args: list[str] = []
+    if gain_db < 0:
+        volume_args = ["-af", f"volume={gain_db:.2f}dB"]
     command = [
         settings.ffmpeg,
         "-hide_banner",
@@ -274,6 +316,7 @@ def convert_wav_to_flac(settings: Settings, wav_path: Path, flac_path: Path) -> 
         "-y",
         "-i",
         str(wav_path),
+        *volume_args,
         "-map_metadata",
         "-1",
         "-vn",
@@ -324,16 +367,18 @@ def run_separation_job(settings: Settings, input_path: Path, workdir: Path, mode
     flac_dir = workdir / "flac"
     flac_dir.mkdir(parents=True, exist_ok=True)
 
+    workers = max(1, min(settings.encode_workers, len(wavs)))
+    gain_db = output_gain_db(settings, wavs, workers)
+
     def convert_one(wav_path: Path) -> Path:
         flac_path = flac_dir / f"{wav_path.stem}.flac"
-        convert_wav_to_flac(settings, wav_path, flac_path)
+        convert_wav_to_flac(settings, wav_path, flac_path, gain_db)
         try:
             wav_path.unlink()
         except FileNotFoundError:
             pass
         return flac_path
 
-    workers = max(1, min(settings.encode_workers, len(wavs)))
     if workers == 1:
         flacs = [convert_one(wav) for wav in wavs]
     else:
@@ -351,7 +396,7 @@ def run_separation_job(settings: Settings, input_path: Path, workdir: Path, mode
             pass
     shutil.rmtree(lbrr_outdir, ignore_errors=True)
     shutil.rmtree(flac_dir, ignore_errors=True)
-    return JobResult(zip_path=zip_path, output_files=tuple(path.name for path in flacs))
+    return JobResult(zip_path=zip_path, output_files=tuple(path.name for path in flacs), gain_db=gain_db)
 
 
 DEFAULT_INSTRUMENTS = ("bass", "drums", "other", "vocals", "guitar", "piano")
@@ -553,6 +598,7 @@ def create_app(settings: Settings) -> FastAPI:
                     "X-Output-Files": ",".join(result.output_files),
                     "X-Zip-Compression": "store",
                     "X-Flac-Compression-Level": "12",
+                    "X-Flac-Gain-Db": f"{result.gain_db:.2f}",
                 },
             )
             handed_to_response = True
