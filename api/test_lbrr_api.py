@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from api.lbrr_api import Settings, convert_wav_to_flac, create_app, measure_peak_db, output_gain_db
+from api.lbrr_api import Settings, convert_wav_to_flac, create_app, load_instrument_names, measure_peak_db, output_gain_db
 
 STEM_NAMES = ["0_bass", "1_drums", "2_other", "3_vocals", "4_guitar", "5_piano"]
 
@@ -193,6 +193,13 @@ def test_overfull_float_output_is_scaled_before_flac(tmp_path: Path, fake_lbrr: 
     assert gain_db < 0
     convert_wav_to_flac(settings, wav_path, flac_path, gain_db)
     assert measure_peak_db(settings, flac_path) <= 0
+
+
+def test_mixed_flow_instrument_names_are_loaded(tmp_path: Path) -> None:
+    model_dir = tmp_path / "assets"
+    model_dir.mkdir()
+    model_dir.joinpath("logic_bs_roformer.yaml").write_text("instruments: ['vocals', drums, \"guitar\"]\n")
+    assert load_instrument_names(model_dir) == ["vocals", "drums", "guitar"]
 
 
 def test_token_is_required_when_configured(tmp_path: Path, fake_lbrr: Path) -> None:

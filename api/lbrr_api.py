@@ -460,7 +460,8 @@ def load_instrument_names(model_dir: Path) -> list[str]:
     match = re.search(r"(?m)^\s*instruments:\s*\[([^\]]*)\]", text)
     if not match:
         return list(DEFAULT_INSTRUMENTS)
-    names = re.findall(r"['\"]([^'\"]+)['\"]", match.group(1))
+    names = [part.strip().strip("\'\"") for part in match.group(1).split(",")]
+    names = [name for name in names if name]
     return names or list(DEFAULT_INSTRUMENTS)
 
 
