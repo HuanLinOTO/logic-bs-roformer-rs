@@ -51,6 +51,10 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Align vendored CUDA Rust toolchain
+        shell: bash
+        run: sed -i 's/channel = "stable"/channel = "1.99.1"/' vendor/cuda-rust/cuda-oxide/rust-toolchain.toml
+
       # ---------- Linux toolchain ----------
       - name: Free disk space (drop preinstalled toolchains)
         if: runner.os == 'Linux'

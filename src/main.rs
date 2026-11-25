@@ -381,7 +381,7 @@ fn main() {
 // Toolchain smoke test: vecadd on the local GPU.
 // ---------------------------------------------------------------------------
 
-use cuda_core::LaunchConfig;
+use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, CudaEvent, DeviceBuffer, PinnedHostBuffer};
 use cuda_device::{DisjointSlice, SharedArray, cuda_module, kernel, thread, warp};
 use cuda_device::wmma;
@@ -5158,7 +5158,7 @@ fn stft_parity_test(device: usize, model_dir: &std::path::Path) {
     unsafe {
         km.frame_hann_reflect(
             &stream,
-            cuda_core::LaunchConfig::for_num_elems((2 * frames * stft::N_FFT) as u32),
+            cuda_core::simt::LaunchConfig::for_num_elems((2 * frames * stft::N_FFT) as u32),
             &x_dev,
             &win_dev,
             &mut frames_dev,
@@ -5221,7 +5221,7 @@ fn rmsnorm_parity_test(device: usize, model_dir: &std::path::Path) {
     unsafe {
         km.rmsnorm(
             &stream,
-            cuda_core::LaunchConfig::for_num_elems((rows * 32) as u32),
+            cuda_core::simt::LaunchConfig::for_num_elems((rows * 32) as u32),
             &x_dev,
             &g_dev,
             &mut out_dev,
@@ -5285,7 +5285,7 @@ fn bandsplit_parity_test(device: usize, model_dir: &std::path::Path) {
     unsafe {
         km.bandsplit(
             &stream,
-            cuda_core::LaunchConfig::for_num_elems((rows * n_bands * 32) as u32),
+            cuda_core::simt::LaunchConfig::for_num_elems((rows * n_bands * 32) as u32),
             &x_dev,
             &g_dev,
             &w_dev,
@@ -5425,7 +5425,7 @@ fn qkvrope_parity_test(device: usize, model_dir: &std::path::Path) {
     let mut h_dev = DeviceBuffer::<f32>::zeroed(&stream, rows * dim).unwrap();
     // SAFETY: one warp per row.
     unsafe {
-        km.rmsnorm(&stream, cuda_core::LaunchConfig::for_num_elems((rows * 32) as u32), &x_dev, &g_dev, &mut h_dev, rows as u32, dim as u32)
+        km.rmsnorm(&stream, cuda_core::simt::LaunchConfig::for_num_elems((rows * 32) as u32), &x_dev, &g_dev, &mut h_dev, rows as u32, dim as u32)
     }
     .expect("rmsnorm");
     let w_dev = DeviceBuffer::from_host(&stream, w).unwrap();
@@ -5435,7 +5435,7 @@ fn qkvrope_parity_test(device: usize, model_dir: &std::path::Path) {
     unsafe {
         km.gemm_bias_64(
             &stream,
-            cuda_core::LaunchConfig {
+            cuda_core::simt::LaunchConfig {
                 grid_dim: ((nqkv.div_ceil(16)) as u32, (rows.div_ceil(16)) as u32, 1),
                 block_dim: (16, 16, 1),
                 shared_mem_bytes: 0,
@@ -5455,7 +5455,7 @@ fn qkvrope_parity_test(device: usize, model_dir: &std::path::Path) {
     let mut out_dev = DeviceBuffer::<f32>::zeroed(&stream, rows * nqkv).unwrap();
     // SAFETY: one thread per (row, pair).
     unsafe {
-        km.rope_scale(&stream, cuda_core::LaunchConfig::for_num_elems((rows * 768) as u32), &qkv_dev, &cos_dev, &sin_dev, &mut out_dev, seq as u32, 1, 0)
+        km.rope_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((rows * 768) as u32), &qkv_dev, &cos_dev, &sin_dev, &mut out_dev, seq as u32, 1, 0)
     }
     .expect("rope");
 
@@ -5501,7 +5501,7 @@ fn attn_parity_test(device: usize, model_dir: &std::path::Path) {
     unsafe {
         km.attn_short(
             &stream,
-            cuda_core::LaunchConfig {
+            cuda_core::simt::LaunchConfig {
                 grid_dim: (bh as u32, 1, 1),
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
@@ -5555,7 +5555,7 @@ fn attn_parity_test(device: usize, model_dir: &std::path::Path) {
         unsafe {
             km.gemm_bias_64(
                 &stream,
-                cuda_core::LaunchConfig {
+                cuda_core::simt::LaunchConfig {
                     grid_dim: ((seq2.div_ceil(16)) as u32, (seq2.div_ceil(16)) as u32, 1),
                     block_dim: (16, 16, 1),
                     shared_mem_bytes: 0,
@@ -5577,7 +5577,7 @@ fn attn_parity_test(device: usize, model_dir: &std::path::Path) {
     // pass 1.5: in-place row softmax
     // SAFETY: one thread per row of bh2*seq2 rows.
     unsafe {
-        km.softmax_rows(&stream, cuda_core::LaunchConfig::for_num_elems((bh2 * seq2) as u32), &mut p2, (bh2 * seq2) as u32, seq2 as u32)
+        km.softmax_rows(&stream, cuda_core::simt::LaunchConfig::for_num_elems((bh2 * seq2) as u32), &mut p2, (bh2 * seq2) as u32, seq2 as u32)
     }
     .expect("softmax");
     // pass 2: out = P @ V with B=[K=seq, N=64] layout (v is [seq, 64] row-major)
@@ -5594,7 +5594,7 @@ fn attn_parity_test(device: usize, model_dir: &std::path::Path) {
         unsafe {
             km.gemm_bias_bn(
                 &stream,
-                cuda_core::LaunchConfig {
+                cuda_core::simt::LaunchConfig {
                     grid_dim: ((64 / 16) as u32, (seq2.div_ceil(16)) as u32, 1),
                     block_dim: (16, 16, 1),
                     shared_mem_bytes: 0,
@@ -5622,7 +5622,7 @@ fn attn_parity_test(device: usize, model_dir: &std::path::Path) {
     unsafe {
         km.attn_flash(
             &stream,
-            cuda_core::LaunchConfig {
+            cuda_core::simt::LaunchConfig {
                 grid_dim: ((seq2.div_ceil(8) * bh2) as u32, 1, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
@@ -5640,7 +5640,7 @@ fn attn_parity_test(device: usize, model_dir: &std::path::Path) {
     unsafe {
         km.attn_flash2(
             &stream,
-            cuda_core::LaunchConfig {
+            cuda_core::simt::LaunchConfig {
                 grid_dim: ((seq2.div_ceil(16) * bh2) as u32, 1, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
@@ -5741,7 +5741,7 @@ fn gateff_parity_test(device: usize, model_dir: &std::path::Path) {
         unsafe {
             km.gemm_bias_64(
                 &stream,
-                cuda_core::LaunchConfig {
+                cuda_core::simt::LaunchConfig {
                     grid_dim: ((nn.div_ceil(16)) as u32, (mm.div_ceil(16)) as u32, 1),
                     block_dim: (16, 16, 1),
                     shared_mem_bytes: 0,
@@ -5774,7 +5774,7 @@ fn gateff_parity_test(device: usize, model_dir: &std::path::Path) {
     let mut scaled_dev = DeviceBuffer::<f32>::zeroed(&stream, m * heads_dim).unwrap();
     // SAFETY: elementwise over m*512.
     unsafe {
-        km.gate_scale(&stream, cuda_core::LaunchConfig::for_num_elems((m * heads_dim) as u32), &attn_dev, &gates_dev, &mut scaled_dev)
+        km.gate_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * heads_dim) as u32), &attn_dev, &gates_dev, &mut scaled_dev)
     }
     .expect("gate scale");
 
@@ -5790,7 +5790,7 @@ fn gateff_parity_test(device: usize, model_dir: &std::path::Path) {
     let mut attn_out_dev = DeviceBuffer::<f32>::zeroed(&stream, m * dim).unwrap();
     // SAFETY: elementwise over m*256.
     unsafe {
-        km.add_resid(&stream, cuda_core::LaunchConfig::for_num_elems((m * dim) as u32), &oproj_dev, &res_dev, &mut attn_out_dev)
+        km.add_resid(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * dim) as u32), &oproj_dev, &res_dev, &mut attn_out_dev)
     }
     .expect("add resid");
 
@@ -5815,7 +5815,7 @@ fn gateff_parity_test(device: usize, model_dir: &std::path::Path) {
     let mut ff1_dev = DeviceBuffer::<f32>::zeroed(&stream, m * ff).unwrap();
     // SAFETY: elementwise over m*ff.
     unsafe {
-        km.gelu_erf(&stream, cuda_core::LaunchConfig::for_num_elems((m * ff) as u32), &pre_dev, &mut ff1_dev)
+        km.gelu_erf(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * ff) as u32), &pre_dev, &mut ff1_dev)
     }
     .expect("gelu");
     let ff1 = ff1_dev.to_host_vec(&stream).unwrap();
@@ -5839,7 +5839,7 @@ fn gateff_parity_test(device: usize, model_dir: &std::path::Path) {
     let mut ff_out_dev = DeviceBuffer::<f32>::zeroed(&stream, m * dim).unwrap();
     // SAFETY: elementwise over m*256.
     unsafe {
-        km.add_resid(&stream, cuda_core::LaunchConfig::for_num_elems((m * dim) as u32), &ffo_dev, &attn_out_dev, &mut ff_out_dev)
+        km.add_resid(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * dim) as u32), &ffo_dev, &attn_out_dev, &mut ff_out_dev)
     }
     .expect("add resid 2");
     let ff_out = ff_out_dev.to_host_vec(&stream).unwrap();
@@ -6144,7 +6144,7 @@ unsafe fn transformer_step(
     let idx = layer_idx * 2 + axis;
     lt_ready(_ctx, stream, scratch, m)?;
     cudnn_ready(_ctx, stream, scratch, bands, t_frames)?;
-    let launch1 = |n: u32| cuda_core::LaunchConfig::for_num_elems(n);
+    let launch1 = |n: u32| cuda_core::simt::LaunchConfig::for_num_elems(n);
     // 1. pre-attention RMSNorm
     // SAFETY: one warp per row over m rows.
     unsafe {
@@ -6205,11 +6205,11 @@ unsafe fn transformer_step(
             km.rope_k16(stream, launch1((m * 256) as u32), &scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], &mut scratch.k16r, bands as u32, axis as u32)
                 .map_err(|e| e.to_string())?;
             // SAFETY: one 128-thread block per (BH group, 64-row query tile).
-            km.attn_flash_async(stream, cuda_core::LaunchConfig { grid_dim: (1, n_len.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &scratch.qkv16, &scratch.k16r, &scratch.cos[axis], &scratch.sin[axis], &scratch.gates, bands as u32, axis as u32, seq as u32, &mut scratch.scaled16, &mut scratch.attn_max, &mut scratch.attn_scale)
+            km.attn_flash_async(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, n_len.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &scratch.qkv16, &scratch.k16r, &scratch.cos[axis], &scratch.sin[axis], &scratch.gates, bands as u32, axis as u32, seq as u32, &mut scratch.scaled16, &mut scratch.attn_max, &mut scratch.attn_scale)
                 .map_err(|e| e.to_string())?;
         } else {
             // SAFETY: one 128-thread block per (BH group, 64-row query tile).
-            km.attn_flash_tc(stream, cuda_core::LaunchConfig { grid_dim: (1, n_len.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], &scratch.gates, bands as u32, axis as u32, seq as u32, &mut scratch.scaled16, &mut scratch.attn_max, &mut scratch.attn_scale)
+            km.attn_flash_tc(stream, cuda_core::simt::LaunchConfig { grid_dim: (1, n_len.div_ceil(64) as u32, bh as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &scratch.qkv16, &scratch.cos[axis], &scratch.sin[axis], &scratch.gates, bands as u32, axis as u32, seq as u32, &mut scratch.scaled16, &mut scratch.attn_max, &mut scratch.attn_scale)
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -6267,32 +6267,32 @@ unsafe fn transformer_step(
     Ok(())
 }
 
-fn tile_cfg_tf32_64(m: usize, n: usize) -> cuda_core::LaunchConfig {
-    cuda_core::LaunchConfig {
+fn tile_cfg_tf32_64(m: usize, n: usize) -> cuda_core::simt::LaunchConfig {
+    cuda_core::simt::LaunchConfig {
         grid_dim: ((n.div_ceil(64)) as u32, (m.div_ceil(128)) as u32, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     }
 }
 
-fn tile_cfg_tf32(m: usize, n: usize) -> cuda_core::LaunchConfig {
-    cuda_core::LaunchConfig {
+fn tile_cfg_tf32(m: usize, n: usize) -> cuda_core::simt::LaunchConfig {
+    cuda_core::simt::LaunchConfig {
         grid_dim: ((n.div_ceil(8)) as u32, (m.div_ceil(64)) as u32, 1),
         block_dim: (128, 1, 1),
         shared_mem_bytes: 0,
     }
 }
 
-fn tile_cfg_64(m: usize, n: usize) -> cuda_core::LaunchConfig {
-    cuda_core::LaunchConfig {
+fn tile_cfg_64(m: usize, n: usize) -> cuda_core::simt::LaunchConfig {
+    cuda_core::simt::LaunchConfig {
         grid_dim: ((n.div_ceil(64)) as u32, (m.div_ceil(64)) as u32, 1),
         block_dim: (16, 16, 1),
         shared_mem_bytes: 0,
     }
 }
 
-fn tile_cfg(m: usize, n: usize) -> cuda_core::LaunchConfig {
-    cuda_core::LaunchConfig {
+fn tile_cfg(m: usize, n: usize) -> cuda_core::simt::LaunchConfig {
+    cuda_core::simt::LaunchConfig {
         grid_dim: ((n.div_ceil(16)) as u32, (m.div_ceil(16)) as u32, 1),
         block_dim: (16, 16, 1),
         shared_mem_bytes: 0,
@@ -6366,7 +6366,7 @@ fn reorder_test(device: usize, model_dir: &std::path::Path) {
     let mut att = DeviceBuffer::<f32>::zeroed(&stream, 3 * bh * t_frames * 64).unwrap();
     // SAFETY: elementwise reorder over 3*BH*T*64.
     unsafe {
-        km.qkv_to_attn(&stream, cuda_core::LaunchConfig::for_num_elems((3 * bh * t_frames * 64) as u32), &in_dev, &mut att, t_frames as u32, bands as u32, 0)
+        km.qkv_to_attn(&stream, cuda_core::simt::LaunchConfig::for_num_elems((3 * bh * t_frames * 64) as u32), &in_dev, &mut att, t_frames as u32, bands as u32, 0)
     }.expect("reorder");
     let got = att.to_host_vec(&stream).unwrap();
     // q segment = first bh*T*64
@@ -6386,7 +6386,7 @@ fn reorder_test(device: usize, model_dir: &std::path::Path) {
     let vseg = slice_view(&stream, &att, 2 * bh * t_frames * 64, bh * t_frames * 64).unwrap();
     // SAFETY: elementwise over m*512.
     unsafe {
-        km.attn_v_to_flat(&stream, cuda_core::LaunchConfig::for_num_elems((m * 512) as u32), &*vseg, &zero_gates, &mut vflat, t_frames as u32, bands as u32, 0)
+        km.attn_v_to_flat(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * 512) as u32), &*vseg, &zero_gates, &mut vflat, t_frames as u32, bands as u32, 0)
     }.expect("unreorder");
     let vf = vflat.to_host_vec(&stream).unwrap();
     // v_flat reference: identity (v part of qkv)
@@ -6446,7 +6446,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
     let mut frames_dev = DeviceBuffer::<f32>::zeroed(&stream, 2 * t_frames * stft::N_FFT).unwrap();
     // SAFETY: one thread per frame element.
     unsafe {
-        km.frame_hann_reflect(&stream, cuda_core::LaunchConfig::for_num_elems((2 * t_frames * stft::N_FFT) as u32),
+        km.frame_hann_reflect(&stream, cuda_core::simt::LaunchConfig::for_num_elems((2 * t_frames * stft::N_FFT) as u32),
             &x_dev, &win_dev, &mut frames_dev, stft::N_FFT as u32, stft::HOP as u32, len as u32, t_frames as u32)
     }.expect("frame");
     let mut spec_dev = DeviceBuffer::<f32>::zeroed(&stream, 2 * t_frames * stft::FREQ_BINS * 2).unwrap();
@@ -6464,7 +6464,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
     let mut xin_dev = DeviceBuffer::<f32>::zeroed(&stream, t_frames * 4100).unwrap();
     // SAFETY: elementwise gather over t*4100.
     unsafe {
-        km.spec_reorder(&stream, cuda_core::LaunchConfig::for_num_elems((t_frames * 4100) as u32),
+        km.spec_reorder(&stream, cuda_core::simt::LaunchConfig::for_num_elems((t_frames * 4100) as u32),
             &spec_dev, &f0_dev, &offs_dev, &mut xin_dev, t_frames as u32)
     }.expect("spec reorder");
 
@@ -6474,12 +6474,12 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
     let mut x = DeviceBuffer::<f32>::zeroed(&stream, m * 256).unwrap();
     // SAFETY: one warp per (band, time) row.
     unsafe {
-        km.bandsplit_norm(&stream, cuda_core::LaunchConfig::for_num_elems((m * 32) as u32),
+        km.bandsplit_norm(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * 32) as u32),
             &xin_dev, &gw.band_gamma, &offs_dev, &dims_dev, &mut bsnorm, t_frames as u32, bands as u32, max_dim as u32)
     }.expect("bandsplit norm");
     // SAFETY: 64x128 FP16 tiles for every band.
     unsafe {
-        km.bandsplit_gemm_f16(&stream, cuda_core::LaunchConfig { grid_dim: (4, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+        km.bandsplit_gemm_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (4, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
             &offs_dev, &dims_dev, &bsnorm, &gw.band_w, &gw.band_b, &mut x, t_frames as u32, bands as u32, max_dim as u32)
     }.expect("bandsplit gemm");
 
@@ -6539,7 +6539,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
     if false {
         let sub = npz::Npz::open(&root.join("parity/e2e_sub.npz")).expect("e2e_sub");
         let m_ = m;
-        let launch1 = |n: usize| cuda_core::LaunchConfig::for_num_elems(n as u32);
+        let launch1 = |n: usize| cuda_core::simt::LaunchConfig::for_num_elems(n as u32);
         // rmsnorm
         // SAFETY: one warp per row.
         unsafe { km.rmsnorm(&stream, launch1(m_ * 32), &x, &gw.norm_gamma[0], &mut parity.h, m_ as u32, 256) }.unwrap();
@@ -6553,12 +6553,12 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
         unsafe { km.gemm_bias_64(&stream, tile_cfg_64(m_, 1536), m_ as u32, 1536, 256, &parity.h, &parity_weights.qkv_w[0], &gw.shared_qkv_bias, &mut parity.qkv) }.unwrap();
         // rope (time axis)
         // SAFETY: one thread per (row, pair).
-        unsafe { km.rope_scale(&stream, cuda_core::LaunchConfig::for_num_elems((m_ * 768) as u32), &parity.qkv, &scr.cos[0], &scr.sin[0], &mut parity.qkv_rope, t_frames as u32, bands as u32, 0) }.unwrap();
+        unsafe { km.rope_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 768) as u32), &parity.qkv, &scr.cos[0], &scr.sin[0], &mut parity.qkv_rope, t_frames as u32, bands as u32, 0) }.unwrap();
         // gates (uses h)
         // SAFETY: tile grid over m x 8.
         unsafe { km.gemm_bias_64(&stream, tile_cfg_64(m_, 8), m_ as u32, 8, 256, &parity.h, &gw.gates_w[0], &gw.gates_b[0], &mut scr.gates) }.unwrap();
         // SAFETY: elementwise reorder.
-        unsafe { km.qkv_to_attn(&stream, cuda_core::LaunchConfig::for_num_elems((3 * 62 * 8 * t_frames * 64) as u32), &parity.qkv_rope, &mut parity.qkv_attn, t_frames as u32, bands as u32, 0) }.unwrap();
+        unsafe { km.qkv_to_attn(&stream, cuda_core::simt::LaunchConfig::for_num_elems((3 * 62 * 8 * t_frames * 64) as u32), &parity.qkv_rope, &mut parity.qkv_attn, t_frames as u32, bands as u32, 0) }.unwrap();
         {
             let (bh, n_len) = (62usize * 8, t_frames);
             for g in 0..bh {
@@ -6569,7 +6569,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
                 unsafe { km.gemm_bias_64(&stream, tile_cfg_64(n_len, n_len), n_len as u32, n_len as u32, 64, &*qseg, &*kseg, &parity.zero_bias_t, &mut *pseg) }.unwrap();
             }
             // SAFETY: one thread per row.
-            unsafe { km.softmax_rows(&stream, cuda_core::LaunchConfig::for_num_elems((bh * n_len) as u32), &mut parity.p_big, (bh * n_len) as u32, n_len as u32) }.unwrap();
+            unsafe { km.softmax_rows(&stream, cuda_core::simt::LaunchConfig::for_num_elems((bh * n_len) as u32), &mut parity.p_big, (bh * n_len) as u32, n_len as u32) }.unwrap();
             {
                 let ps = npz::Npz::open(&root.join("parity/e2e_pspot.npz")).expect("pspot");
                 let p0 = ps.f32("p0").unwrap();
@@ -6619,7 +6619,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
                 // v provenance: qkv_attn part2 first 4, and the raw qkv v segment for m=0
             }
             // SAFETY: elementwise un-reorder (time axis).
-            unsafe { km.attn_v_to_flat(&stream, cuda_core::LaunchConfig::for_num_elems((m_ * 512) as u32), &parity.attn_out_long, &scr.gates, &mut parity.v_flat, t_frames as u32, bands as u32, 0) }.unwrap();
+            unsafe { km.attn_v_to_flat(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 512) as u32), &parity.attn_out_long, &scr.gates, &mut parity.v_flat, t_frames as u32, bands as u32, 0) }.unwrap();
         }
         {
             let vfnpz = npz::Npz::open(&root.join("parity/e2e_vflat.npz")).expect("e2e_vflat");
@@ -6634,7 +6634,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
             println!("stage L0.v_flat: rel={:.3e}", me / dn);
         }
         // SAFETY: elementwise over m*512.
-        unsafe { km.gate_scale(&stream, cuda_core::LaunchConfig::for_num_elems((m_ * 512) as u32), &parity.v_flat, &scr.gates, &mut parity.scaled) }.unwrap();
+        unsafe { km.gate_scale(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 512) as u32), &parity.v_flat, &scr.gates, &mut parity.scaled) }.unwrap();
         {
             let sc = npz::Npz::open(&root.join("parity/e2e_scaled.npz")).expect("e2e_scaled");
             {
@@ -6655,7 +6655,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
         // SAFETY: tile grid over m x 256.
         unsafe { km.gemm_bias_64(&stream, tile_cfg_64(m_, 256), m_ as u32, 256, 512, &parity.scaled, &parity_weights.out_w[0], &gw.shared_out_bias, &mut parity.oproj) }.unwrap();
         // SAFETY: elementwise over m*256.
-        unsafe { km.add_resid(&stream, cuda_core::LaunchConfig::for_num_elems((m_ * 256) as u32), &parity.oproj, &x, &mut scr.attn_out) }.unwrap();
+        unsafe { km.add_resid(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m_ * 256) as u32), &parity.oproj, &x, &mut scr.attn_out) }.unwrap();
         {
             let av = scr.attn_out.to_host_vec(&stream).unwrap();
             let r = sub.f32("attn_out").unwrap();
@@ -6670,7 +6670,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
         let mut h0 = DeviceBuffer::<f32>::zeroed(&stream, m * 256).unwrap();
         let mut g0b = DeviceBuffer::<f32>::zeroed(&stream, m * 8).unwrap();
         // SAFETY: one warp per row.
-        unsafe { km.rmsnorm_gates(&stream, cuda_core::LaunchConfig::for_num_elems((m * 32) as u32), &x0, &gw.norm_gamma[0], &gw.gates_w[0], &gw.gates_b[0], &mut h0, &mut g0b, m as u32, 256) }.unwrap();
+        unsafe { km.rmsnorm_gates(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * 32) as u32), &x0, &gw.norm_gamma[0], &gw.gates_w[0], &gw.gates_b[0], &mut h0, &mut g0b, m as u32, 256) }.unwrap();
         let mut qkv0 = DeviceBuffer::<f32>::zeroed(&stream, m * 1536).unwrap();
         // SAFETY: tile grid over m x 1536.
         unsafe { km.gemm_f16_128x64(&stream, tile_cfg_tf32_64(m, 1536), m as u32, 1536, 256, &h0, &parity_weights.qkv_w[0], &gw.shared_qkv_bias, &mut qkv0) }.unwrap();
@@ -6681,11 +6681,11 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
         let bh_t = bands * 8;
         // old chain
         // SAFETY: 64x128 FP16 tiles over [BH, N, N].
-        unsafe { km.attn_qk_rope_f16(&stream, cuda_core::LaunchConfig { grid_dim: (t_frames.div_ceil(64) as u32, t_frames.div_ceil(64) as u32, bh_t as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, t_frames as u32, 64, &qkv0, &scr.cos[0], &scr.sin[0], &parity.zero_bias_t, bands as u32, 0, &mut parity.p_big) }.unwrap();
+        unsafe { km.attn_qk_rope_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (t_frames.div_ceil(64) as u32, t_frames.div_ceil(64) as u32, bh_t as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, t_frames as u32, 64, &qkv0, &scr.cos[0], &scr.sin[0], &parity.zero_bias_t, bands as u32, 0, &mut parity.p_big) }.unwrap();
         // SAFETY: one warp per score row.
-        unsafe { km.softmax_stats(&stream, cuda_core::LaunchConfig::for_num_elems((bh_t * t_frames * 32) as u32), &parity.p_big, (bh_t * t_frames) as u32, t_frames as u32, &mut a_max, &mut a_scale) }.unwrap();
+        unsafe { km.softmax_stats(&stream, cuda_core::simt::LaunchConfig::for_num_elems((bh_t * t_frames * 32) as u32), &parity.p_big, (bh_t * t_frames) as u32, t_frames as u32, &mut a_max, &mut a_scale) }.unwrap();
         // SAFETY: one 64-column FP16 tile per row block and BH group.
-        unsafe { km.attn_pv_raw_f16(&stream, cuda_core::LaunchConfig { grid_dim: (1, t_frames.div_ceil(128) as u32, bh_t as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, 64, t_frames as u32, &parity.p_big, &qkv0, &parity.zero_bias_64, &g0b, bands as u32, 0, &a_max, &a_scale, &mut s_old) }.unwrap();
+        unsafe { km.attn_pv_raw_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (1, t_frames.div_ceil(128) as u32, bh_t as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, 64, t_frames as u32, &parity.p_big, &qkv0, &parity.zero_bias_64, &g0b, bands as u32, 0, &a_max, &a_scale, &mut s_old) }.unwrap();
         // new flash
         // SAFETY: one 128-thread block per (BH group, 64-row query tile).
         let mut f_max = DeviceBuffer::<f32>::zeroed(&stream, bh_t * t_frames).unwrap();
@@ -6696,7 +6696,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
         };
         let qkv0_16 = DeviceBuffer::from_host(&stream, &qkv0h16).unwrap();
         // SAFETY: one 128-thread block per (BH group, 64-row query tile).
-        unsafe { km.attn_flash_tc(&stream, cuda_core::LaunchConfig { grid_dim: (1, t_frames.div_ceil(64) as u32, bh_t as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &qkv0_16, &scr.cos[0], &scr.sin[0], &g0b, bands as u32, 0, t_frames as u32, &mut s_new, &mut f_max, &mut f_l) }.unwrap();
+        unsafe { km.attn_flash_tc(&stream, cuda_core::simt::LaunchConfig { grid_dim: (1, t_frames.div_ceil(64) as u32, bh_t as u32), block_dim: (128, 1, 1), shared_mem_bytes: 0 }, &qkv0_16, &scr.cos[0], &scr.sin[0], &g0b, bands as u32, 0, t_frames as u32, &mut s_new, &mut f_max, &mut f_l) }.unwrap();
         let qkv0h = qkv0.to_host_vec(&stream).unwrap();
         {
             let mv = a_max.to_host_vec(&stream).unwrap();
@@ -6816,7 +6816,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
     let mut x_final = DeviceBuffer::<f32>::zeroed(&stream, m * 256).unwrap();
     // SAFETY: one warp per row.
     unsafe {
-        km.rmsnorm(&stream, cuda_core::LaunchConfig::for_num_elems((m * 32) as u32), &x, &gw.final_norm, &mut x_final, m as u32, 256)
+        km.rmsnorm(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * 32) as u32), &x, &gw.final_norm, &mut x_final, m as u32, 256)
     }.expect("final norm");
 
     // Trunk parity is checked from the final six-stem SNR below; avoid a
@@ -6827,7 +6827,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
     let mut xb16 = DeviceBuffer::<u32>::zeroed(&stream, m * 128).unwrap();
     // SAFETY: elementwise transpose, packed f16x2.
     unsafe {
-        km.transpose_band_major_h16(&stream, cuda_core::LaunchConfig::for_num_elems((m * 128) as u32), &x_final, &mut xb16, t_frames as u32, bands as u32)
+        km.transpose_band_major_h16(&stream, cuda_core::simt::LaunchConfig::for_num_elems((m * 128) as u32), &x_final, &mut xb16, t_frames as u32, bands as u32)
     }.expect("transpose");
 
     // ---- MaskEstimator: grouped per-stem launches ----
@@ -6843,7 +6843,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
     for s in 0..6usize {
         // SAFETY: 16 column tiles x ceil(T/128) row tiles x 62 bands.
         unsafe {
-            km.mask_gemm1_f16(&stream, cuda_core::LaunchConfig { grid_dim: (16, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, (s * bands) as u32, &xb16, &gw.mask_w1_h[s], &gw.mask_b1[s], &mut hidden_t)
+            km.mask_gemm1_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (16, t_frames.div_ceil(128) as u32, bands as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, (s * bands) as u32, &xb16, &gw.mask_w1_h[s], &gw.mask_b1[s], &mut hidden_t)
         }.expect("grouped mask gemm1");
     }
     // Tanh is fused into the grouped mask GEMM1 epilogue.
@@ -6852,7 +6852,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
     for s in 0..6usize {
         // SAFETY: worst-case 17 column tiles; invalid per-band tiles return.
         unsafe {
-            km.mask_gemm2_f16(&stream, cuda_core::LaunchConfig { grid_dim: (1, t_frames.div_ceil(128) as u32, mask2_tiles_dev.len() as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, (s * bands) as u32, &offs_dev, &mask2_tiles_dev, &hidden_t, &gw.mask_w2_h[s], &gw.mask_b2[s], &mut pre2_all)
+            km.mask_gemm2_f16(&stream, cuda_core::simt::LaunchConfig { grid_dim: (1, t_frames.div_ceil(128) as u32, mask2_tiles_dev.len() as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, t_frames as u32, (s * bands) as u32, &offs_dev, &mask2_tiles_dev, &hidden_t, &gw.mask_w2_h[s], &gw.mask_b2[s], &mut pre2_all)
         }.expect("grouped mask gemm2");
     }
     // SAFETY: one thread per padded GLU output element.
@@ -6865,7 +6865,7 @@ fn e2e_test(device: usize, model_dir: &std::path::Path, inference: &InferenceOpt
     // mask apply -> C2R input frames
     let mut c2r_in = DeviceBuffer::<f32>::zeroed(&stream, 12 * t_frames * stft::FREQ_BINS * 2).unwrap();
     // SAFETY: elementwise over 12*T*1025*2.
-    unsafe { km.mask_apply(&stream, cuda_core::LaunchConfig::for_num_elems((12 * t_frames * 1025 * 2) as u32), &spec_dev, &glu_all, &f0_dev, &mut c2r_in, t_frames as u32, bands as u32) }.expect("mask apply");
+    unsafe { km.mask_apply(&stream, cuda_core::simt::LaunchConfig::for_num_elems((12 * t_frames * 1025 * 2) as u32), &spec_dev, &glu_all, &f0_dev, &mut c2r_in, t_frames as u32, bands as u32) }.expect("mask apply");
     // Host-side mask bisection is disabled for clean timing; E2E SNR below
     // remains the correctness gate.
     if false {
@@ -7309,7 +7309,7 @@ fn bench_warm(device: usize, model_dir: &std::path::Path, iters: usize, dual: bo
     let prepare_ms=prepare.elapsed().as_secs_f64()*1000.0;
     for _ in 0..options.warmup { forward(&mut bufs,&mut waveform); }
     stream.synchronize().expect("warmup sync");
-    let events:Vec<_>=(0..iters).map(|_|(ctx.new_event().unwrap(),ctx.new_event().unwrap())).collect();
+    let events:Vec<_>=(0..iters).map(|_|(ctx.new_event(Some(0)).unwrap(),ctx.new_event(Some(0)).unwrap())).collect();
     let begin=Instant::now();
     for (a,b) in &events { a.record(&stream).unwrap();forward(&mut bufs,&mut waveform);b.record(&stream).unwrap(); }
     stream.synchronize().expect("timed sync");
@@ -7721,7 +7721,7 @@ fn separate(device: usize, model_dir: &std::path::Path, input: &std::path::Path,
     let mut pin: Vec<PinnedHostBuffer<f32>> = (0..2)
         .map(|_| PinnedHostBuffer::zeroed(&ctx, C * 2).unwrap())
         .collect();
-    let evs: Vec<CudaEvent> = (0..2).map(|_| ctx.new_event().unwrap()).collect();
+    let evs: Vec<CudaEvent> = (0..2).map(|_| ctx.new_event(None).unwrap()).collect();
     for e in &evs {
         e.record(&stream).unwrap(); // both slots start idle
     }
@@ -8037,7 +8037,7 @@ fn ff1_kernel_regression(km:&gpu_kernels::LoadedModule,ctx:&Arc<CudaContext>,str
             for _ in 0..3{launch();}stream.synchronize().unwrap();
             let mut times=Vec::new();
             for _ in 0..3 {
-                let a=ctx.new_event().unwrap();let b=ctx.new_event().unwrap();a.record(stream).unwrap();
+                let a=ctx.new_event(Some(0)).unwrap();let b=ctx.new_event(Some(0)).unwrap();a.record(stream).unwrap();
                 for _ in 0..10{launch();}b.record(stream).unwrap();b.synchronize().unwrap();times.push(a.elapsed_ms(&b).unwrap()as f64/10.0);
             }
             drop(launch);
