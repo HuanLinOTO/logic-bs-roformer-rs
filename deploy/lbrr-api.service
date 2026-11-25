@@ -14,6 +14,8 @@ Environment=LBRR_API_HOST=0.0.0.0
 Environment=LBRR_API_PORT=10722
 Environment=LBRR_API_TEMP_DIR=/var/tmp/lbrr-api
 Environment=LBRR_API_CONCURRENCY=1
+Environment=LBRR_API_SSL_CERTFILE=/etc/lbrr-api/tls.crt
+Environment=LBRR_API_SSL_KEYFILE=/etc/lbrr-api/tls.key
 EnvironmentFile=-/etc/lbrr-api.env
 ExecStart=/opt/lbrr-api/venv/bin/python -m api.lbrr_api
 Restart=on-failure

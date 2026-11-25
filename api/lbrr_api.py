@@ -28,7 +28,7 @@ from typing import Sequence
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 
 API_VERSION = "0.1.0"
@@ -52,6 +52,10 @@ class Settings:
     port: int
     api_token: str | None
     log_level: str
+    ssl_certfile: str | None = None
+    ssl_keyfile: str | None = None
+    allow_insecure_http: bool = False
+    allow_unauthenticated: bool = False
 
     @property
     def assets_ready(self) -> bool:
@@ -69,6 +73,10 @@ class JobResult:
 
 
 class JobError(RuntimeError):
+    pass
+
+
+class UploadTooLarge(Exception):
     pass
 
 
@@ -98,6 +106,17 @@ def _float_env(name: str, default: float, minimum: float) -> float:
     return value
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    if raw.lower() in {"1", "true", "yes", "on"}:
+        return True
+    if raw.lower() in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 def load_settings() -> Settings:
     default_encode_workers = min(4, os.cpu_count() or 1)
     temp_root_raw = os.environ.get("LBRR_API_TEMP_DIR", "")
@@ -116,7 +135,33 @@ def load_settings() -> Settings:
         port=_int_env("LBRR_API_PORT", 10722, 1),
         api_token=os.environ.get("LBRR_API_TOKEN") or None,
         log_level=os.environ.get("LBRR_API_LOG_LEVEL", "info"),
+        ssl_certfile=os.environ.get("LBRR_API_SSL_CERTFILE") or None,
+        ssl_keyfile=os.environ.get("LBRR_API_SSL_KEYFILE") or None,
+        allow_insecure_http=_bool_env("LBRR_API_ALLOW_INSECURE_HTTP"),
+        allow_unauthenticated=_bool_env("LBRR_API_ALLOW_UNAUTHENTICATED"),
     )
+
+
+def is_loopback_host(host: str) -> bool:
+    normalized = host.strip().lower().strip("[]")
+    return normalized in {"localhost", "::1"} or normalized.startswith("127.")
+
+
+def validate_network_security(settings: Settings) -> None:
+    if bool(settings.ssl_certfile) != bool(settings.ssl_keyfile):
+        raise RuntimeError("LBRR_API_SSL_CERTFILE and LBRR_API_SSL_KEYFILE must be set together")
+    if is_loopback_host(settings.host):
+        return
+    if settings.api_token is None and not settings.allow_unauthenticated:
+        raise RuntimeError(
+            "refusing to bind publicly without authentication; set LBRR_API_TOKEN "
+            "or explicitly set LBRR_API_ALLOW_UNAUTHENTICATED=true"
+        )
+    if settings.api_token is not None and not settings.ssl_certfile and not settings.allow_insecure_http:
+        raise RuntimeError(
+            "refusing to expose bearer credentials over plaintext HTTP; configure "
+            "LBRR_API_SSL_CERTFILE/LBRR_API_SSL_KEYFILE or explicitly set LBRR_API_ALLOW_INSECURE_HTTP=true"
+        )
 
 
 def _tail(text: str, max_chars: int = 1200) -> str:
@@ -469,6 +514,8 @@ def _cleanup_stale_jobs(settings: Settings) -> None:
 
 
 def create_app(settings: Settings) -> FastAPI:
+    validate_network_security(settings)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         _cleanup_stale_jobs(settings)
@@ -497,6 +544,43 @@ def create_app(settings: Settings) -> FastAPI:
             detail="valid bearer token or X-API-Key required",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    @app.middleware("http")
+    async def guard_separate_upload(request: Request, call_next):
+        if request.method != "POST" or request.url.path != "/separate":
+            return await call_next(request)
+        try:
+            require_token(request)
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers or {})
+
+        body_limit = settings.max_upload_bytes + 1024 * 1024
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared = int(content_length)
+            except ValueError:
+                return JSONResponse({"detail": "invalid content-length"}, status_code=400)
+            if declared > body_limit:
+                return JSONResponse({"detail": f"upload exceeds the {settings.max_upload_bytes} byte limit"}, status_code=413)
+
+        received = 0
+        inner_receive = request.receive
+
+        async def limited_receive():
+            nonlocal received
+            message = await inner_receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > body_limit:
+                    raise UploadTooLarge
+            return message
+
+        request._receive = limited_receive
+        try:
+            return await call_next(request)
+        except UploadTooLarge:
+            return JSONResponse({"detail": f"upload exceeds the {settings.max_upload_bytes} byte limit"}, status_code=413)
 
     @app.get("/")
     async def root() -> dict[str, object]:
@@ -622,6 +706,8 @@ def main() -> None:
         port=settings.port,
         workers=1,
         log_level=settings.log_level,
+        ssl_certfile=settings.ssl_certfile,
+        ssl_keyfile=settings.ssl_keyfile,
     )
 
 
