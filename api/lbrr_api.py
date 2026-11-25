@@ -330,12 +330,10 @@ def measure_peak_db(settings: Settings, audio_path: Path) -> float:
         "-",
     ]
     proc = _run_command(command, settings.job_timeout_seconds, f"peak analysis {audio_path.name}")
-    match = re.search(r"Peak level dB:\s*(-inf|-?\d+(?:\.\d+)?)", proc.stderr + proc.stdout)
-    if not match:
+    matches = re.findall(r"Peak level dB:\s*(-inf|-?\d+(?:\.\d+)?)", proc.stderr + proc.stdout)
+    if not matches:
         raise JobError(f"could not measure peak for {audio_path.name}")
-    if match.group(1) == "-inf":
-        return -math.inf
-    return float(match.group(1))
+    return max(-math.inf if value == "-inf" else float(value) for value in matches)
 
 
 def output_gain_db(settings: Settings, wavs: Sequence[Path], workers: int) -> float:

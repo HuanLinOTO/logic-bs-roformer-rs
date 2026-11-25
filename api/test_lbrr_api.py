@@ -100,8 +100,8 @@ def make_settings(tmp_path: Path, fake_lbrr: Path, **overrides) -> Settings:
     return Settings(**values)
 
 
-def write_f32_wav(path: Path, amplitude: float = 1.5, frames: int = 4410) -> None:
-    samples = struct.pack(f"<{frames * 2}f", *([amplitude, amplitude] * frames))
+def write_f32_wav(path: Path, left: float = 1.5, right: float = 1.5, frames: int = 4410) -> None:
+    samples = struct.pack(f"<{frames * 2}f", *([left, right] * frames))
     data_len = len(samples)
     with path.open("wb") as output:
         output.write(b"RIFF")
@@ -187,7 +187,7 @@ def test_overfull_float_output_is_scaled_before_flac(tmp_path: Path, fake_lbrr: 
     settings = make_settings(tmp_path, fake_lbrr)
     wav_path = tmp_path / "hot.wav"
     flac_path = tmp_path / "hot.flac"
-    write_f32_wav(wav_path, amplitude=1.5)
+    write_f32_wav(wav_path, left=0.5, right=1.5)
 
     gain_db = output_gain_db(settings, [wav_path], workers=1)
     assert gain_db < 0
