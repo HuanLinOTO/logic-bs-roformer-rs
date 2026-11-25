@@ -119,7 +119,7 @@ jobs:
       - name: Install libffi (cuda-bindings link)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: vendor/cuda-rust/.github/scripts/install-libffi.ps1
+        run: scripts/install-libffi.ps1
         env:
           VCPKG_ROOT: ${{ github.workspace }}\vcpkg
 
