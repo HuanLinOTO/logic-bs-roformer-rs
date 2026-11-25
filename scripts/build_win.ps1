@@ -1,4 +1,4 @@
-﻿# Windows 原生构建 lbrr.exe + cudnn_sdpa_wrap.dll（一条龙）
+# Windows 原生构建 lbrr.exe + cudnn_sdpa_wrap.dll（一条龙）
 # 前置：MSVC Build Tools（cl 在 PATH 或 VCINSTALLDIR 可寻）、CUDA Toolkit
 # 12.x/13.x、LLVM/libclang、rustup stable。运行库（cuDNN DLL、cfe 头文件）
 # 若缺失会给出布置提示。
@@ -72,6 +72,12 @@ if (-not $SkipShim) {
     } else {
         Write-Warning "未找到 vcvars64.bat，跳过 shim 编译（SDPA 将回退手写 kernel）"
     }
+}
+
+# --- cuda-oxide 后端工具链与仓库 pin 对齐 ---
+$oxideToolchain = Join-Path $repo "vendor\cuda-rust\cuda-oxide\rust-toolchain.toml"
+if (Test-Path $oxideToolchain) {
+    (Get-Content $oxideToolchain -Raw) -replace 'channel = "stable"', 'channel = "1.99.1"' | Set-Content $oxideToolchain -NoNewline
 }
 
 # --- lbrr.exe ---
