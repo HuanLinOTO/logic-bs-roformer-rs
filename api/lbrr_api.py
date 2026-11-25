@@ -145,8 +145,8 @@ def _run_command(command: Sequence[str], timeout: float, label: str) -> subproce
     return proc
 
 
-def probe_audio_duration(ffprobe: str, audio_path: Path, timeout: float = 30.0) -> float:
-    """Return the container duration in seconds, or raise ValueError."""
+def probe_audio_duration(ffprobe: str, audio_path: Path, timeout: float = 30.0) -> float | None:
+    """Return declared duration when present, or None for playable streams without it."""
     command = [
         ffprobe,
         "-v",
@@ -193,7 +193,7 @@ def probe_audio_duration(ffprobe: str, audio_path: Path, timeout: float = 30.0) 
 
     valid = [value for value in candidates if math.isfinite(value) and value > 0]
     if not valid:
-        raise ValueError("audio duration is unavailable")
+        return None
     return max(valid)
 
 
@@ -471,7 +471,7 @@ def create_app(settings: Settings) -> FastAPI:
                 metadata_duration = await asyncio.to_thread(probe_audio_duration, settings.ffprobe, input_path)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
-            if metadata_duration >= settings.max_duration_seconds:
+            if metadata_duration is not None and metadata_duration >= settings.max_duration_seconds:
                 raise HTTPException(
                     status_code=422,
                     detail=(
