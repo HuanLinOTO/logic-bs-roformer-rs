@@ -384,8 +384,17 @@ def convert_wav_to_flac(settings: Settings, wav_path: Path, flac_path: Path, gai
         raise JobError(f"flac encode produced no output for {wav_path.name}")
 
 
+def lbrr_cli_flags(settings: Settings) -> set[str]:
+    try:
+        proc = subprocess.run([settings.lbrr_bin], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return set()
+    return set(re.findall(r"--[a-z0-9-]+", proc.stdout + proc.stderr))
+
+
 def run_separation_job(settings: Settings, input_path: Path, workdir: Path, mode: str, stems: str | None) -> JobResult:
     lbrr_outdir = workdir / "separated"
+    flags = lbrr_cli_flags(settings)
     command = [
         settings.lbrr_bin,
         "--separate",
@@ -395,13 +404,17 @@ def run_separation_job(settings: Settings, input_path: Path, workdir: Path, mode
         str(input_path),
         "--outdir",
         str(lbrr_outdir),
-        "--mode",
-        mode,
-        "--no-tui",
-        "--no-pause",
     ]
-    if mode == "stems" and stems:
-        command.extend(["--stems", stems])
+    default_selection = mode == "stems" and (stems is None or stems.strip().lower() in {"", "all"})
+    if "--mode" in flags:
+        command.extend(["--mode", mode])
+        if mode == "stems" and stems:
+            command.extend(["--stems", stems])
+    elif not default_selection:
+        raise JobError("the deployed lbrr binary does not support mode or stem selection")
+    for flag in ("--no-tui", "--no-pause"):
+        if flag in flags:
+            command.append(flag)
 
     _run_command(command, settings.job_timeout_seconds, "lbrr separation")
     try:
