@@ -33,7 +33,30 @@ pub fn read_wav(path: &std::path::Path) -> Result<WavData, String> {
                 let _block_align = r.u16()?;
                 f.bits = r.u16()? as usize;
                 if size > 16 {
-                    r.skip(size - 16)?;
+                    let extension_len = size - 16;
+                    // ffmpeg writes float WAVs as WAVE_FORMAT_EXTENSIBLE
+                    // (0xfffe) with the real PCM/float tag in the subformat
+                    // GUID. Read that tag instead of rejecting ffmpeg's own
+                    // conversion output.
+                    if f.audio_format == 0xfffe && extension_len >= 24 {
+                        let cb_size = r.u16()?;
+                        let _valid_bits = r.u16()?;
+                        let _channel_mask = r.u32()?;
+                        let sub_format = r.u16()?;
+                        let mut guid_tail = [0u8; 14];
+                        r.take(&mut guid_tail)?;
+                        const KSDATAFORMAT_TAIL: [u8; 14] = [
+                            0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71,
+                        ];
+                        if cb_size >= 22 && guid_tail == KSDATAFORMAT_TAIL {
+                            f.audio_format = sub_format;
+                        }
+                        if extension_len > 24 {
+                            r.skip(extension_len - 24)?;
+                        }
+                    } else {
+                        r.skip(extension_len)?;
+                    }
                 }
                 fmt = Some(f);
             }
@@ -252,6 +275,43 @@ mod tests {
                 values.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn extensible_float_wav_decodes() {
+        let values: Vec<f32> = vec![0.0, 0.5, -0.5, 1.0];
+        let data_len = values.len() * 4;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(60 + data_len as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(&0xfffeu16.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&44100u32.to_le_bytes());
+        bytes.extend_from_slice(&(44100u32 * 2 * 4).to_le_bytes());
+        bytes.extend_from_slice(&8u16.to_le_bytes());
+        bytes.extend_from_slice(&32u16.to_le_bytes());
+        bytes.extend_from_slice(&22u16.to_le_bytes());
+        bytes.extend_from_slice(&32u16.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71]);
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(data_len as u32).to_le_bytes());
+        for sample in &values {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let path = Temp::new();
+        std::fs::write(&path.0, bytes).unwrap();
+        let got = read_wav(&path.0).unwrap();
+        assert_eq!(got.sample_rate, 44100);
+        assert_eq!(got.channels, 2);
+        assert_eq!(
+            got.samples.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+            values.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
