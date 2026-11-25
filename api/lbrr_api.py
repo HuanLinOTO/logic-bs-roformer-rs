@@ -481,24 +481,24 @@ def create_app(settings: Settings) -> FastAPI:
                 )
 
             normalized_path = workdir / "normalized.wav"
-            try:
-                duration = await asyncio.to_thread(normalize_input_audio, settings, input_path, normalized_path)
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
-            try:
-                input_path.unlink()
-            except FileNotFoundError:
-                pass
-            if duration >= settings.max_duration_seconds:
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        f"decoded audio duration {duration:.3f}s is not less than "
-                        f"{settings.max_duration_seconds:.3f}s"
-                    ),
-                )
-
             async with request.app.state.semaphore:
+                try:
+                    duration = await asyncio.to_thread(normalize_input_audio, settings, input_path, normalized_path)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                try:
+                    input_path.unlink()
+                except FileNotFoundError:
+                    pass
+                if duration >= settings.max_duration_seconds:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"decoded audio duration {duration:.3f}s is not less than "
+                            f"{settings.max_duration_seconds:.3f}s"
+                        ),
+                    )
+
                 try:
                     result = await asyncio.to_thread(run_separation_job, settings, normalized_path, workdir, selected_mode, selected_stems)
                 except JobError as exc:
