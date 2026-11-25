@@ -8,4 +8,5 @@ export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.3}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/root/work/target-lbrr}"
 cd "${LBRR_WSL_ROOT:-/root/work/lbrr}"
 sed -i 's/channel = "stable"/channel = "1.99.1"/' vendor/cuda-rust/cuda-oxide/rust-toolchain.toml 2>/dev/null || true
+rustup component add rustc-dev rust-src llvm-tools --toolchain "$RUSTUP_TOOLCHAIN"
 exec cargo oxide "${LBRR_CARGO_ACTION:-run}" "$@"
