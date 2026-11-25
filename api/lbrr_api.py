@@ -354,6 +354,39 @@ def run_separation_job(settings: Settings, input_path: Path, workdir: Path, mode
     return JobResult(zip_path=zip_path, output_files=tuple(path.name for path in flacs))
 
 
+DEFAULT_INSTRUMENTS = ("bass", "drums", "other", "vocals", "guitar", "piano")
+
+
+def load_instrument_names(model_dir: Path) -> list[str]:
+    """Read the flow-style instrument list used by the model config."""
+    try:
+        text = model_dir.joinpath("logic_bs_roformer.yaml").read_text(encoding="utf-8")
+    except OSError:
+        return list(DEFAULT_INSTRUMENTS)
+    match = re.search(r"(?m)^\s*instruments:\s*\[([^\]]*)\]", text)
+    if not match:
+        return list(DEFAULT_INSTRUMENTS)
+    names = re.findall(r"['\"]([^'\"]+)['\"]", match.group(1))
+    return names or list(DEFAULT_INSTRUMENTS)
+
+
+def validate_stem_selection(spec: str, instruments: Sequence[str]) -> None:
+    spec = spec.strip()
+    if not spec or spec.lower() == "all":
+        return
+    for part in re.split(r"[,;\s]+", spec):
+        if not part:
+            continue
+        if part.isdigit():
+            if int(part) < len(instruments):
+                continue
+        elif any(part.lower() == name.lower() for name in instruments):
+            continue
+        raise ValueError(
+            f"unknown stem {part!r}: expected one of {', '.join(instruments)} or an index 0..{len(instruments) - 1}"
+        )
+
+
 def _safe_download_name(filename: str | None, mode: str) -> str:
     raw = Path((filename or "audio").replace("\\", "/")).stem or "audio"
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._") or "audio"
@@ -455,6 +488,11 @@ def create_app(settings: Settings) -> FastAPI:
         selected_stems = stems.strip() if stems else None
         if selected_stems is not None and len(selected_stems) > 200:
             raise HTTPException(status_code=422, detail="stems selection is too long")
+        if selected_mode == "stems" and selected_stems:
+            try:
+                validate_stem_selection(selected_stems, load_instrument_names(settings.model_dir))
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         temp_root = settings.temp_root or Path(tempfile.gettempdir())
         temp_root.mkdir(parents=True, exist_ok=True)
