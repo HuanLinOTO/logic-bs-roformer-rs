@@ -62,9 +62,11 @@ jobs:
       - name: Vendor overlay (cuda-oxide-codegen src/target)
         if: runner.os == 'Linux'
         run: |
-          mkdir -p vendor/cuda-rust/cuda-oxide/crates/cuda-oxide-codegen/src
-          cp -r vendor-overlay/cuda-oxide-codegen/src/target \
-                vendor/cuda-rust/cuda-oxide/crates/cuda-oxide-codegen/src/
+          if [ ! -f vendor/cuda-rust/cuda-oxide/crates/cuda-oxide-codegen/src/target/mod.rs ]; then
+            mkdir -p vendor/cuda-rust/cuda-oxide/crates/cuda-oxide-codegen/src
+            cp -r vendor-overlay/cuda-oxide-codegen/src/target \
+                  vendor/cuda-rust/cuda-oxide/crates/cuda-oxide-codegen/src/
+          fi
 
       - name: Install CUDA toolkit (network repo)
         if: runner.os == 'Linux'
